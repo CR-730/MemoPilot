@@ -15,5 +15,4 @@ sqlite_busy_timeout_seconds: 5
 mcp_startup_timeout_seconds: 15
 mcp_call_timeout_seconds: 30
 llm_retry_limit: 2
-redis_stream_maxlen: 10000
 display_timezone: Asia/Shanghai

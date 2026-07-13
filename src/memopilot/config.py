@@ -51,7 +51,6 @@ class MemoPilotSettings(BaseSettings):
     embedding_dimension: int = Field(default=0, ge=0)
 
     redis_url: str = "redis://localhost:6379/0"
-    redis_stream_maxlen: int = Field(default=10_000, gt=0)
 
     feishu_app_id: str = ""
     feishu_app_secret: SecretStr = SecretStr("")

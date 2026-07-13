@@ -91,7 +91,7 @@ flowchart LR
 
 ## 开发环境
 
-项目使用 Python 3.12 与 [uv](https://docs.astral.sh/uv/) 管理环境。
+项目使用 Python 3.12 与 [uv](https://docs.astral.sh/uv/) 管理环境。阶段 1 的集成测试还需要本机 Redis 7.2 或更高版本监听 `127.0.0.1:6379`；Python 依赖仍全部由 `uv` 隔离管理，不要求使用 Docker 开发。
 
 ```bash
 git clone https://github.com/CR-730/MemoPilot.git
@@ -118,7 +118,7 @@ cp .env.example .env
 
 - [x] 完成系统设计、可靠性评审与两周范围划分
 - [x] 创建项目仓库、Python 包和工程基线
-- [ ] 建立三库迁移、Transactional Inbox / Outbox 与 Redis 任务底座
+- [x] 建立三库迁移、Transactional Inbox / Outbox 与 Redis 任务底座
 - [ ] 实现 Phase Pipeline、ReAct Runtime 与统一工具执行
 - [ ] 接入飞书私聊和可靠外发状态机
 - [ ] 实现分层检索、Consolidation 与 Memory Optimizer

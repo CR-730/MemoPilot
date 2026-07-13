@@ -24,7 +24,6 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
     assert settings.mcp_startup_timeout_seconds == 15
     assert settings.mcp_call_timeout_seconds == 30
     assert settings.llm_retry_limit == 2
-    assert settings.redis_stream_maxlen == 10_000
 
 
 def test_environment_overrides_dotenv_and_yaml(
