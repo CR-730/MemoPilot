@@ -112,6 +112,8 @@ cp .env.example .env
 
 对话模型与 Embedding Provider 独立配置。任何 API Key、飞书 Secret、用户数据、SQLite 数据库和上传文件都不会进入 Git。
 
+非敏感默认值位于 `config/default.yaml`，实际优先级为环境变量 > `.env` > YAML 默认值。启动核心服务前会一次性检查模型、Embedding、飞书 owner 白名单和 workspace 路径；已有向量库还会校验 Provider、模型与向量维度，避免静默混用不兼容向量。
+
 ## 开发路线
 
 - [x] 完成系统设计、可靠性评审与两周范围划分
@@ -130,6 +132,7 @@ cp .env.example .env
 MemoPilot/
 ├── src/memopilot/     # Agent 核心代码
 ├── tests/             # 单元、集成、回放与 E2E 测试
+├── config/             # 不含 Secret 的 YAML 默认配置
 ├── .env.example       # 无 Secret 的配置示例
 └── pyproject.toml     # 依赖与工程工具配置
 ```

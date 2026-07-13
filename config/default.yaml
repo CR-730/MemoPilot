@@ -1,0 +1,19 @@
+# 非敏感运行默认值。Secret 只通过环境变量或 Docker Secret 注入。
+workspace: workspace
+
+chat_base_url: https://api.deepseek.com
+chat_model: deepseek-chat
+redis_url: redis://localhost:6379/0
+
+wake_tick_seconds: 300
+content_half_life_hours: 6
+proactive_cooldown_hours: 2
+lease_ttl_seconds: 30
+lease_heartbeat_seconds: 10
+reclaim_idle_seconds: 60
+sqlite_busy_timeout_seconds: 5
+mcp_startup_timeout_seconds: 15
+mcp_call_timeout_seconds: 30
+llm_retry_limit: 2
+redis_stream_maxlen: 10000
+display_timezone: Asia/Shanghai

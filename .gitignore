@@ -17,11 +17,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-workspace/data/
-workspace/uploads/
-workspace/restore/
-workspace/traces/
+workspace/
 *.db
 *.db-shm
 *.db-wal
-
+*.db.bak-v*-*
