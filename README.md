@@ -98,7 +98,7 @@ uv run pytest
 
 当前自动化测试使用 Fake Provider 与 Fake Feishu，不需要模型 API Key，也不会产生外部副作用。
 
-阶段 2 还提供真实 DeepSeek 手动冒烟脚本。配置 `MEMOPILOT_CHAT_API_KEY` 后，它会要求模型调用一个无副作用的本地状态工具，再输出自然语言结果：
+仓库还提供真实 DeepSeek 手动冒烟脚本。配置 `MEMOPILOT_CHAT_API_KEY` 后，它会要求模型调用一个无副作用的本地状态工具，再输出自然语言结果：
 
 ```bash
 uv run python scripts/smoke_deepseek_runtime.py

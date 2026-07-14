@@ -24,7 +24,7 @@ def test_migrate_all_databases_uses_configured_workspace(tmp_path: Path) -> None
 
     reports = migrate_all_databases(settings)
 
-    assert [report.to_version for report in reports] == [2, 1, 1]
+    assert [report.to_version for report in reports] == [3, 2, 1]
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
     assert settings.wake_database.exists()

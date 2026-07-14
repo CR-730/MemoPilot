@@ -7,6 +7,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
+from memopilot.runtime.contracts import ChatMessage
 from memopilot.runtime.engine import TurnInput
 from memopilot.runtime.worker import RuntimeJobExecutor
 from memopilot.tasks.lease import SessionLease, SessionLeaseManager
@@ -34,6 +35,7 @@ class WorkerService:
         pending_min_idle: timedelta = timedelta(seconds=60),
         stale_heartbeat: timedelta = timedelta(seconds=60),
         pending_reclaim_every: int = 20,
+        short_term_message_limit: int = 12,
     ) -> None:
         self._repository = repository
         self._queue = queue
@@ -48,6 +50,9 @@ class WorkerService:
         self._pending_min_idle = pending_min_idle
         self._stale_heartbeat = stale_heartbeat
         self._pending_reclaim_every = pending_reclaim_every
+        if short_term_message_limit < 1:
+            raise ValueError("短期消息窗口必须至少包含 1 条消息")
+        self._short_term_message_limit = short_term_message_limit
         self._new_reads_since_reclaim = 0
         self._reclaimer = PendingMessageReclaimer(repository, queue, leases)
         derived_interval = max(0.05, leases.ttl_ms / 3000)
@@ -176,7 +181,23 @@ class WorkerService:
             raise KeyError(message.job_id)
         payload = json.loads(job.payload_json)
         content = str(payload.get("text") or "")
-        return TurnInput(session_key=claim.session_key, content=content)
+        records = self._repository.list_recent_messages(
+            claim.session_key,
+            limit=self._short_term_message_limit,
+        )
+        history: list[ChatMessage] = []
+        for record in records:
+            if record.role == "user":
+                history.append(ChatMessage.user(record.content))
+            elif record.role == "assistant":
+                history.append(ChatMessage.assistant(content=record.content))
+            elif record.role == "system":
+                history.append(ChatMessage.system(record.content))
+        return TurnInput(
+            session_key=claim.session_key,
+            content=content,
+            history=tuple(history),
+        )
 
     async def _ack_if_terminal(self, message: QueueMessage) -> None:
         job = self._repository.get_job(message.job_id)

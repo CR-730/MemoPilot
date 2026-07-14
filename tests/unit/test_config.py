@@ -28,6 +28,10 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
     assert settings.llm_max_output_tokens == 2048
     assert settings.llm_timeout_seconds == 60
     assert settings.llm_thinking_enabled is False
+    assert settings.memory_short_term_message_limit == 12
+    assert settings.memory_consolidation_keep_count == 12
+    assert settings.memory_consolidation_min_new_messages == 5
+    assert settings.memory_score_threshold == 0.45
 
 
 def test_environment_overrides_dotenv_and_yaml(

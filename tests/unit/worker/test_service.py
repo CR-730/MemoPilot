@@ -53,6 +53,9 @@ class _Repository:
     def get_job(self, job_id: str) -> Any:
         return SimpleNamespace(payload_json='{"text":"你好"}', state="running")
 
+    def list_recent_messages(self, session_key: str, *, limit: int) -> tuple[Any, ...]:
+        return ()
+
 
 class _Executor:
     cancelled = False
@@ -118,3 +121,34 @@ async def test_successful_lease_renewal_also_refreshes_run_heartbeat() -> None:
 
     assert await worker.run_once() is True
     assert repository.heartbeats > 0
+
+
+def test_turn_input_loads_short_term_history_before_current_message() -> None:
+    class RepositoryWithHistory(_Repository):
+        def list_recent_messages(self, session_key: str, *, limit: int) -> tuple[Any, ...]:
+            assert session_key == "feishu:chat-1"
+            assert limit == 12
+            return (
+                SimpleNamespace(role="user", content="上一问"),
+                SimpleNamespace(role="assistant", content="上一答"),
+            )
+
+    worker = WorkerService(
+        RepositoryWithHistory(),  # type: ignore[arg-type]
+        _Queue(),  # type: ignore[arg-type]
+        _Leases(),  # type: ignore[arg-type]
+        _CompletingExecutor(),  # type: ignore[arg-type]
+        owner_id="worker-1",
+        clock=lambda: NOW,
+        short_term_message_limit=12,
+    )
+    claim = SimpleNamespace(session_key="feishu:chat-1")
+    message = SimpleNamespace(job_id="job-1")
+
+    turn = worker._turn_input(message, claim)
+
+    assert [(item.role, item.content) for item in turn.history] == [
+        ("user", "上一问"),
+        ("assistant", "上一答"),
+    ]
+    assert turn.content == "你好"

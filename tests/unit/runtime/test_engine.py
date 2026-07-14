@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from memopilot.memory.contracts import MemoryQueryResult
 from memopilot.runtime.contracts import (
     ChatMessage,
     FunctionCall,
@@ -143,3 +144,46 @@ class _FailingProvider(ChatProvider):
         tools: Sequence[ToolSchema],
     ) -> ModelResponse:
         raise TimeoutError("provider timeout")
+
+
+class _MemoryEngine:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def query(self, request):
+        self.requests.append(request)
+        return MemoryQueryResult(text_block="## 用户偏好与流程\n- [p1] 先读文档")
+
+
+class _MemoryProfile:
+    def read(self, name: str) -> str:
+        return {
+            "MEMORY.md": "# 长期记忆\n- 用户是 AI 工程师",
+            "SELF.md": "# MemoPilot\n- 保持务实",
+            "CONTEXT.md": "- 当前正在重构项目",
+        }[name]
+
+
+async def test_runtime_prerecall_uses_raw_context_query_and_injects_system_memory() -> None:
+    provider = _CapturingProvider()
+    memory = _MemoryEngine()
+    runtime = AgentRuntime(
+        provider,
+        ToolRegistry(),
+        memory_engine=memory,  # type: ignore[arg-type]
+        memory_profile=_MemoryProfile(),
+    )
+
+    result = await runtime.run(TurnInput(session_key="feishu:chat-1", content="原始问题"))
+
+    assert [(request.text, request.intent) for request in memory.requests] == [
+        ("原始问题", "context")
+    ]
+    assert provider.messages[0].role == "system"
+    assert "先读文档" in (provider.messages[0].content or "")
+    assert "用户是 AI 工程师" in (provider.messages[0].content or "")
+    assert "当前正在重构项目" in (provider.messages[0].content or "")
+    assert any(
+        entry.module_slot == "before_reasoning.memory_prerecall"
+        for entry in result.phase_trace
+    )

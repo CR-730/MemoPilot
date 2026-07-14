@@ -41,6 +41,10 @@ EXPECTED_TABLES = {
         "memory_metadata",
         "memory_relations",
         "keyword_index_metadata",
+        "memory_sources",
+        "memory_vector_rows",
+        "memory_ingestion_batches",
+        "memory_fts",
     },
     DatabaseKind.WAKE: {
         "source_events",
@@ -61,7 +65,11 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
     report = migrate_database(database, kind)
 
     assert report.from_version == 0
-    expected_version = 2 if kind is DatabaseKind.OPERATIONAL else 1
+    expected_version = {
+        DatabaseKind.OPERATIONAL: 3,
+        DatabaseKind.MEMORY: 2,
+        DatabaseKind.WAKE: 1,
+    }[kind]
     assert report.to_version == expected_version
     assert report.backup_path is None
     with connect_database(database) as connection:
@@ -77,7 +85,7 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
-def test_operational_v1_upgrades_to_v2_without_losing_existing_rows(tmp_path: Path) -> None:
+def test_operational_v1_upgrades_to_v3_without_losing_existing_rows(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
     v1_sql = (
         files("memopilot.persistence.schema")
@@ -95,19 +103,29 @@ def test_operational_v1_upgrades_to_v2_without_losing_existing_rows(tmp_path: Pa
     report = migrate_database(database, DatabaseKind.OPERATIONAL)
 
     assert report.from_version == 1
-    assert report.to_version == 2
-    assert report.applied_versions == (2,)
+    assert report.to_version == 3
+    assert report.applied_versions == (2, 3)
     assert report.backup_path is not None
     with connect_database(database) as connection:
         session = connection.execute(
             "SELECT chat_id FROM sessions WHERE session_key = 'feishu:chat-1'"
         ).fetchone()
-        columns = {
+        effect_columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(outbound_effects)").fetchall()
         }
+        session_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        message_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+        }
     assert session is not None and session[0] == "chat-1"
-    assert {"channel", "chat_id", "payload_json", "last_attempt_at"} <= columns
+    assert {"channel", "chat_id", "payload_json", "last_attempt_at"} <= effect_columns
+    assert "last_consolidated_position" in session_columns
+    assert "session_position" in message_columns
 
 
 def test_migration_backs_up_existing_database_before_upgrade(tmp_path: Path) -> None:

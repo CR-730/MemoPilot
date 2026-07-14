@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
+from memopilot.memory.contracts import MemoryQuery, MemoryQueryEngine
 from memopilot.runtime.contracts import ChatMessage, ModelResponse
 from memopilot.runtime.phases import (
     LifecyclePhase,
@@ -55,6 +56,10 @@ class RuntimeStepSink(Protocol):
     async def record(self, event: RuntimeTraceEvent) -> None: ...
 
 
+class LongTermMemoryProfile(Protocol):
+    def read(self, name: str) -> str: ...
+
+
 @dataclass(frozen=True)
 class TurnResult:
     reply: str
@@ -87,13 +92,35 @@ class AgentRuntime:
         *,
         max_iterations: int = 10,
         modules: Sequence[PhaseModule] = (),
+        memory_engine: MemoryQueryEngine | None = None,
+        memory_profile: LongTermMemoryProfile | None = None,
+        memory_markdown_max_chars: int = 6000,
     ) -> None:
         self._provider = provider
         self._tools = tools
         self._max_iterations = max_iterations
+        self._memory_engine = memory_engine
+        self._memory_profile = memory_profile
+        if memory_markdown_max_chars < 500:
+            raise ValueError("Markdown 记忆注入预算不能少于 500 字符")
+        self._memory_markdown_max_chars = memory_markdown_max_chars
+        memory_modules: tuple[PhaseModule, ...] = ()
+        if memory_engine is not None or memory_profile is not None:
+            memory_modules = cast(
+                tuple[PhaseModule, ...],
+                (
+                    FunctionPhaseModule(
+                        LifecyclePhase.BEFORE_REASONING,
+                        "before_reasoning.memory_prerecall",
+                        ("reasoning.input",),
+                        ("memory.context",),
+                        self._memory_prerecall,
+                    ),
+                ),
+            )
         all_modules = cast(
             Sequence[PhaseModule],
-            (*_default_modules(), *modules),
+            (*_default_modules(), *memory_modules, *modules),
         )
         self._pipeline = PhasePipeline(
             all_modules,
@@ -107,6 +134,33 @@ class AgentRuntime:
                 LifecyclePhase.AFTER_REASONING: {"reasoning.result"},
             },
         )
+
+    async def _memory_prerecall(self, context: PhaseContext) -> Mapping[str, Any]:
+        turn = context.slots["reasoning.input"]
+        if not isinstance(turn, TurnInput):
+            raise TypeError("reasoning.input 必须是 TurnInput")
+        parts: list[str] = []
+        if self._memory_profile is not None:
+            for name, title in (
+                ("MEMORY.md", "用户长期记忆"),
+                ("SELF.md", "助手自我认知"),
+                ("CONTEXT.md", "近期上下文"),
+            ):
+                content = self._memory_profile.read(name).strip()
+                if content:
+                    parts.append(f"## {title}\n{content}")
+        if self._memory_engine is not None:
+            result = await self._memory_engine.query(
+                MemoryQuery(
+                    text=turn.content,
+                    intent="context",
+                    session_key=turn.session_key,
+                )
+            )
+            if result.text_block.strip():
+                parts.append(result.text_block.strip())
+        context_block = "\n\n".join(parts)
+        return {"memory.context": context_block[: self._memory_markdown_max_chars]}
 
     async def run(
         self,
@@ -248,8 +302,13 @@ async def _prompt_render(context: PhaseContext) -> Mapping[str, Any]:
     if not isinstance(turn, TurnInput):
         raise TypeError("reasoning.input 必须是 TurnInput")
     messages: list[ChatMessage] = []
-    if turn.system_prompt.strip():
-        messages.append(ChatMessage.system(turn.system_prompt.strip()))
+    system_parts = [turn.system_prompt.strip()]
+    memory_context = context.slots.get("memory.context")
+    if isinstance(memory_context, str) and memory_context.strip():
+        system_parts.append("以下是与当前问题相关的长期记忆：\n" + memory_context.strip())
+    system_prompt = "\n\n".join(part for part in system_parts if part)
+    if system_prompt:
+        messages.append(ChatMessage.system(system_prompt))
     messages.extend(turn.history)
     messages.append(ChatMessage.user(turn.content))
     return {"prompt.messages": tuple(messages)}
@@ -328,6 +387,7 @@ def _default_modules() -> tuple[FunctionPhaseModule, ...]:
 __all__ = [
     "AgentRuntime",
     "FunctionPhaseModule",
+    "LongTermMemoryProfile",
     "PhaseTraceEntry",
     "RuntimeStepSink",
     "RuntimeTraceEvent",

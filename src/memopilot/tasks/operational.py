@@ -122,6 +122,24 @@ class StepRecord:
     fencing_epoch: int
 
 
+@dataclass(frozen=True, slots=True)
+class MessageRecord:
+    message_id: str
+    session_key: str
+    role: str
+    content: str
+    turn_id: str
+    session_position: int
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class TurnCommitResult:
+    consolidation_job_id: str
+    outbox_id: str
+    created: bool
+
+
 class OperationalRepository:
     """用短事务封装跨进程共享的 operational.db。"""
 
@@ -138,6 +156,8 @@ class OperationalRepository:
             "session_identities",
             "session_interrupts",
             "steps",
+            "messages",
+            "consolidation_manifests",
         }
     )
 
@@ -1192,6 +1212,236 @@ class OperationalRepository:
         finally:
             connection.close()
 
+    def commit_successful_turn(
+        self,
+        run_id: str,
+        *,
+        lease: FenceToken,
+        user_content: str,
+        assistant_content: str,
+        now: datetime,
+        failpoint: Failpoint | None = None,
+    ) -> TurnCommitResult:
+        """原子保存成功 Turn、关闭 Run，并创建唯一的异步 Consolidation Job。"""
+        if not user_content.strip() or not assistant_content.strip():
+            raise ValueError("成功 Turn 的用户消息和助手回复不能为空")
+        now_text = _utc_iso(now)
+        consolidation_job_id = _stable_id("job", f"consolidate:{run_id}")
+        outbox_id = _stable_id("outbox", consolidation_job_id)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_current_fence(connection, lease)
+            run = connection.execute(
+                """
+                SELECT r.job_id, r.state AS run_state, j.state AS job_state,
+                       j.activity_version
+                FROM runs AS r
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                WHERE r.run_id = ? AND j.session_key = ?
+                """,
+                (run_id, lease.session_key),
+            ).fetchone()
+            if run is None:
+                raise LostLeaseError("Run 不存在或不属于当前会话")
+
+            existing_job = connection.execute(
+                "SELECT job_id FROM agent_jobs WHERE job_id = ?",
+                (consolidation_job_id,),
+            ).fetchone()
+            if str(run["run_state"]) == "succeeded" and existing_job is not None:
+                stored = connection.execute(
+                    "SELECT role, content FROM messages WHERE turn_id = ? ORDER BY turn_position",
+                    (run_id,),
+                ).fetchall()
+                expected = [("user", user_content), ("assistant", assistant_content)]
+                actual = [(str(row["role"]), str(row["content"])) for row in stored]
+                if actual != expected:
+                    raise ValueError("同一 Turn 不能以不同消息内容重复提交")
+                connection.execute("COMMIT")
+                return TurnCommitResult(consolidation_job_id, outbox_id, False)
+
+            if (
+                str(run["run_state"]) != "running"
+                or str(run["job_state"]) != "running"
+            ):
+                raise LostLeaseError("Run 已不处于可提交状态")
+            owned = connection.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE run_id = ? AND owner_id = ? AND fencing_epoch = ?
+                """,
+                (run_id, lease.owner_id, lease.epoch),
+            ).fetchone()
+            if owned is None:
+                raise LostLeaseError("Run 已不属于当前 lease")
+
+            position_row = connection.execute(
+                "SELECT COALESCE(MAX(session_position), 0) FROM messages WHERE session_key = ?",
+                (lease.session_key,),
+            ).fetchone()
+            assert position_row is not None
+            first_position = int(position_row[0]) + 1
+            messages = (
+                (
+                    _stable_id("message", f"{run_id}:user"),
+                    "user",
+                    user_content,
+                    0,
+                    first_position,
+                ),
+                (
+                    _stable_id("message", f"{run_id}:assistant"),
+                    "assistant",
+                    assistant_content,
+                    1,
+                    first_position + 1,
+                ),
+            )
+            for message_id, role, content, turn_position, session_position in messages:
+                connection.execute(
+                    """
+                    INSERT INTO messages(
+                        message_id, session_key, role, content, turn_id, turn_position,
+                        owner_id, fencing_epoch, created_at, session_position
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_id,
+                        lease.session_key,
+                        role,
+                        content,
+                        run_id,
+                        turn_position,
+                        lease.owner_id,
+                        lease.epoch,
+                        now_text,
+                        session_position,
+                    ),
+                )
+
+            payload_json = _json(
+                {
+                    "trigger_run_id": run_id,
+                    "last_message_id": messages[-1][0],
+                }
+            )
+            connection.execute(
+                """
+                INSERT INTO agent_jobs(
+                    job_id, kind, priority, session_key, idempotency_key, state,
+                    activity_version, payload_json, created_at, updated_at
+                ) VALUES (?, 'memory.consolidate', 3, ?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    consolidation_job_id,
+                    lease.session_key,
+                    f"consolidate:{run_id}",
+                    int(run["activity_version"]),
+                    payload_json,
+                    now_text,
+                    now_text,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO outbox_events(
+                    outbox_id, event_type, aggregate_id, payload_json,
+                    idempotency_key, state, next_attempt_at, created_at, updated_at
+                ) VALUES (?, 'agent.job.queued', ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    outbox_id,
+                    consolidation_job_id,
+                    _json(
+                        {
+                            "activity_version": int(run["activity_version"]),
+                            "job_id": consolidation_job_id,
+                            "kind": "memory.consolidate",
+                            "priority": 3,
+                            "session_key": lease.session_key,
+                        }
+                    ),
+                    f"publish-job:{consolidation_job_id}",
+                    now_text,
+                    now_text,
+                    now_text,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE runs
+                SET state = 'succeeded', finished_at = ?, heartbeat_at = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (now_text, now_text, now_text, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE run_attempts
+                SET outcome = 'succeeded', finished_at = ?, heartbeat_at = ?
+                WHERE run_id = ? AND owner_id = ? AND fencing_epoch = ?
+                  AND finished_at IS NULL
+                """,
+                (now_text, now_text, run_id, lease.owner_id, lease.epoch),
+            )
+            connection.execute(
+                """
+                UPDATE agent_jobs
+                SET state = 'succeeded', heartbeat_at = ?, finished_at = ?, updated_at = ?
+                WHERE job_id = ? AND state = 'running'
+                """,
+                (now_text, now_text, now_text, run["job_id"]),
+            )
+            if failpoint is not None:
+                failpoint("before_commit")
+            connection.execute("COMMIT")
+            return TurnCommitResult(consolidation_job_id, outbox_id, True)
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def list_recent_messages(
+        self,
+        session_key: str,
+        *,
+        limit: int,
+    ) -> tuple[MessageRecord, ...]:
+        if limit < 1:
+            return ()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT message_id, session_key, role, content, turn_id,
+                       session_position, created_at
+                FROM (
+                    SELECT message_id, session_key, role, content, turn_id,
+                           session_position, created_at
+                    FROM messages
+                    WHERE session_key = ? AND session_position IS NOT NULL
+                    ORDER BY session_position DESC
+                    LIMIT ?
+                )
+                ORDER BY session_position
+                """,
+                (session_key, limit),
+            ).fetchall()
+        return tuple(
+            MessageRecord(
+                message_id=str(row["message_id"]),
+                session_key=str(row["session_key"]),
+                role=str(row["role"]),
+                content=str(row["content"]),
+                turn_id=str(row["turn_id"]),
+                session_position=int(row["session_position"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        )
+
     def resolve_needs_review(
         self,
         run_id: str,
@@ -1359,9 +1609,11 @@ __all__ = [
     "InterruptResult",
     "JobRecord",
     "LostLeaseError",
+    "MessageRecord",
     "OperationalRepository",
     "OutboxRecord",
     "RunClaim",
     "SessionIdentityRecord",
     "StepRecord",
+    "TurnCommitResult",
 ]

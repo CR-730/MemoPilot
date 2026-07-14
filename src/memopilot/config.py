@@ -71,6 +71,13 @@ class MemoPilotSettings(BaseSettings):
     llm_max_output_tokens: int = Field(default=2048, gt=0)
     llm_timeout_seconds: float = Field(default=60, gt=0)
     llm_thinking_enabled: bool = False
+    memory_short_term_message_limit: int = Field(default=12, gt=0)
+    memory_consolidation_keep_count: int = Field(default=12, ge=0)
+    memory_consolidation_min_new_messages: int = Field(default=5, gt=0)
+    memory_retrieval_limit: int = Field(default=8, gt=0, le=200)
+    memory_score_threshold: float = Field(default=0.45, ge=0, le=1)
+    memory_relative_delta: float = Field(default=0.06, ge=0, le=1)
+    memory_inject_max_chars: int = Field(default=1200, ge=120)
     display_timezone: str = "Asia/Shanghai"
 
     @classmethod

@@ -159,7 +159,11 @@ def migrate_all_databases(settings: MemoPilotSettings) -> tuple[MigrationReport,
 
 def _load_migrations(kind: DatabaseKind) -> tuple[Migration, ...]:
     schema = files("memopilot.persistence.schema")
-    versions = (1, 2) if kind is DatabaseKind.OPERATIONAL else (1,)
+    versions = {
+        DatabaseKind.OPERATIONAL: (1, 2, 3),
+        DatabaseKind.MEMORY: (1, 2),
+        DatabaseKind.WAKE: (1,),
+    }[kind]
     return tuple(
         Migration(
             version=version,
