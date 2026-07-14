@@ -70,6 +70,7 @@ class MemoPilotSettings(BaseSettings):
     llm_max_iterations: int = Field(default=10, gt=0)
     llm_max_output_tokens: int = Field(default=2048, gt=0)
     llm_timeout_seconds: float = Field(default=60, gt=0)
+    llm_thinking_enabled: bool = False
     display_timezone: str = "Asia/Shanghai"
 
     @classmethod

@@ -35,11 +35,13 @@ class OpenAICompatibleProvider:
         model: str,
         max_output_tokens: int = 2048,
         extra_body: Mapping[str, Any] | None = None,
+        preserve_reasoning_content: bool = False,
     ) -> None:
         self._client = client
         self._model = model
         self._max_output_tokens = max_output_tokens
         self._extra_body = dict(extra_body) if extra_body is not None else None
+        self._preserve_reasoning_content = preserve_reasoning_content
 
     @classmethod
     def from_credentials(
@@ -52,6 +54,7 @@ class OpenAICompatibleProvider:
         max_retries: int = 2,
         timeout_seconds: float = 60,
         extra_body: Mapping[str, Any] | None = None,
+        preserve_reasoning_content: bool = False,
     ) -> OpenAICompatibleProvider:
         client = AsyncOpenAI(
             api_key=api_key,
@@ -64,6 +67,7 @@ class OpenAICompatibleProvider:
             model=model,
             max_output_tokens=max_output_tokens,
             extra_body=extra_body,
+            preserve_reasoning_content=preserve_reasoning_content,
         )
 
     @classmethod
@@ -76,12 +80,9 @@ class OpenAICompatibleProvider:
         max_output_tokens: int = 2048,
         max_retries: int = 2,
         timeout_seconds: float = 60,
+        thinking_enabled: bool = False,
     ) -> OpenAICompatibleProvider:
-        """创建阶段 2 的 DeepSeek 非思考模式 Provider。
-
-        DeepSeek V4 默认开启思考模式；思考模式下的工具调用要求回传
-        ``reasoning_content``。阶段 2 暂不保存思维链，因此在适配边界显式关闭。
-        """
+        """创建保留思考字段的 DeepSeek Provider。"""
         return cls.from_credentials(
             api_key=api_key,
             base_url=base_url,
@@ -89,7 +90,12 @@ class OpenAICompatibleProvider:
             max_output_tokens=max_output_tokens,
             max_retries=max_retries,
             timeout_seconds=timeout_seconds,
-            extra_body={"thinking": {"type": "disabled"}},
+            extra_body={
+                "thinking": {
+                    "type": "enabled" if thinking_enabled else "disabled",
+                }
+            },
+            preserve_reasoning_content=thinking_enabled,
         )
 
     async def complete(
@@ -98,9 +104,19 @@ class OpenAICompatibleProvider:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolSchema],
     ) -> ModelResponse:
+        request_messages = [
+            message.to_openai(
+                include_provider_fields=self._preserve_reasoning_content,
+            )
+            for message in messages
+        ]
+        if self._preserve_reasoning_content:
+            for message in request_messages:
+                if message.get("role") == "assistant":
+                    message.setdefault("reasoning_content", "")
         request: dict[str, Any] = {
             "model": self._model,
-            "messages": [message.to_openai() for message in messages],
+            "messages": request_messages,
             "max_tokens": self._max_output_tokens,
             "stream": False,
         }
@@ -115,6 +131,16 @@ class OpenAICompatibleProvider:
         choice = response.choices[0]
         message = choice.message
         calls = tuple(self._parse_call(call) for call in (message.tool_calls or ()))
+        thinking = (
+            getattr(message, "reasoning_content", None)
+            if self._preserve_reasoning_content
+            else None
+        )
+        provider_fields: dict[str, Any] = {}
+        if self._preserve_reasoning_content and (thinking is not None or calls):
+            provider_fields["reasoning_content"] = (
+                str(thinking) if thinking is not None else ""
+            )
         usage = getattr(response, "usage", None)
         return ModelResponse(
             content=message.content,
@@ -123,6 +149,8 @@ class OpenAICompatibleProvider:
             response_id=getattr(response, "id", None),
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
+            thinking=str(thinking) if thinking is not None else None,
+            provider_fields=provider_fields,
         )
 
     @staticmethod

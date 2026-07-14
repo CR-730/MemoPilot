@@ -11,11 +11,10 @@
 [![MCP](https://img.shields.io/badge/MCP-stdio-6B57FF)](https://modelcontextprotocol.io/)
 [![Channel](https://img.shields.io/badge/Channel-飞书私聊-00D6B9)](#项目边界)
 
-
 </div>
 
 > [!IMPORTANT]
-> MemoPilot 已完成可靠任务底座与核心 Agent Runtime，当前正按路线图继续接入飞书、分层记忆和主动能力。
+> MemoPilot 已完成可靠任务底座与核心 Agent Runtime，当前正在继续接入飞书、分层记忆和主动能力。
 
 ## 为什么做 MemoPilot
 
@@ -108,7 +107,7 @@ uv run pytest
 uv run python scripts/smoke_deepseek_runtime.py
 ```
 
-默认模型为 `deepseek-v4-flash`，可通过 `MEMOPILOT_CHAT_MODEL` 覆盖；Provider 使用统一 OpenAI-compatible Chat Completions 接口。阶段 2 的 DeepSeek 适配显式关闭思考模式，避免工具调用后遗漏 `reasoning_content`；后续若启用思考模式，必须先补齐思考内容的完整回传合同。
+默认模型为 `deepseek-v4-flash`，可通过 `MEMOPILOT_CHAT_MODEL` 覆盖；Provider 使用统一 OpenAI-compatible Chat Completions 接口。思考模式默认关闭，可通过 `MEMOPILOT_LLM_THINKING_ENABLED=true` 开启。开启后，DeepSeek Provider 会把 `reasoning_content` 收入不透明的 `provider_fields`，修补历史 assistant 消息并在后续请求中原样回传；通用 Provider 会剥离该字段，运行审计也不持久化思考正文。
 
 ### 配置
 
@@ -124,7 +123,7 @@ cp .env.example .env
 
 ## 开发路线
 
-- [x] 完成系统设计、可靠性评审与两周范围划分
+- [x] 完成核心架构设计、可靠性评审与第一版范围划分
 - [x] 创建项目仓库、Python 包和工程基线
 - [x] 建立三库迁移、Transactional Inbox / Outbox 与 Redis 任务底座
 - [x] 实现 Phase Pipeline、ReAct Runtime 与统一工具执行
@@ -133,7 +132,6 @@ cp .env.example .env
 - [ ] 接入插件、Skills、MCP、主动唤醒与定时任务
 - [ ] 完成 Inspector、Docker Compose、故障测试和演示脚本
 
-
 ## 仓库结构
 
 ```text
@@ -141,7 +139,7 @@ MemoPilot/
 ├── src/memopilot/     # Agent 核心代码
 ├── scripts/           # 手动冒烟与后续演示脚本
 ├── tests/             # 单元、集成、回放与 E2E 测试
-├── config/             # 不含 Secret 的 YAML 默认配置
+├── config/            # 不含 Secret 的 YAML 默认配置
 ├── .env.example       # 无 Secret 的配置示例
 └── pyproject.toml     # 依赖与工程工具配置
 ```
@@ -154,5 +152,5 @@ MemoPilot/
 feat: 实现会话级任务租约
 fix: 修复主动消息抢占竞态
 test: 增加 Redis 清空恢复测试
-docs: 完善分层记忆设计说明
+docs: 完善分层记忆说明
 ```

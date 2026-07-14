@@ -108,6 +108,24 @@ async def test_react_executes_function_and_returns_observation_to_model() -> Non
     assert second_messages[-1].tool_call_id == "c1"
 
 
+async def test_react_replays_provider_fields_with_assistant_tool_call() -> None:
+    call = FunctionCall(id="c1", name="echo", arguments={"text": "hello"})
+    first = ModelResponse(
+        content="",
+        tool_calls=(call,),
+        finish_reason="tool_calls",
+        thinking="先查资料",
+        provider_fields={"reasoning_content": "先查资料"},
+    )
+    provider = _FakeProvider([first, _response("完成")])
+
+    await ReActEngine(provider, _registry()).run((ChatMessage.user("执行"),))
+
+    assistant = provider.calls[1]["messages"][-2]
+    assert assistant.role == "assistant"
+    assert assistant.provider_fields == {"reasoning_content": "先查资料"}
+
+
 @pytest.mark.parametrize(
     "call",
     [

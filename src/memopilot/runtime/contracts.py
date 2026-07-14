@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 type ToolSchema = dict[str, Any]
@@ -23,6 +24,7 @@ class ChatMessage:
     tool_calls: tuple[FunctionCall, ...] = ()
     tool_call_id: str | None = None
     name: str | None = None
+    provider_fields: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def system(cls, content: str) -> ChatMessage:
@@ -38,8 +40,14 @@ class ChatMessage:
         *,
         content: str | None,
         tool_calls: tuple[FunctionCall, ...] = (),
+        provider_fields: Mapping[str, Any] | None = None,
     ) -> ChatMessage:
-        return cls(role="assistant", content=content, tool_calls=tool_calls)
+        return cls(
+            role="assistant",
+            content=content,
+            tool_calls=tool_calls,
+            provider_fields=dict(provider_fields or {}),
+        )
 
     @classmethod
     def tool(cls, *, call_id: str, name: str, content: str) -> ChatMessage:
@@ -50,7 +58,7 @@ class ChatMessage:
             name=name,
         )
 
-    def to_openai(self) -> dict[str, Any]:
+    def to_openai(self, *, include_provider_fields: bool = False) -> dict[str, Any]:
         if self.role == "assistant":
             message: dict[str, Any] = {"role": "assistant", "content": self.content}
             if self.tool_calls:
@@ -65,6 +73,8 @@ class ChatMessage:
                     }
                     for call in self.tool_calls
                 ]
+            if include_provider_fields:
+                message.update(self.provider_fields)
             return message
         if self.role == "tool":
             if self.tool_call_id is None:
@@ -85,6 +95,8 @@ class ModelResponse:
     response_id: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    thinking: str | None = None
+    provider_fields: dict[str, Any] = field(default_factory=dict)
     error_type: str | None = None
     error_message: str | None = None
 

@@ -26,6 +26,7 @@ async def main() -> None:
         max_output_tokens=settings.llm_max_output_tokens,
         max_retries=settings.llm_retry_limit,
         timeout_seconds=settings.llm_timeout_seconds,
+        thinking_enabled=settings.llm_thinking_enabled,
     )
     tools = ToolRegistry(
         [

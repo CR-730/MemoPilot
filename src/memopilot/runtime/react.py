@@ -85,6 +85,7 @@ class ReActEngine:
                 ChatMessage.assistant(
                     content=response.content,
                     tool_calls=response.tool_calls,
+                    provider_fields=response.provider_fields,
                 )
             )
             if not response.tool_calls:
