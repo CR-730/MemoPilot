@@ -842,6 +842,48 @@ class OperationalRepository:
         finally:
             connection.close()
 
+    def authorize_live_progress(
+        self,
+        run_id: str,
+        *,
+        lease: FenceToken,
+        expected_activity_version: int,
+        now: datetime,
+        creating: bool,
+    ) -> bool:
+        """原子确认 live 副作用仍属于当前 Run，且创建未超过一小时窗口。"""
+        creation_cutoff = _utc_iso(now - timedelta(hours=1))
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM runs AS r
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                JOIN session_activity AS a ON a.session_key = j.session_key
+                JOIN session_fences AS f ON f.session_key = j.session_key
+                WHERE r.run_id = ?
+                  AND r.state = 'running' AND j.state = 'running'
+                  AND r.owner_id = ? AND r.fencing_epoch = ?
+                  AND j.session_key = ?
+                  AND f.owner_id = ? AND f.current_epoch = ?
+                  AND j.activity_version = ? AND a.activity_version = ?
+                  AND (? = 0 OR r.started_at >= ?)
+                """,
+                (
+                    run_id,
+                    lease.owner_id,
+                    lease.epoch,
+                    lease.session_key,
+                    lease.owner_id,
+                    lease.epoch,
+                    expected_activity_version,
+                    expected_activity_version,
+                    int(creating),
+                    creation_cutoff,
+                ),
+            ).fetchone()
+        return row is not None
+
     def append_step(
         self,
         run_id: str,

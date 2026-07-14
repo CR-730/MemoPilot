@@ -32,6 +32,7 @@
 | 扩展机制 | Python 插件、PromptBlock、ToolHook、Skills 与 MCP stdio |
 | 任务协调 | Redis Streams P0–P3、会话租约、持久化 fencing epoch 与用户消息抢占 |
 | 可靠副作用 | Transactional Outbox、稳定 operation ID、飞书 UUID 幂等与不明确状态核对 |
+| 飞书私聊 | 长连接入站、实时思考/工具过程卡、终态折叠与独立可靠最终回复 |
 | 可观测性 | Diagnostic Log、Strategy Trace 与只读 Inspector API，不开发独立 Dashboard |
 
 ## 系统架构
@@ -104,6 +105,8 @@ uv run python scripts/smoke_deepseek_runtime.py
 ```
 
 默认模型为 `deepseek-v4-flash`，可通过 `MEMOPILOT_CHAT_MODEL` 覆盖；Provider 使用统一 OpenAI-compatible Chat Completions 接口。思考模式默认关闭，可通过 `MEMOPILOT_LLM_THINKING_ENABLED=true` 开启。开启后，DeepSeek Provider 会把 `reasoning_content` 收入不透明的 `provider_fields`，修补历史 assistant 消息并在后续请求中原样回传；通用 Provider 会剥离该字段，运行审计也不持久化思考正文。
+
+飞书会使用 schema 2.0 交互卡片展示流式过程：生成期间更新模型返回的思考增量、工具调用状态和临时回复，结束后将思考折叠为过程卡，最终答案单独通过可靠外发状态机发送。未开启思考模式时不会生成思考正文；live 卡失败或限流只关闭过程预览，不改变最终任务结果。
 
 ### 配置
 

@@ -10,6 +10,12 @@ type ToolSchema = dict[str, Any]
 
 
 @dataclass(frozen=True)
+class StreamDelta:
+    content_delta: str = ""
+    thinking_delta: str = ""
+
+
+@dataclass(frozen=True)
 class FunctionCall:
     id: str
     name: str
@@ -107,4 +113,4 @@ def _json_arguments(arguments: dict[str, Any]) -> str:
     return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
 
 
-__all__ = ["ChatMessage", "FunctionCall", "ModelResponse", "ToolSchema"]
+__all__ = ["ChatMessage", "FunctionCall", "ModelResponse", "StreamDelta", "ToolSchema"]

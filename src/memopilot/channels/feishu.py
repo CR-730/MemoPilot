@@ -40,6 +40,12 @@ class _TokenCache:
     expires_at: float
 
 
+class FeishuApiError(RuntimeError):
+    def __init__(self, business_code: int, message: str) -> None:
+        super().__init__(f"Feishu API request failed: code={business_code} msg={message}")
+        self.business_code = business_code
+
+
 class FeishuChannel:
     def __init__(
         self,
@@ -223,6 +229,38 @@ class FeishuChannel:
         provider_uuid: str,
     ) -> SendReceipt:
         return await self.send(chat_id, message, provider_uuid=provider_uuid)
+
+    async def send_card(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        provider_uuid: str,
+    ) -> SendReceipt:
+        token = await self._get_tenant_access_token()
+        body = {
+            "receive_id": str(chat_id),
+            "msg_type": "interactive",
+            "content": content,
+            "uuid": provider_uuid,
+        }
+        data = await self._api_request(
+            "POST",
+            "/im/v1/messages",
+            body,
+            token=token,
+            params={"receive_id_type": "chat_id"},
+        )
+        return _send_receipt(data)
+
+    async def patch_card(self, message_id: str, content: str) -> None:
+        token = await self._get_tenant_access_token()
+        await self._api_request(
+            "PATCH",
+            f"/im/v1/messages/{message_id}",
+            {"content": content},
+            token=token,
+        )
 
     async def send_image(
         self,
@@ -421,8 +459,9 @@ class FeishuChannel:
         )
         response.raise_for_status()
         payload = response.json()
-        if int(payload.get("code", -1)) != 0:
-            raise RuntimeError(f"Feishu API request failed: {payload.get('msg') or payload}")
+        business_code = int(payload.get("code", -1))
+        if business_code != 0:
+            raise FeishuApiError(business_code, str(payload.get("msg") or payload))
         return _as_dict(payload.get("data"))
 
     async def _download_message_resource(
@@ -585,4 +624,4 @@ def _file_type(file_name: str) -> str:
     return suffix if suffix in {"opus", "mp4", "pdf", "doc", "xls", "ppt"} else "stream"
 
 
-__all__ = ["FeishuChannel"]
+__all__ = ["FeishuApiError", "FeishuChannel"]

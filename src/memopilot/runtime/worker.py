@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -14,6 +15,8 @@ from memopilot.tasks.operational import (
     OperationalRepository,
     RunClaim,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeJobExecutor:
@@ -53,8 +56,21 @@ class RuntimeJobExecutor:
             lease=lease,
             clock=self._clock,
         )
+        progress = None
+        if self._final_response_dispatcher is not None:
+            try:
+                progress = self._final_response_dispatcher.create_live_progress(
+                    claim=claim,
+                    lease=lease,
+                )
+            except Exception as exc:
+                logger.warning("飞书 live 初始化异常，核心 Runtime 继续执行: %s", exc)
         try:
-            result = await self._runtime.run(turn, step_sink=step_sink)
+            result = await self._runtime.run(
+                turn,
+                step_sink=step_sink,
+                progress=progress,
+            )
         except Exception:
             try:
                 self._repository.finish_job(
@@ -66,6 +82,11 @@ class RuntimeJobExecutor:
             except LostLeaseError:
                 pass
             raise
+        if progress is not None:
+            try:
+                await progress.finalize()
+            except Exception as exc:
+                logger.warning("飞书过程卡定格异常，最终回复继续发送: %s", exc)
         if result.react.infrastructure_error:
             outcome = "failed"
         elif self._final_response_dispatcher is None:

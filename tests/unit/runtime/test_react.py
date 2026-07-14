@@ -9,6 +9,7 @@ from memopilot.runtime.contracts import (
     ChatMessage,
     FunctionCall,
     ModelResponse,
+    StreamDelta,
     ToolSchema,
 )
 from memopilot.runtime.providers import ChatProvider
@@ -106,6 +107,95 @@ async def test_react_executes_function_and_returns_observation_to_model() -> Non
     assert second_messages[-2].tool_calls == (call,)
     assert second_messages[-1].role == "tool"
     assert second_messages[-1].tool_call_id == "c1"
+
+
+async def test_react_reports_stream_and_tool_progress_in_execution_order() -> None:
+    call = FunctionCall(id="c1", name="echo", arguments={"text": "hello"})
+    provider = _FakeProvider(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(call,),
+                thinking="先调用工具",
+                provider_fields={"reasoning_content": "先调用工具"},
+            ),
+            _response("工具调用完成"),
+        ]
+    )
+    events: list[tuple[str, object]] = []
+
+    class _Progress:
+        async def on_stream_delta(self, delta: StreamDelta) -> None:
+            events.append(("delta", delta))
+
+        async def on_tool_call_started(self, iteration: int, item: FunctionCall) -> None:
+            events.append(("started", (iteration, item.id)))
+
+        async def on_tool_call_completed(
+            self,
+            iteration: int,
+            item: FunctionCall,
+            observation: object,
+        ) -> None:
+            events.append(("completed", (iteration, item.id)))
+
+    result = await ReActEngine(provider, _registry()).run(
+        (ChatMessage.user("回显 hello"),),
+        progress=_Progress(),
+    )
+
+    assert result.reply == "工具调用完成"
+    assert events == [
+        ("delta", StreamDelta(thinking_delta="先调用工具")),
+        ("started", (1, "c1")),
+        ("completed", (1, "c1")),
+        ("delta", StreamDelta(content_delta="工具调用完成")),
+    ]
+
+
+@pytest.mark.parametrize("failure_point", ["stream", "started", "completed"])
+async def test_progress_observer_failure_never_changes_react_result(
+    failure_point: str,
+) -> None:
+    call = FunctionCall(id="c1", name="echo", arguments={"text": "hello"})
+    provider = _FakeProvider(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(call,),
+                thinking="先调用工具",
+            ),
+            _response("工具调用完成"),
+        ]
+    )
+
+    class _BrokenProgress:
+        async def on_stream_delta(self, delta: StreamDelta) -> None:
+            if failure_point == "stream":
+                raise RuntimeError("stream preview failed")
+
+        async def on_tool_call_started(self, iteration: int, item: FunctionCall) -> None:
+            if failure_point == "started":
+                raise RuntimeError("tool start preview failed")
+
+        async def on_tool_call_completed(
+            self,
+            iteration: int,
+            item: FunctionCall,
+            observation: object,
+        ) -> None:
+            if failure_point == "completed":
+                raise RuntimeError("tool completion preview failed")
+
+    result = await ReActEngine(provider, _registry()).run(
+        (ChatMessage.user("回显 hello"),),
+        progress=_BrokenProgress(),
+    )
+
+    assert result.reply == "工具调用完成"
+    assert result.exit_reason == "completed"
+    assert result.infrastructure_error is None
+    assert result.tool_chain[0].observation.ok is True
 
 
 async def test_react_replays_provider_fields_with_assistant_tool_call() -> None:

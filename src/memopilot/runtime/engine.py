@@ -17,6 +17,7 @@ from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.react import (
     ReActEngine,
     ReActObserver,
+    ReActProgressObserver,
     ReActResult,
     ToolCallRecord,
 )
@@ -112,6 +113,7 @@ class AgentRuntime:
         turn: TurnInput,
         *,
         step_sink: RuntimeStepSink | None = None,
+        progress: ReActProgressObserver | None = None,
     ) -> TurnResult:
         context = PhaseContext(slots={"turn.input": turn})
         execution = _RuntimeExecution(self._pipeline, context, step_sink)
@@ -127,7 +129,7 @@ class AgentRuntime:
             self._tools,
             max_iterations=self._max_iterations,
             observer=execution,
-        ).run(prompt_messages)
+        ).run(prompt_messages, progress=progress)
         context.slots["reasoning.result"] = react
         await execution.run_phase(LifecyclePhase.AFTER_REASONING)
         await execution.run_phase(LifecyclePhase.AFTER_TURN)

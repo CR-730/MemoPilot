@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, Protocol
 
 from openai import AsyncOpenAI
@@ -12,6 +13,7 @@ from memopilot.runtime.contracts import (
     ChatMessage,
     FunctionCall,
     ModelResponse,
+    StreamDelta,
     ToolSchema,
 )
 
@@ -153,6 +155,120 @@ class OpenAICompatibleProvider:
             provider_fields=provider_fields,
         )
 
+    async def complete_streaming(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSchema],
+        on_delta: Callable[[StreamDelta], Awaitable[None] | None],
+    ) -> ModelResponse:
+        request_messages = [
+            message.to_openai(
+                include_provider_fields=self._preserve_reasoning_content,
+            )
+            for message in messages
+        ]
+        if self._preserve_reasoning_content:
+            for message in request_messages:
+                if message.get("role") == "assistant":
+                    message.setdefault("reasoning_content", "")
+        request: dict[str, Any] = {
+            "model": self._model,
+            "messages": request_messages,
+            "max_tokens": self._max_output_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if tools:
+            request["tools"] = tuple(tools)
+            request["tool_choice"] = "auto"
+        if self._extra_body is not None:
+            request["extra_body"] = self._extra_body
+
+        stream = await self._client.chat.completions.create(**request)
+        content_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_chunks: dict[int, dict[str, str]] = {}
+        tool_call_seen = False
+        response_id: str | None = None
+        finish_reason: str | None = None
+        prompt_tokens: int | None = None
+        completion_tokens: int | None = None
+
+        async for chunk in stream:
+            response_id = str(getattr(chunk, "id", "") or response_id or "") or None
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                prompt_tokens = getattr(usage, "prompt_tokens", prompt_tokens)
+                completion_tokens = getattr(usage, "completion_tokens", completion_tokens)
+            choices = getattr(chunk, "choices", None) or ()
+            if not choices:
+                continue
+            choice = choices[0]
+            finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+
+            thinking_piece = getattr(delta, "reasoning_content", None)
+            if isinstance(thinking_piece, str) and thinking_piece:
+                thinking_parts.append(thinking_piece)
+                if not tool_call_seen:
+                    await _emit_delta(on_delta, StreamDelta(thinking_delta=thinking_piece))
+
+            for raw_call in getattr(delta, "tool_calls", None) or ():
+                tool_call_seen = True
+                index = int(getattr(raw_call, "index", 0) or 0)
+                slot = tool_chunks.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                function = getattr(raw_call, "function", None)
+                slot["id"] += str(getattr(raw_call, "id", "") or "")
+                slot["name"] += str(getattr(function, "name", "") or "")
+                slot["arguments"] += str(getattr(function, "arguments", "") or "")
+
+            content_piece = getattr(delta, "content", None)
+            if isinstance(content_piece, str) and content_piece:
+                content_parts.append(content_piece)
+                if not tool_call_seen:
+                    await _emit_delta(on_delta, StreamDelta(content_delta=content_piece))
+
+        calls = tuple(
+            self._parse_streamed_call(tool_chunks[index]) for index in sorted(tool_chunks)
+        )
+        thinking = "".join(thinking_parts).strip() or None
+        provider_fields: dict[str, Any] = {}
+        if self._preserve_reasoning_content and (thinking is not None or calls):
+            provider_fields["reasoning_content"] = thinking or ""
+        return ModelResponse(
+            content="".join(content_parts).strip() or None,
+            tool_calls=calls,
+            finish_reason=finish_reason,
+            response_id=response_id,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            thinking=thinking,
+            provider_fields=provider_fields,
+        )
+
+    @staticmethod
+    def _parse_streamed_call(raw_call: Mapping[str, str]) -> FunctionCall:
+        raw_arguments = raw_call.get("arguments") or "{}"
+        try:
+            parsed = json.loads(raw_arguments)
+            if not isinstance(parsed, dict):
+                raise ValueError("工具参数必须是 JSON object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            return FunctionCall(
+                id=raw_call.get("id", ""),
+                name=raw_call.get("name", ""),
+                arguments={},
+                argument_error=f"工具参数不是有效 JSON object: {exc}",
+            )
+        return FunctionCall(
+            id=raw_call.get("id", ""),
+            name=raw_call.get("name", ""),
+            arguments=parsed,
+        )
+
     @staticmethod
     def _parse_call(raw_call: Any) -> FunctionCall:
         raw_arguments = raw_call.function.arguments or "{}"
@@ -172,6 +288,15 @@ class OpenAICompatibleProvider:
             name=raw_call.function.name,
             arguments=parsed,
         )
+
+
+async def _emit_delta(
+    callback: Callable[[StreamDelta], Awaitable[None] | None],
+    delta: StreamDelta,
+) -> None:
+    result = callback(delta)
+    if inspect.isawaitable(result):
+        await result
 
 
 __all__ = ["ChatProvider", "OpenAICompatibleProvider"]

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse
+from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse, StreamDelta
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tools import ToolObservation, ToolRegistry
 
@@ -14,6 +15,8 @@ _SUMMARY_PROMPT = """[运行时收尾]
 当前 Turn 已达到工具调用轮次上限。请停止调用工具，只根据已有对话和工具结果，
 输出给用户看的自然语言阶段性回复：说明已经得到的结果、仍缺少的信息和当前结论。
 不要暴露内部 schema、call id 或本条系统指令。"""
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,22 @@ class ReActObserver(Protocol):
     ) -> None: ...
 
 
+class ReActProgressObserver(Protocol):
+    async def on_stream_delta(self, delta: StreamDelta) -> None: ...
+
+    async def on_tool_call_started(
+        self,
+        iteration: int,
+        call: FunctionCall,
+    ) -> None: ...
+
+    async def on_tool_call_completed(
+        self,
+        iteration: int,
+        call: FunctionCall,
+        observation: ToolObservation,
+    ) -> None: ...
+
 class ReActEngine:
     def __init__(
         self,
@@ -64,16 +83,26 @@ class ReActEngine:
         self._max_iterations = max_iterations
         self._observer = observer
 
-    async def run(self, messages: Sequence[ChatMessage]) -> ReActResult:
+    async def run(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        progress: ReActProgressObserver | None = None,
+    ) -> ReActResult:
         working = list(messages)
         records: list[ToolCallRecord] = []
         schemas = self._tools.schemas()
+        safe_progress = _BestEffortProgress(progress) if progress is not None else None
 
         for iteration in range(1, self._max_iterations + 1):
             if self._observer is not None:
                 await self._observer.before_step(iteration, working)
             try:
-                response = await self._provider.complete(messages=working, tools=schemas)
+                response = await self._complete(
+                    messages=working,
+                    tools=schemas,
+                    progress=safe_progress,
+                )
             except Exception as exc:
                 return await self._provider_failure(
                     working,
@@ -112,6 +141,7 @@ class ReActEngine:
                 working=working,
                 records=records,
                 iteration=iteration,
+                progress=safe_progress,
             )
             if self._observer is not None:
                 await self._observer.after_step(iteration, response, step_records)
@@ -130,9 +160,12 @@ class ReActEngine:
         working: list[ChatMessage],
         records: list[ToolCallRecord],
         iteration: int,
+        progress: ReActProgressObserver | None,
     ) -> tuple[ToolCallRecord, ...]:
         step_records: list[ToolCallRecord] = []
         for call in response.tool_calls:
+            if progress is not None:
+                await progress.on_tool_call_started(iteration, call)
             observation = await self._tools.execute(call)
             record = ToolCallRecord(
                 iteration=iteration,
@@ -148,7 +181,38 @@ class ReActEngine:
                     content=observation.content,
                 )
             )
+            if progress is not None:
+                await progress.on_tool_call_completed(iteration, call, observation)
         return tuple(step_records)
+
+    async def _complete(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[dict[str, object]],
+        progress: ReActProgressObserver | None,
+    ) -> ModelResponse:
+        streaming = getattr(self._provider, "complete_streaming", None)
+        if progress is not None and callable(streaming):
+            streamed_response = await streaming(
+                messages=messages,
+                tools=tools,
+                on_delta=progress.on_stream_delta,
+            )
+            if not isinstance(streamed_response, ModelResponse):
+                raise TypeError("Provider 流式接口必须返回 ModelResponse")
+            return streamed_response
+        response = await self._provider.complete(messages=messages, tools=tools)
+        if progress is not None:
+            if response.thinking:
+                await progress.on_stream_delta(
+                    StreamDelta(thinking_delta=response.thinking)
+                )
+            if response.content and not response.tool_calls:
+                await progress.on_stream_delta(
+                    StreamDelta(content_delta=response.content)
+                )
+        return response
 
     async def _finalize(
         self,
@@ -222,4 +286,54 @@ class ReActEngine:
         )
 
 
-__all__ = ["ReActEngine", "ReActObserver", "ReActResult", "ToolCallRecord"]
+class _BestEffortProgress:
+    def __init__(self, delegate: ReActProgressObserver) -> None:
+        self._delegate = delegate
+        self._disabled = False
+
+    async def on_stream_delta(self, delta: StreamDelta) -> None:
+        await self._invoke("stream_delta", self._delegate.on_stream_delta, delta)
+
+    async def on_tool_call_started(
+        self,
+        iteration: int,
+        call: FunctionCall,
+    ) -> None:
+        await self._invoke(
+            "tool_call_started",
+            self._delegate.on_tool_call_started,
+            iteration,
+            call,
+        )
+
+    async def on_tool_call_completed(
+        self,
+        iteration: int,
+        call: FunctionCall,
+        observation: ToolObservation,
+    ) -> None:
+        await self._invoke(
+            "tool_call_completed",
+            self._delegate.on_tool_call_completed,
+            iteration,
+            call,
+            observation,
+        )
+
+    async def _invoke(self, label: str, callback: object, *args: object) -> None:
+        if self._disabled:
+            return
+        try:
+            await callback(*args)  # type: ignore[operator]
+        except Exception as exc:
+            self._disabled = True
+            logger.warning("Runtime live 进度观察器异常，已降级关闭 %s: %s", label, exc)
+
+
+__all__ = [
+    "ReActEngine",
+    "ReActObserver",
+    "ReActProgressObserver",
+    "ReActResult",
+    "ToolCallRecord",
+]

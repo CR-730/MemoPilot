@@ -7,11 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from memopilot.channels.base import AttachmentStore, SessionIdentityIndex
 from memopilot.channels.contracts import InterruptAcknowledgement, MessageBus
-from memopilot.channels.feishu import FeishuChannel
+from memopilot.channels.feishu import FeishuApiError, FeishuChannel
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.tasks.operational import OperationalRepository
 
@@ -303,6 +304,54 @@ async def test_text_send_uses_caller_supplied_uuid_and_returns_message_id(tmp_pa
     body = channel._api_request.await_args.args[2]
     assert body["uuid"] == "4fddab9d-f30c-5c31-850c-849ebc958f9a"
     assert json.loads(body["content"]) == {"text": "回复"}
+
+
+@pytest.mark.asyncio
+async def test_live_card_can_be_created_then_patched_in_place(tmp_path: Path) -> None:
+    channel, _ = _channel(tmp_path)
+    channel._get_tenant_access_token = AsyncMock(return_value="token")  # type: ignore[method-assign]
+    channel._api_request = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[{"message_id": "om-live"}, {}]
+    )
+
+    receipt = await channel.send_card(
+        "chat-1",
+        '{"schema":"2.0"}',
+        provider_uuid="live-uuid",
+    )
+    await channel.patch_card(receipt.message_id, '{"schema":"2.0","done":true}')
+
+    create = channel._api_request.await_args_list[0]
+    patch = channel._api_request.await_args_list[1]
+    assert create.args[:2] == ("POST", "/im/v1/messages")
+    assert create.args[2] == {
+        "receive_id": "chat-1",
+        "msg_type": "interactive",
+        "content": '{"schema":"2.0"}',
+        "uuid": "live-uuid",
+    }
+    assert patch.args[:2] == ("PATCH", "/im/v1/messages/om-live")
+    assert patch.args[2] == {"content": '{"schema":"2.0","done":true}'}
+
+
+@pytest.mark.asyncio
+async def test_business_rate_limit_keeps_structured_feishu_error(tmp_path: Path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={"code": 99991400, "msg": "rate limited", "data": {}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    channel, _ = _channel(tmp_path, client=client)
+
+    with pytest.raises(FeishuApiError) as captured:
+        await channel._api_request("POST", "/im/v1/messages", {}, token="token")
+
+    assert captured.value.business_code == 99991400
+    assert "rate limited" in str(captured.value)
+    await client.aclose()
 
 
 @pytest.mark.asyncio

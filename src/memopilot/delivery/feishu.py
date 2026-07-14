@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol, cast
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 
@@ -17,11 +20,14 @@ from memopilot.delivery.effects import (
     EffectRequest,
     EffectTransition,
 )
+from memopilot.delivery.feishu_live import FeishuLiveProgress, LiveCardTransport
 from memopilot.tasks.operational import (
     FenceToken,
     OperationalRepository,
     RunClaim,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class TextTransport(Protocol):
@@ -61,6 +67,40 @@ class FinalResponseDispatcher:
         self._transport = transport
         self._clock = clock or (lambda: datetime.now(UTC))
 
+    def create_live_progress(
+        self,
+        *,
+        claim: RunClaim,
+        lease: FenceToken,
+    ) -> FeishuLiveProgress | None:
+        try:
+            if not hasattr(self._transport, "send_card") or not hasattr(
+                self._transport, "patch_card"
+            ):
+                return None
+            job = self._operational.get_job(claim.job_id)
+            if job is None:
+                return None
+            chat_id = str(json.loads(job.payload_json).get("chat_id") or "")
+            if not chat_id:
+                return None
+            provider_uuid = str(uuid5(NAMESPACE_URL, f"feishu:{claim.run_id}:live-card"))
+            return FeishuLiveProgress(
+                cast(LiveCardTransport, cast(Any, self._transport)),
+                chat_id=chat_id,
+                provider_uuid=provider_uuid,
+                authorize=lambda creating: self._operational.authorize_live_progress(
+                    claim.run_id,
+                    lease=lease,
+                    expected_activity_version=job.activity_version,
+                    now=self._clock(),
+                    creating=creating,
+                ),
+            )
+        except Exception as exc:
+            logger.warning("飞书 live 初始化失败，已降级为仅发送最终回复: %s", exc)
+            return None
+
     async def dispatch(
         self,
         *,
@@ -71,8 +111,6 @@ class FinalResponseDispatcher:
         job = self._operational.get_job(claim.job_id)
         if job is None:
             raise KeyError(claim.job_id)
-        import json
-
         payload = json.loads(job.payload_json)
         chat_id = str(payload.get("chat_id") or "")
         if not chat_id:

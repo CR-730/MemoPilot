@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from memopilot.runtime.contracts import ChatMessage, FunctionCall
+from memopilot.runtime.contracts import ChatMessage, FunctionCall, StreamDelta
 from memopilot.runtime.providers import OpenAICompatibleProvider
 
 
@@ -288,3 +288,143 @@ async def test_deepseek_factory_disables_thinking_by_default(
     await provider.complete(messages=(ChatMessage.user("hello"),), tools=())
 
     assert completions.calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+class _AsyncChunks:
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = chunks
+
+    def __aiter__(self) -> _AsyncChunks:
+        return self
+
+    async def __anext__(self) -> Any:
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
+async def test_streaming_provider_emits_reasoning_and_content_deltas() -> None:
+    stream = _AsyncChunks(
+        [
+            SimpleNamespace(
+                id="chat-stream",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason=None,
+                        delta=SimpleNamespace(
+                            reasoning_content="先分析",
+                            content=None,
+                            tool_calls=None,
+                        ),
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                id="chat-stream",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        delta=SimpleNamespace(
+                            reasoning_content=None,
+                            content="最终答案",
+                            tool_calls=None,
+                        ),
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=8, completion_tokens=5),
+            ),
+        ]
+    )
+    client, completions = _client(stream)
+    provider = OpenAICompatibleProvider(
+        client=client,
+        model="deepseek-v4-pro",
+        preserve_reasoning_content=True,
+    )
+    deltas: list[StreamDelta] = []
+
+    result = await provider.complete_streaming(
+        messages=(ChatMessage.user("hello"),),
+        tools=(),
+        on_delta=deltas.append,
+    )
+
+    assert deltas == [
+        StreamDelta(thinking_delta="先分析"),
+        StreamDelta(content_delta="最终答案"),
+    ]
+    assert result.thinking == "先分析"
+    assert result.content == "最终答案"
+    assert result.provider_fields == {"reasoning_content": "先分析"}
+    assert result.finish_reason == "stop"
+    assert result.prompt_tokens == 8
+    assert result.completion_tokens == 5
+    assert completions.calls[0]["stream"] is True
+    assert completions.calls[0]["stream_options"] == {"include_usage": True}
+
+
+async def test_streaming_provider_reassembles_tool_call_chunks() -> None:
+    stream = _AsyncChunks(
+        [
+            SimpleNamespace(
+                id="chat-tool-stream",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason=None,
+                        delta=SimpleNamespace(
+                            reasoning_content="先查",
+                            content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id="call-",
+                                    function=SimpleNamespace(name="echo", arguments='{"text":'),
+                                )
+                            ],
+                        ),
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                id="chat-tool-stream",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="tool_calls",
+                        delta=SimpleNamespace(
+                            reasoning_content=None,
+                            content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id="1",
+                                    function=SimpleNamespace(name="", arguments='"hi"}'),
+                                )
+                            ],
+                        ),
+                    )
+                ],
+                usage=None,
+            ),
+        ]
+    )
+    client, _ = _client(stream)
+    provider = OpenAICompatibleProvider(
+        client=client,
+        model="deepseek-v4-pro",
+        preserve_reasoning_content=True,
+    )
+    deltas: list[StreamDelta] = []
+
+    result = await provider.complete_streaming(
+        messages=(ChatMessage.user("hello"),),
+        tools=(),
+        on_delta=deltas.append,
+    )
+
+    assert result.tool_calls == (
+        FunctionCall(id="call-1", name="echo", arguments={"text": "hi"}),
+    )
+    assert result.provider_fields == {"reasoning_content": "先查"}
+    assert deltas == [StreamDelta(thinking_delta="先查")]
