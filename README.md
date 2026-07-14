@@ -15,7 +15,7 @@
 </div>
 
 > [!IMPORTANT]
-> MemoPilot 当前处于工程初始化阶段，系统设计已经完成，核心 Runtime 正在按路线图持续开发。
+> MemoPilot 已完成可靠任务底座与核心 Agent Runtime，当前正按路线图继续接入飞书、分层记忆和主动能力。
 
 ## 为什么做 MemoPilot
 
@@ -100,7 +100,15 @@ uv sync --all-groups
 uv run pytest
 ```
 
-当前命令只验证工程基线。Agent 启动命令将在 App、Worker 与 Scheduler 完成后加入。
+当前自动化测试使用 Fake Provider，不需要模型 API Key，也不会产生外部副作用。App、Worker 与 Scheduler 的正式启动命令将在对应阶段完成后加入。
+
+阶段 2 还提供真实 DeepSeek 手动冒烟脚本。配置 `MEMOPILOT_CHAT_API_KEY` 后，它会要求模型调用一个无副作用的本地状态工具，再输出自然语言结果：
+
+```bash
+uv run python scripts/smoke_deepseek_runtime.py
+```
+
+默认模型为 `deepseek-v4-flash`，可通过 `MEMOPILOT_CHAT_MODEL` 覆盖；Provider 使用统一 OpenAI-compatible Chat Completions 接口。阶段 2 的 DeepSeek 适配显式关闭思考模式，避免工具调用后遗漏 `reasoning_content`；后续若启用思考模式，必须先补齐思考内容的完整回传合同。
 
 ### 配置
 
@@ -119,7 +127,7 @@ cp .env.example .env
 - [x] 完成系统设计、可靠性评审与两周范围划分
 - [x] 创建项目仓库、Python 包和工程基线
 - [x] 建立三库迁移、Transactional Inbox / Outbox 与 Redis 任务底座
-- [ ] 实现 Phase Pipeline、ReAct Runtime 与统一工具执行
+- [x] 实现 Phase Pipeline、ReAct Runtime 与统一工具执行
 - [ ] 接入飞书私聊和可靠外发状态机
 - [ ] 实现分层检索、Consolidation 与 Memory Optimizer
 - [ ] 接入插件、Skills、MCP、主动唤醒与定时任务
@@ -131,6 +139,7 @@ cp .env.example .env
 ```text
 MemoPilot/
 ├── src/memopilot/     # Agent 核心代码
+├── scripts/           # 手动冒烟与后续演示脚本
 ├── tests/             # 单元、集成、回放与 E2E 测试
 ├── config/             # 不含 Secret 的 YAML 默认配置
 ├── .env.example       # 无 Secret 的配置示例

@@ -42,7 +42,7 @@ class MemoPilotSettings(BaseSettings):
     traces_dir: Path = Path("traces")
 
     chat_base_url: str = "https://api.deepseek.com"
-    chat_model: str = "deepseek-chat"
+    chat_model: str = "deepseek-v4-flash"
     chat_api_key: SecretStr = SecretStr("")
 
     embedding_base_url: str = ""
@@ -67,6 +67,9 @@ class MemoPilotSettings(BaseSettings):
     mcp_startup_timeout_seconds: float = Field(default=15, gt=0)
     mcp_call_timeout_seconds: float = Field(default=30, gt=0)
     llm_retry_limit: int = Field(default=2, ge=0)
+    llm_max_iterations: int = Field(default=10, gt=0)
+    llm_max_output_tokens: int = Field(default=2048, gt=0)
+    llm_timeout_seconds: float = Field(default=60, gt=0)
     display_timezone: str = "Asia/Shanghai"
 
     @classmethod

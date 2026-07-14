@@ -77,7 +77,23 @@ class OutboxRecord:
 class RunClaim:
     run_id: str
     job_id: str
+    session_key: str
     attempt_no: int
+    owner_id: str
+    fencing_epoch: int
+
+
+@dataclass(frozen=True, slots=True)
+class StepRecord:
+    step_id: str
+    run_id: str
+    step_index: int
+    phase: str
+    step_type: str
+    state: str
+    tool_name: str | None
+    input_json: str | None
+    observation_json: str | None
     owner_id: str
     fencing_epoch: int
 
@@ -94,6 +110,7 @@ class OperationalRepository:
             "outbox_events",
             "runs",
             "run_attempts",
+            "steps",
         }
     )
 
@@ -517,6 +534,7 @@ class OperationalRepository:
                     return RunClaim(
                         str(existing["run_id"]),
                         job_id,
+                        lease.session_key,
                         int(attempt[0]),
                         lease.owner_id,
                         lease.epoch,
@@ -594,7 +612,14 @@ class OperationalRepository:
                 ),
             )
             connection.execute("COMMIT")
-            return RunClaim(run_id, job_id, attempt_no, lease.owner_id, lease.epoch)
+            return RunClaim(
+                run_id,
+                job_id,
+                lease.session_key,
+                attempt_no,
+                lease.owner_id,
+                lease.epoch,
+            )
         except Exception:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -609,9 +634,14 @@ class OperationalRepository:
         try:
             self._require_current_fence(connection, lease)
             run = connection.execute(
-                "SELECT job_id FROM runs WHERE run_id = ? AND state = 'running' "
-                "AND owner_id = ? AND fencing_epoch = ?",
-                (run_id, lease.owner_id, lease.epoch),
+                """
+                SELECT r.job_id FROM runs AS r
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                WHERE r.run_id = ? AND r.state = 'running'
+                  AND r.owner_id = ? AND r.fencing_epoch = ?
+                  AND j.session_key = ?
+                """,
+                (run_id, lease.owner_id, lease.epoch, lease.session_key),
             ).fetchone()
             if run is None:
                 raise LostLeaseError("Run 已不属于当前 lease")
@@ -638,6 +668,139 @@ class OperationalRepository:
         finally:
             connection.close()
 
+    def append_step(
+        self,
+        run_id: str,
+        *,
+        lease: FenceToken,
+        phase: str,
+        step_type: str,
+        state: str,
+        now: datetime,
+        tool_name: str | None = None,
+        input: Mapping[str, Any] | None = None,
+        observation: Mapping[str, Any] | None = None,
+    ) -> StepRecord:
+        """以当前 fencing 身份向 Run 追加一个不可变执行步骤。"""
+        allowed_states = {
+            "pending",
+            "running",
+            "succeeded",
+            "failed",
+            "skipped",
+            "cancelled",
+            "unknown",
+        }
+        if state not in allowed_states:
+            raise ValueError(f"不支持的 Step 状态: {state}")
+        if not phase or not step_type:
+            raise ValueError("Step phase 和 step_type 不能为空")
+        now_text = _utc_iso(now)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_current_fence(connection, lease)
+            run = connection.execute(
+                """
+                SELECT 1 FROM runs AS r
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                WHERE r.run_id = ? AND r.state = 'running'
+                  AND r.owner_id = ? AND r.fencing_epoch = ?
+                  AND j.session_key = ?
+                """,
+                (run_id, lease.owner_id, lease.epoch, lease.session_key),
+            ).fetchone()
+            if run is None:
+                raise LostLeaseError("Run 已不属于当前 lease")
+            index_row = connection.execute(
+                "SELECT COALESCE(MAX(step_index), -1) + 1 FROM steps WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            assert index_row is not None
+            step_index = int(index_row[0])
+            step_id = _stable_id("step", f"{run_id}:{step_index}")
+            input_json = (
+                json.dumps(input, ensure_ascii=False, sort_keys=True, default=str)
+                if input is not None
+                else None
+            )
+            observation_json = (
+                json.dumps(observation, ensure_ascii=False, sort_keys=True, default=str)
+                if observation is not None
+                else None
+            )
+            connection.execute(
+                """
+                INSERT INTO steps(
+                    step_id, run_id, step_index, phase, step_type, state,
+                    tool_name, input_json, observation_json, owner_id,
+                    fencing_epoch, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    step_id,
+                    run_id,
+                    step_index,
+                    phase,
+                    step_type,
+                    state,
+                    tool_name,
+                    input_json,
+                    observation_json,
+                    lease.owner_id,
+                    lease.epoch,
+                    now_text,
+                    now_text,
+                ),
+            )
+            connection.execute("COMMIT")
+            return StepRecord(
+                step_id=step_id,
+                run_id=run_id,
+                step_index=step_index,
+                phase=phase,
+                step_type=step_type,
+                state=state,
+                tool_name=tool_name,
+                input_json=input_json,
+                observation_json=observation_json,
+                owner_id=lease.owner_id,
+                fencing_epoch=lease.epoch,
+            )
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def list_steps(self, run_id: str) -> tuple[StepRecord, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM steps WHERE run_id = ? ORDER BY step_index",
+                (run_id,),
+            ).fetchall()
+        return tuple(
+            StepRecord(
+                step_id=str(row["step_id"]),
+                run_id=str(row["run_id"]),
+                step_index=int(row["step_index"]),
+                phase=str(row["phase"]),
+                step_type=str(row["step_type"]),
+                state=str(row["state"]),
+                tool_name=str(row["tool_name"]) if row["tool_name"] is not None else None,
+                input_json=str(row["input_json"]) if row["input_json"] is not None else None,
+                observation_json=(
+                    str(row["observation_json"])
+                    if row["observation_json"] is not None
+                    else None
+                ),
+                owner_id=str(row["owner_id"]),
+                fencing_epoch=int(row["fencing_epoch"]),
+            )
+            for row in rows
+        )
+
     def recover_stale_job(
         self,
         job_id: str,
@@ -657,9 +820,10 @@ class OperationalRepository:
                 SELECT r.run_id, r.state, COALESCE(r.heartbeat_at, r.updated_at) AS last_seen
                 FROM runs AS r
                 JOIN agent_jobs AS j ON j.job_id = r.job_id
-                WHERE r.job_id = ? AND j.state = 'running' AND r.state = 'running'
+                WHERE r.job_id = ? AND j.session_key = ?
+                  AND j.state = 'running' AND r.state = 'running'
                 """,
-                (job_id,),
+                (job_id, lease.session_key),
             ).fetchone()
             if run is None or str(run["last_seen"]) > cutoff:
                 connection.execute("COMMIT")
@@ -769,11 +933,13 @@ class OperationalRepository:
             self._require_current_fence(connection, lease)
             run = connection.execute(
                 """
-                SELECT job_id FROM runs
-                WHERE run_id = ? AND state = 'running'
-                  AND owner_id = ? AND fencing_epoch = ?
+                SELECT r.job_id FROM runs AS r
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                WHERE r.run_id = ? AND r.state = 'running'
+                  AND r.owner_id = ? AND r.fencing_epoch = ?
+                  AND j.session_key = ?
                 """,
-                (run_id, lease.owner_id, lease.epoch),
+                (run_id, lease.owner_id, lease.epoch, lease.session_key),
             ).fetchone()
             if run is None:
                 raise LostLeaseError("Run 已不属于当前 lease")

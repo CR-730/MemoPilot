@@ -2,7 +2,7 @@
 workspace: workspace
 
 chat_base_url: https://api.deepseek.com
-chat_model: deepseek-chat
+chat_model: deepseek-v4-flash
 redis_url: redis://localhost:6379/0
 
 wake_tick_seconds: 300
@@ -15,4 +15,7 @@ sqlite_busy_timeout_seconds: 5
 mcp_startup_timeout_seconds: 15
 mcp_call_timeout_seconds: 30
 llm_retry_limit: 2
+llm_max_iterations: 10
+llm_max_output_tokens: 2048
+llm_timeout_seconds: 60
 display_timezone: Asia/Shanghai

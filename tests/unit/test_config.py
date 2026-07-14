@@ -13,7 +13,7 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
     settings = MemoPilotSettings(_env_file=None)
 
     assert settings.chat_base_url == "https://api.deepseek.com"
-    assert settings.chat_model == "deepseek-chat"
+    assert settings.chat_model == "deepseek-v4-flash"
     assert settings.wake_tick_seconds == 300
     assert settings.content_half_life_hours == 6
     assert settings.proactive_cooldown_hours == 2
@@ -24,6 +24,9 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
     assert settings.mcp_startup_timeout_seconds == 15
     assert settings.mcp_call_timeout_seconds == 30
     assert settings.llm_retry_limit == 2
+    assert settings.llm_max_iterations == 10
+    assert settings.llm_max_output_tokens == 2048
+    assert settings.llm_timeout_seconds == 60
 
 
 def test_environment_overrides_dotenv_and_yaml(
