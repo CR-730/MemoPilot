@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,8 @@ EXPECTED_TABLES = {
         "scheduled_executions",
         "consolidation_manifests",
         "messages",
+        "session_identities",
+        "session_interrupts",
     },
     DatabaseKind.MEMORY: {
         "memory_items",
@@ -52,13 +55,14 @@ EXPECTED_TABLES = {
 
 
 @pytest.mark.parametrize("kind", list(DatabaseKind))
-def test_v1_migration_creates_expected_schema(tmp_path: Path, kind: DatabaseKind) -> None:
+def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -> None:
     database = tmp_path / f"{kind.value}.db"
 
     report = migrate_database(database, kind)
 
     assert report.from_version == 0
-    assert report.to_version == 1
+    expected_version = 2 if kind is DatabaseKind.OPERATIONAL else 1
+    assert report.to_version == expected_version
     assert report.backup_path is None
     with connect_database(database) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -66,11 +70,44 @@ def test_v1_migration_creates_expected_schema(tmp_path: Path, kind: DatabaseKind
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
         table_names = {str(row[0]) for row in table_rows}
-        assert version == 1
+        assert version == expected_version
         assert EXPECTED_TABLES[kind] <= table_names
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5_000
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_operational_v1_upgrades_to_v2_without_losing_existing_rows(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    v1_sql = (
+        files("memopilot.persistence.schema")
+        .joinpath("operational_v1.sql")
+        .read_text("utf-8")
+    )
+    with sqlite3.connect(database) as connection:
+        connection.executescript(v1_sql)
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute(
+            "INSERT INTO sessions(session_key, channel, chat_id, created_at, updated_at) "
+            "VALUES ('feishu:chat-1', 'feishu', 'chat-1', 'now', 'now')"
+        )
+
+    report = migrate_database(database, DatabaseKind.OPERATIONAL)
+
+    assert report.from_version == 1
+    assert report.to_version == 2
+    assert report.applied_versions == (2,)
+    assert report.backup_path is not None
+    with connect_database(database) as connection:
+        session = connection.execute(
+            "SELECT chat_id FROM sessions WHERE session_key = 'feishu:chat-1'"
+        ).fetchone()
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(outbound_effects)").fetchall()
+        }
+    assert session is not None and session[0] == "chat-1"
+    assert {"channel", "chat_id", "payload_json", "last_attempt_at"} <= columns
 
 
 def test_migration_backs_up_existing_database_before_upgrade(tmp_path: Path) -> None:

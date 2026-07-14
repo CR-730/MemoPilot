@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 
+from memopilot.delivery.feishu import DeliveryOutcome, FinalResponseDispatcher
 from memopilot.runtime.engine import AgentRuntime, TurnInput, TurnResult
 from memopilot.runtime.persistence import OperationalStepSink
 from memopilot.tasks.operational import (
@@ -21,10 +22,12 @@ class RuntimeJobExecutor:
         repository: OperationalRepository,
         runtime: AgentRuntime,
         *,
+        final_response_dispatcher: FinalResponseDispatcher | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._repository = repository
         self._runtime = runtime
+        self._final_response_dispatcher = final_response_dispatcher
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def execute(
@@ -63,7 +66,22 @@ class RuntimeJobExecutor:
             except LostLeaseError:
                 pass
             raise
-        outcome = "failed" if result.react.infrastructure_error else "succeeded"
+        if result.react.infrastructure_error:
+            outcome = "failed"
+        elif self._final_response_dispatcher is None:
+            outcome = "succeeded"
+        else:
+            delivery = await self._final_response_dispatcher.dispatch(
+                claim=claim,
+                lease=lease,
+                text=result.reply,
+            )
+            outcome = {
+                DeliveryOutcome.CONFIRMED: "succeeded",
+                DeliveryOutcome.CANCELLED: "cancelled",
+                DeliveryOutcome.FAILED: "failed",
+                DeliveryOutcome.NEEDS_REVIEW: "needs_review",
+            }[delivery.outcome]
         self._repository.finish_job(
             claim.run_id,
             lease=lease,

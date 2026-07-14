@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
-from memopilot.tasks.operational import InboundCommand, OperationalRepository
+from memopilot.tasks.operational import (
+    InboundCommand,
+    InterruptCommand,
+    OperationalRepository,
+)
 
 NOW = datetime(2026, 7, 13, 8, 0, tzinfo=UTC)
 
@@ -100,3 +104,56 @@ def test_concurrent_duplicate_inbound_is_serialized_by_sqlite(tmp_path: Path) ->
     assert repository.get_activity_version("feishu:chat-1") == 1
     assert repository.count("agent_jobs") == 1
     assert repository.count("outbox_events") == 1
+
+
+def test_session_identities_are_upserted_and_rebuilt_by_channel(tmp_path: Path) -> None:
+    repository = make_repository(tmp_path)
+    repository.accept_inbound(make_command())
+
+    repository.remember_session_identities(
+        session_key="feishu:chat-1",
+        channel="feishu",
+        chat_id="chat-1",
+        identities={"open_id": "ou_1", "user_id": "u_1", "union_id": "on_1"},
+        now=NOW,
+    )
+    repository.remember_session_identities(
+        session_key="feishu:chat-1",
+        channel="feishu",
+        chat_id="chat-1",
+        identities={"open_id": "ou_1", "user_id": "u_1"},
+        now=NOW,
+    )
+
+    identities = repository.list_session_identities("feishu")
+    assert {(item.identity_kind, item.identity_value, item.chat_id) for item in identities} == {
+        ("open_id", "ou_1", "chat-1"),
+        ("user_id", "u_1", "chat-1"),
+        ("union_id", "on_1", "chat-1"),
+    }
+    assert repository.count("session_identities") == 3
+
+
+def test_duplicate_interrupt_only_increments_activity_once_and_creates_no_job(
+    tmp_path: Path,
+) -> None:
+    repository = make_repository(tmp_path)
+    repository.accept_inbound(make_command())
+    command = InterruptCommand(
+        event_id="stop-event-1",
+        message_id="stop-message-1",
+        session_key="feishu:chat-1",
+        channel="feishu",
+        chat_id="chat-1",
+        requested_at=NOW,
+    )
+
+    first = repository.request_interrupt(command)
+    duplicate = repository.request_interrupt(command)
+
+    assert first.created is True
+    assert duplicate.created is False
+    assert duplicate.activity_version == first.activity_version == 2
+    assert repository.get_activity_version("feishu:chat-1") == 2
+    assert repository.count("session_interrupts") == 1
+    assert repository.count("agent_jobs") == 1

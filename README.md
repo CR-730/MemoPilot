@@ -14,7 +14,7 @@
 </div>
 
 > [!IMPORTANT]
-> MemoPilot 已完成可靠任务底座与核心 Agent Runtime，当前正在继续接入飞书、分层记忆和主动能力。
+> MemoPilot 已完成可靠任务底座、核心 Agent Runtime 与飞书私聊闭环，当前正在继续实现分层记忆和主动能力。
 
 ## 为什么做 MemoPilot
 
@@ -90,7 +90,7 @@ flowchart LR
 
 ## 开发环境
 
-项目使用 Python 3.12 与 [uv](https://docs.astral.sh/uv/) 管理环境。阶段 1 的集成测试还需要本机 Redis 7.2 或更高版本监听 `127.0.0.1:6379`；Python 依赖仍全部由 `uv` 隔离管理，不要求使用 Docker 开发。
+项目使用 Python 3.12 与 [uv](https://docs.astral.sh/uv/) 管理环境。Redis 集成测试需要本机 Redis 7.2 或更高版本监听 `127.0.0.1:6379`；Python 依赖仍全部由 `uv` 隔离管理，不要求使用 Docker 开发。
 
 ```bash
 git clone https://github.com/CR-730/MemoPilot.git
@@ -99,7 +99,7 @@ uv sync --all-groups
 uv run pytest
 ```
 
-当前自动化测试使用 Fake Provider，不需要模型 API Key，也不会产生外部副作用。App、Worker 与 Scheduler 的正式启动命令将在对应阶段完成后加入。
+当前自动化测试使用 Fake Provider 与 Fake Feishu，不需要模型 API Key，也不会产生外部副作用。App、Worker 与 Scheduler 的正式启动命令将在整体装配阶段加入。
 
 阶段 2 还提供真实 DeepSeek 手动冒烟脚本。配置 `MEMOPILOT_CHAT_API_KEY` 后，它会要求模型调用一个无副作用的本地状态工具，再输出自然语言结果：
 
@@ -127,7 +127,7 @@ cp .env.example .env
 - [x] 创建项目仓库、Python 包和工程基线
 - [x] 建立三库迁移、Transactional Inbox / Outbox 与 Redis 任务底座
 - [x] 实现 Phase Pipeline、ReAct Runtime 与统一工具执行
-- [ ] 接入飞书私聊和可靠外发状态机
+- [x] 接入飞书私聊和可靠外发状态机
 - [ ] 实现分层检索、Consolidation 与 Memory Optimizer
 - [ ] 接入插件、Skills、MCP、主动唤醒与定时任务
 - [ ] 完成 Inspector、Docker Compose、故障测试和演示脚本

@@ -43,11 +43,35 @@ class InboundCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class InterruptCommand:
+    event_id: str
+    message_id: str
+    session_key: str
+    channel: str
+    chat_id: str
+    requested_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class EnqueueResult:
     job_id: str
     outbox_id: str
     activity_version: int
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptResult:
+    activity_version: int
+    created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SessionIdentityRecord:
+    identity_kind: str
+    identity_value: str
+    session_key: str
+    chat_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,8 +132,11 @@ class OperationalRepository:
             "inbound_events",
             "agent_jobs",
             "outbox_events",
+            "outbound_effects",
             "runs",
             "run_attempts",
+            "session_identities",
+            "session_interrupts",
             "steps",
         }
     )
@@ -274,6 +301,153 @@ class OperationalRepository:
                 (session_key,),
             ).fetchone()
         return None if row is None else int(row["activity_version"])
+
+    def remember_session_identities(
+        self,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        identities: Mapping[str, str],
+        now: datetime,
+    ) -> None:
+        allowed_kinds = {"open_id", "user_id", "union_id"}
+        normalized = {
+            kind: str(value).strip()
+            for kind, value in identities.items()
+            if kind in allowed_kinds and str(value).strip()
+        }
+        if not normalized:
+            return
+        now_text = _utc_iso(now)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                INSERT INTO sessions(session_key, channel, chat_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    channel = excluded.channel,
+                    chat_id = excluded.chat_id,
+                    updated_at = excluded.updated_at
+                """,
+                (session_key, channel, chat_id, now_text, now_text),
+            )
+            for kind, value in normalized.items():
+                connection.execute(
+                    """
+                    INSERT INTO session_identities(
+                        channel, identity_kind, identity_value, session_key, chat_id, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(channel, identity_kind, identity_value) DO UPDATE SET
+                        session_key = excluded.session_key,
+                        chat_id = excluded.chat_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (channel, kind, value, session_key, chat_id, now_text),
+                )
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def list_session_identities(self, channel: str) -> tuple[SessionIdentityRecord, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT identity_kind, identity_value, session_key, chat_id
+                FROM session_identities
+                WHERE channel = ?
+                ORDER BY identity_kind, identity_value
+                """,
+                (channel,),
+            ).fetchall()
+        return tuple(
+            SessionIdentityRecord(
+                identity_kind=str(row["identity_kind"]),
+                identity_value=str(row["identity_value"]),
+                session_key=str(row["session_key"]),
+                chat_id=str(row["chat_id"]),
+            )
+            for row in rows
+        )
+
+    def request_interrupt(self, command: InterruptCommand) -> InterruptResult:
+        requested_at = _utc_iso(command.requested_at)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = connection.execute(
+                """
+                SELECT activity_version FROM session_interrupts
+                WHERE event_id = ? OR message_id = ?
+                """,
+                (command.event_id, command.message_id),
+            ).fetchone()
+            if existing is not None:
+                connection.execute("COMMIT")
+                return InterruptResult(int(existing["activity_version"]), False)
+            connection.execute(
+                """
+                INSERT INTO sessions(session_key, channel, chat_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    channel = excluded.channel,
+                    chat_id = excluded.chat_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    command.session_key,
+                    command.channel,
+                    command.chat_id,
+                    requested_at,
+                    requested_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO session_activity(
+                    session_key, activity_version, last_user_at, updated_at
+                ) VALUES (?, 1, ?, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    activity_version = session_activity.activity_version + 1,
+                    last_user_at = excluded.last_user_at,
+                    updated_at = excluded.updated_at
+                """,
+                (command.session_key, requested_at, requested_at),
+            )
+            row = connection.execute(
+                "SELECT activity_version FROM session_activity WHERE session_key = ?",
+                (command.session_key,),
+            ).fetchone()
+            assert row is not None
+            activity_version = int(row["activity_version"])
+            connection.execute(
+                """
+                INSERT INTO session_interrupts(
+                    event_id, message_id, session_key, activity_version, requested_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    command.event_id,
+                    command.message_id,
+                    command.session_key,
+                    activity_version,
+                    requested_at,
+                ),
+            )
+            connection.execute("COMMIT")
+            return InterruptResult(activity_version, True)
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
 
     def claim_next_outbox(
         self,
@@ -976,6 +1150,79 @@ class OperationalRepository:
         finally:
             connection.close()
 
+    def resolve_needs_review(
+        self,
+        run_id: str,
+        *,
+        lease: FenceToken,
+        outcome: str,
+        now: datetime,
+    ) -> None:
+        """在显式核对外部副作用后关闭 needs_review Run。"""
+        if outcome not in {"succeeded", "failed", "cancelled"}:
+            raise ValueError(f"不支持的核对终态: {outcome}")
+        now_text = _utc_iso(now)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_current_fence(connection, lease)
+            existing = connection.execute(
+                """
+                SELECT r.job_id, r.state AS run_state, j.state AS job_state
+                FROM runs AS r JOIN agent_jobs AS j ON j.job_id = r.job_id
+                WHERE r.run_id = ? AND j.session_key = ?
+                """,
+                (run_id, lease.session_key),
+            ).fetchone()
+            if existing is None:
+                raise LostLeaseError("待核对 Run 已不存在或不属于当前会话")
+            if existing["run_state"] == outcome and existing["job_state"] == outcome:
+                connection.execute("COMMIT")
+                return
+            run = connection.execute(
+                """
+                SELECT r.job_id FROM runs AS r
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                WHERE r.run_id = ? AND r.state = 'needs_review'
+                  AND j.state = 'needs_review' AND j.session_key = ?
+                """,
+                (run_id, lease.session_key),
+            ).fetchone()
+            if run is None:
+                raise LostLeaseError("待核对 Run 已不处于 needs_review")
+            connection.execute(
+                """
+                UPDATE runs
+                SET state = ?, owner_id = ?, fencing_epoch = ?,
+                    finished_at = ?, heartbeat_at = ?, updated_at = ?
+                WHERE run_id = ? AND state = 'needs_review'
+                """,
+                (
+                    outcome,
+                    lease.owner_id,
+                    lease.epoch,
+                    now_text,
+                    now_text,
+                    now_text,
+                    run_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE agent_jobs
+                SET state = ?, heartbeat_at = ?, finished_at = ?, updated_at = ?
+                WHERE job_id = ? AND state = 'needs_review'
+                """,
+                (outcome, now_text, now_text, now_text, run["job_id"]),
+            )
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
     @staticmethod
     def _require_current_fence(connection: sqlite3.Connection, lease: FenceToken) -> None:
         row = connection.execute(
@@ -1064,10 +1311,15 @@ def _outbox_record(row: sqlite3.Row) -> OutboxRecord:
 
 __all__ = [
     "EnqueueResult",
+    "FenceToken",
     "InboundCommand",
+    "InterruptCommand",
+    "InterruptResult",
     "JobRecord",
     "LostLeaseError",
     "OperationalRepository",
     "OutboxRecord",
     "RunClaim",
+    "SessionIdentityRecord",
+    "StepRecord",
 ]

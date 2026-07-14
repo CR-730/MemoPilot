@@ -158,8 +158,16 @@ def migrate_all_databases(settings: MemoPilotSettings) -> tuple[MigrationReport,
 
 
 def _load_migrations(kind: DatabaseKind) -> tuple[Migration, ...]:
-    resource = files("memopilot.persistence.schema").joinpath(f"{kind.value}_v1.sql")
-    return (Migration(version=1, name=f"create_{kind.value}_v1", sql=resource.read_text("utf-8")),)
+    schema = files("memopilot.persistence.schema")
+    versions = (1, 2) if kind is DatabaseKind.OPERATIONAL else (1,)
+    return tuple(
+        Migration(
+            version=version,
+            name=f"migrate_{kind.value}_v{version}",
+            sql=schema.joinpath(f"{kind.value}_v{version}.sql").read_text("utf-8"),
+        )
+        for version in versions
+    )
 
 
 def _validate_migration_sequence(migrations: Sequence[Migration]) -> None:
