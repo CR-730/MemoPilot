@@ -7,14 +7,10 @@
 基于 ReAct + Function Calling 构建可追踪的 Agent Runtime，融合分层长期记忆、主动唤醒、定时任务、插件、Skills 与 MCP。
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![状态](https://img.shields.io/badge/状态-开发中-E6A700)](#开发路线)
 [![MCP](https://img.shields.io/badge/MCP-stdio-6B57FF)](https://modelcontextprotocol.io/)
 [![Channel](https://img.shields.io/badge/Channel-飞书私聊-00D6B9)](#项目边界)
 
 </div>
-
-> [!IMPORTANT]
-> MemoPilot 已完成可靠任务底座、核心 Agent Runtime 与飞书私聊闭环，当前正在继续实现分层记忆和主动能力。
 
 ## 为什么做 MemoPilot
 
@@ -99,7 +95,7 @@ uv sync --all-groups
 uv run pytest
 ```
 
-当前自动化测试使用 Fake Provider 与 Fake Feishu，不需要模型 API Key，也不会产生外部副作用。App、Worker 与 Scheduler 的正式启动命令将在整体装配阶段加入。
+当前自动化测试使用 Fake Provider 与 Fake Feishu，不需要模型 API Key，也不会产生外部副作用。
 
 阶段 2 还提供真实 DeepSeek 手动冒烟脚本。配置 `MEMOPILOT_CHAT_API_KEY` 后，它会要求模型调用一个无副作用的本地状态工具，再输出自然语言结果：
 
@@ -121,23 +117,12 @@ cp .env.example .env
 
 非敏感默认值位于 `config/default.yaml`，实际优先级为环境变量 > `.env` > YAML 默认值。启动核心服务前会一次性检查模型、Embedding、飞书 owner 白名单和 workspace 路径；已有向量库还会校验 Provider、模型与向量维度，避免静默混用不兼容向量。
 
-## 开发路线
-
-- [x] 完成核心架构设计、可靠性评审与第一版范围划分
-- [x] 创建项目仓库、Python 包和工程基线
-- [x] 建立三库迁移、Transactional Inbox / Outbox 与 Redis 任务底座
-- [x] 实现 Phase Pipeline、ReAct Runtime 与统一工具执行
-- [x] 接入飞书私聊和可靠外发状态机
-- [ ] 实现分层检索、Consolidation 与 Memory Optimizer
-- [ ] 接入插件、Skills、MCP、主动唤醒与定时任务
-- [ ] 完成 Inspector、Docker Compose、故障测试和演示脚本
-
 ## 仓库结构
 
 ```text
 MemoPilot/
 ├── src/memopilot/     # Agent 核心代码
-├── scripts/           # 手动冒烟与后续演示脚本
+├── scripts/           # 手动冒烟与演示脚本
 ├── tests/             # 单元、集成、回放与 E2E 测试
 ├── config/            # 不含 Secret 的 YAML 默认配置
 ├── .env.example       # 无 Secret 的配置示例
