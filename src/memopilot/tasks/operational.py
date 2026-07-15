@@ -850,6 +850,7 @@ class OperationalRepository:
         expected_activity_version: int,
         now: datetime,
         creating: bool,
+        cancel_on_activity: bool = True,
     ) -> bool:
         """原子确认 live 副作用仍属于当前 Run，且创建未超过一小时窗口。"""
         creation_cutoff = _utc_iso(now - timedelta(hours=1))
@@ -866,7 +867,8 @@ class OperationalRepository:
                   AND r.owner_id = ? AND r.fencing_epoch = ?
                   AND j.session_key = ?
                   AND f.owner_id = ? AND f.current_epoch = ?
-                  AND j.activity_version = ? AND a.activity_version = ?
+                  AND j.activity_version = ?
+                  AND (? = 0 OR a.activity_version = ?)
                   AND (? = 0 OR r.started_at >= ?)
                 """,
                 (
@@ -877,6 +879,7 @@ class OperationalRepository:
                     lease.owner_id,
                     lease.epoch,
                     expected_activity_version,
+                    int(cancel_on_activity),
                     expected_activity_version,
                     int(creating),
                     creation_cutoff,

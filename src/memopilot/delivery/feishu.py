@@ -95,6 +95,7 @@ class FinalResponseDispatcher:
                     expected_activity_version=job.activity_version,
                     now=self._clock(),
                     creating=creating,
+                    cancel_on_activity=False,
                 ),
             )
         except Exception as exc:
@@ -127,6 +128,7 @@ class FinalResponseDispatcher:
                 expected_activity_version=job.activity_version,
                 lease=lease,
                 now=now,
+                cancel_on_activity=False,
             )
         )
         transition = self._effects.begin_send(effect.operation_id, lease=lease, now=now)

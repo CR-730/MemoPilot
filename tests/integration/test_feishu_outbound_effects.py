@@ -265,7 +265,7 @@ async def test_runtime_streams_thinking_to_process_card_before_reliable_final_re
 
 
 @pytest.mark.asyncio
-async def test_live_card_stops_patching_after_new_user_activity(tmp_path: Path) -> None:
+async def test_passive_live_card_keeps_patching_after_new_user_activity(tmp_path: Path) -> None:
     repository, effects, lease, claim = _claimed(tmp_path)
     transport = AsyncMock()
     transport.send_card.return_value = SendReceipt(message_id="om-live")
@@ -285,10 +285,10 @@ async def test_live_card_stops_patching_after_new_user_activity(tmp_path: Path) 
             received_at=NOW + timedelta(seconds=1),
         )
     )
-    await progress.on_stream_delta(StreamDelta(content_delta="旧 Turn 临时答案"))
+    await progress.on_stream_delta(StreamDelta(content_delta="继续刷新" * 60))
 
     transport.send_card.assert_awaited_once()
-    transport.patch_card.assert_not_awaited()
+    transport.patch_card.assert_awaited_once()
 
 
 @pytest.mark.asyncio

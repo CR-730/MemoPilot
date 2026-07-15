@@ -61,7 +61,7 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
     report = migrate_database(database, kind)
 
     assert report.from_version == 0
-    expected_version = 2 if kind is DatabaseKind.OPERATIONAL else 1
+    expected_version = 3 if kind is DatabaseKind.OPERATIONAL else 1
     assert report.to_version == expected_version
     assert report.backup_path is None
     with connect_database(database) as connection:
@@ -95,8 +95,8 @@ def test_operational_v1_upgrades_to_v2_without_losing_existing_rows(tmp_path: Pa
     report = migrate_database(database, DatabaseKind.OPERATIONAL)
 
     assert report.from_version == 1
-    assert report.to_version == 2
-    assert report.applied_versions == (2,)
+    assert report.to_version == 3
+    assert report.applied_versions == (2, 3)
     assert report.backup_path is not None
     with connect_database(database) as connection:
         session = connection.execute(
@@ -107,7 +107,13 @@ def test_operational_v1_upgrades_to_v2_without_losing_existing_rows(tmp_path: Pa
             for row in connection.execute("PRAGMA table_info(outbound_effects)").fetchall()
         }
     assert session is not None and session[0] == "chat-1"
-    assert {"channel", "chat_id", "payload_json", "last_attempt_at"} <= columns
+    assert {
+        "channel",
+        "chat_id",
+        "payload_json",
+        "last_attempt_at",
+        "cancel_on_activity",
+    } <= columns
 
 
 def test_migration_backs_up_existing_database_before_upgrade(tmp_path: Path) -> None:
