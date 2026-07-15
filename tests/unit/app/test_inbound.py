@@ -138,5 +138,5 @@ async def test_stop_controller_publishes_targeted_run_to_interrupt_signal(
 
     result = await controller.request_interrupt(_message(text="/stop", event_id="stop-event"))
 
-    assert result.message == "本轮已中断。你可以继续补充要求，我会接着这件事处理。"
+    assert result.message == "已收到停止请求，正在中断本轮任务。"
     signal.publish.assert_awaited_once_with(claim.run_id)

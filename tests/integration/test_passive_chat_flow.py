@@ -238,7 +238,7 @@ async def test_stop_interrupts_worker_and_next_message_resumes_snapshot(
         )
     )
 
-    assert "本轮已中断" in acknowledgement.message
+    assert acknowledgement.message == "已收到停止请求，正在中断本轮任务。"
     assert await running is True
     assert repository.get_job(first.job_id).state == "cancelled"  # type: ignore[union-attr]
     assert transport.calls == []

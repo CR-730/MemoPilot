@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,7 +14,19 @@ from jsonschema.validators import validator_for
 
 from memopilot.runtime.contracts import FunctionCall, ToolSchema
 
-ToolHandler = Callable[..., Awaitable[Any]]
+ToolHandler = Callable[..., Any]
+
+
+def _is_async_callable(handler: ToolHandler) -> bool:
+    candidates = (handler, type(handler).__call__)
+    for candidate in candidates:
+        try:
+            candidate = inspect.unwrap(candidate)
+        except ValueError:
+            pass
+        if inspect.iscoroutinefunction(candidate):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -21,6 +35,7 @@ class Tool:
     description: str
     parameters: dict[str, Any]
     handler: ToolHandler
+    timeout_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -56,6 +71,13 @@ class ToolRegistry:
             raise ValueError("工具名称不能为空")
         if tool.name in self._tools:
             raise ValueError(f"工具名称重复: {tool.name}")
+        if tool.timeout_seconds <= 0:
+            raise ValueError(f"工具 {tool.name} 的 timeout_seconds 必须大于 0")
+        if not _is_async_callable(tool.handler):
+            raise ValueError(
+                f"工具 {tool.name} 必须提供异步 Handler；"
+                "阻塞操作应使用可取消的异步实现或子进程"
+            )
         validator_class = validator_for(tool.parameters)
         try:
             validator_class.check_schema(tool.parameters)
@@ -87,13 +109,25 @@ class ToolRegistry:
         except ValidationError as exc:
             return self._failure(call, "invalid_arguments", exc.message)
         try:
-            result = await tool.handler(**call.arguments)
-        except Exception as exc:
+            async with asyncio.timeout(tool.timeout_seconds):
+                try:
+                    result = await tool.handler(**call.arguments)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    return self._failure(
+                        call,
+                        "tool_execution_error",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+        except TimeoutError:
             return self._failure(
                 call,
-                "tool_execution_error",
-                f"{type(exc).__name__}: {exc}",
+                "tool_timeout",
+                f"工具执行超过 {tool.timeout_seconds:g} 秒",
             )
+        except asyncio.CancelledError:
+            raise
         return ToolObservation(
             call_id=call.id,
             tool_name=call.name,

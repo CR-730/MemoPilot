@@ -85,7 +85,7 @@ class OperationalInterruptController:
                 logger.warning("Redis 中断通知写入失败，Worker 将回退轮询 SQLite: %s", exc)
         provider_uuid = str(uuid5(NAMESPACE_URL, f"feishu:interrupt:{stable_event_id}"))
         message_text = (
-            "本轮已中断。你可以继续补充要求，我会接着这件事处理。"
+            "已收到停止请求，正在中断本轮任务。"
             if result.target_run_id is not None
             else "当前没有正在执行的任务。"
         )

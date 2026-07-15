@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -48,6 +49,78 @@ def test_registry_rejects_duplicate_names_and_exposes_function_schema() -> None:
     )
 
 
+def test_registry_rejects_sync_handler() -> None:
+    def sync_handler(*, text: str) -> str:
+        return text
+
+    with pytest.raises(ValueError, match="异步"):
+        ToolRegistry([_tool(handler=sync_handler)])
+
+
+def test_registry_accepts_async_callable_object() -> None:
+    class AsyncHandler:
+        async def __call__(self, *, text: str) -> str:
+            return text
+
+    ToolRegistry([_tool(handler=AsyncHandler())])
+
+
+async def test_tool_timeout_becomes_react_observation() -> None:
+    async def never_returns(*, text: str) -> str:
+        await asyncio.Event().wait()
+        return text
+
+    tool = _tool(handler=never_returns)
+    tool = Tool(
+        name=tool.name,
+        description=tool.description,
+        parameters=tool.parameters,
+        handler=tool.handler,
+        timeout_seconds=0.01,
+    )
+
+    observation = await ToolRegistry([tool]).execute(
+        FunctionCall(id="1", name="echo", arguments={"text": "x"})
+    )
+
+    assert observation.ok is False
+    assert observation.error_type == "tool_timeout"
+    assert "0.01" in observation.content
+
+
+async def test_handler_timeout_error_keeps_original_error_semantics() -> None:
+    async def raises_timeout(*, text: str) -> str:
+        raise TimeoutError("upstream timed out")
+
+    observation = await ToolRegistry([_tool(handler=raises_timeout)]).execute(
+        FunctionCall(id="1", name="echo", arguments={"text": "x"})
+    )
+
+    assert observation.ok is False
+    assert observation.error_type == "tool_execution_error"
+    assert observation.error_message == "TimeoutError: upstream timed out"
+
+
+async def test_external_cancellation_is_not_converted_to_tool_error() -> None:
+    entered = asyncio.Event()
+
+    async def cancellable(*, text: str) -> str:
+        entered.set()
+        await asyncio.Event().wait()
+        return text
+
+    execution = asyncio.create_task(
+        ToolRegistry([_tool(handler=cancellable)]).execute(
+            FunctionCall(id="1", name="echo", arguments={"text": "x"})
+        )
+    )
+    await entered.wait()
+    execution.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+
 @pytest.mark.parametrize(
     ("call", "error_type"),
     [
@@ -93,4 +166,3 @@ async def test_successful_tool_result_is_serializable_observation() -> None:
     assert observation.ok is True
     assert observation.result == {"echo": "hello"}
     assert '"ok": true' in observation.content
-
