@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import tomllib
 from pathlib import Path
 from typing import Annotated, Any, Self
 
@@ -56,6 +59,8 @@ class MemoPilotSettings(BaseSettings):
     feishu_app_secret: SecretStr = SecretStr("")
     feishu_allow_from: Annotated[tuple[str, ...], NoDecode] = ()
     feishu_channel_name: str = "feishu"
+    feishu_enabled: bool = True
+    feishu_receive_mode: str = "ws"
 
     wake_tick_seconds: int = Field(default=300, gt=0)
     content_half_life_hours: float = Field(default=6, gt=0)
@@ -160,11 +165,118 @@ class MemoPilotSettings(BaseSettings):
             "MEMOPILOT_EMBEDDING_DIMENSION": self.embedding_dimension,
             "MEMOPILOT_FEISHU_APP_ID": self.feishu_app_id,
             "MEMOPILOT_FEISHU_APP_SECRET": self.feishu_app_secret.get_secret_value(),
-            "MEMOPILOT_FEISHU_ALLOW_FROM": self.feishu_allow_from,
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise ValueError("启动配置不完整，缺少: " + ", ".join(missing))
 
+    def validate_app_ready(self) -> None:
+        missing: list[str] = []
+        if not self.feishu_enabled:
+            missing.append("channels.feishu.enabled=true")
+        if not self.feishu_app_id:
+            missing.append("MEMOPILOT_FEISHU_APP_ID")
+        if not self.feishu_app_secret.get_secret_value():
+            missing.append("MEMOPILOT_FEISHU_APP_SECRET")
+        if self.feishu_receive_mode.lower() != "ws":
+            missing.append("channels.feishu.receive_mode=ws")
+        if missing:
+            raise ValueError("App 启动配置不完整，缺少或不支持: " + ", ".join(missing))
 
-__all__ = ["MemoPilotSettings"]
+    def validate_worker_ready(self) -> None:
+        missing = []
+        if not self.chat_api_key.get_secret_value():
+            missing.append("MEMOPILOT_CHAT_API_KEY")
+        if not self.embedding_base_url:
+            missing.append("MEMOPILOT_EMBEDDING_BASE_URL")
+        if not self.embedding_model:
+            missing.append("MEMOPILOT_EMBEDDING_MODEL")
+        if not self.embedding_api_key.get_secret_value():
+            missing.append("MEMOPILOT_EMBEDDING_API_KEY")
+        if not self.embedding_dimension:
+            missing.append("MEMOPILOT_EMBEDDING_DIMENSION")
+        if not self.feishu_app_id:
+            missing.append("MEMOPILOT_FEISHU_APP_ID")
+        if not self.feishu_app_secret.get_secret_value():
+            missing.append("MEMOPILOT_FEISHU_APP_SECRET")
+        if missing:
+            raise ValueError("Worker 启动配置不完整，缺少: " + ", ".join(missing))
+
+    def validate_effects_ready(self) -> None:
+        """Effects 进程只校验自身发送飞书消息需要的配置。"""
+        missing = []
+        if not self.feishu_app_id:
+            missing.append("MEMOPILOT_FEISHU_APP_ID")
+        if not self.feishu_app_secret.get_secret_value():
+            missing.append("MEMOPILOT_FEISHU_APP_SECRET")
+        if missing:
+            raise ValueError("Effects 启动配置不完整，缺少: " + ", ".join(missing))
+
+
+def load_settings(
+    config_path: str | Path,
+    *,
+    workspace: Path | None = None,
+) -> MemoPilotSettings:
+    """按原型 TOML 字段加载阶段 3 所需配置。"""
+    path = Path(config_path)
+    if path.suffix.lower() != ".toml":
+        raise ValueError(f"主配置仅支持 TOML: {path.suffix}")
+    data = _resolve_environment(tomllib.loads(path.read_text(encoding="utf-8")))
+    llm = _as_dict(data.get("llm"))
+    main = _as_dict(llm.get("main"))
+    agent = _as_dict(data.get("agent"))
+    memory = _as_dict(data.get("memory"))
+    embedding = _as_dict(memory.get("embedding"))
+    channels = _as_dict(data.get("channels"))
+    feishu = _as_dict(channels.get("feishu"))
+    redis = _as_dict(data.get("redis"))
+    values: dict[str, Any] = {
+        "chat_model": main.get("model") or "deepseek-v4-flash",
+        "chat_base_url": main.get("base_url") or "https://api.deepseek.com",
+        "llm_thinking_enabled": bool(main.get("enable_thinking", False)),
+        "llm_max_output_tokens": int(agent.get("max_tokens", 2048)),
+        "llm_max_iterations": int(agent.get("max_iterations", 10)),
+        "feishu_enabled": bool(feishu.get("enabled", True)),
+        "feishu_allow_from": feishu.get("allow_from", feishu.get("allowFrom", ())),
+        "feishu_channel_name": feishu.get("channel_name", "feishu"),
+        "feishu_receive_mode": feishu.get("receive_mode", "ws"),
+        "redis_url": redis.get("url") or data.get("redis_url") or "redis://localhost:6379/0",
+    }
+    optional_values = {
+        "chat_api_key": main.get("api_key"),
+        "embedding_model": embedding.get("model"),
+        "embedding_api_key": embedding.get("api_key"),
+        "embedding_base_url": embedding.get("base_url"),
+        "embedding_dimension": embedding.get("dimension"),
+        "feishu_app_id": feishu.get("app_id", feishu.get("appId")),
+        "feishu_app_secret": feishu.get("app_secret", feishu.get("appSecret")),
+    }
+    values.update({key: value for key, value in optional_values.items() if value not in (None, "")})
+    if workspace is not None:
+        values["workspace"] = workspace
+    return MemoPilotSettings(**values, _env_file=None)  # type: ignore[call-arg]
+
+
+def _resolve_environment(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _resolve_environment(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_environment(item) for item in value]
+    if isinstance(value, str):
+        resolved = re.sub(
+            r"\$\{(\w+)\}",
+            lambda match: os.environ.get(match.group(1), match.group(0)),
+            value,
+        )
+        if re.fullmatch(r"\$\{\w+\}", resolved):
+            return ""
+        return resolved
+    return value
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+__all__ = ["MemoPilotSettings", "load_settings"]

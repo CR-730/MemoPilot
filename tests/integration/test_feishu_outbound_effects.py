@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -10,16 +11,17 @@ import httpx
 import pytest
 
 from memopilot.channels.contracts import SendReceipt
+from memopilot.channels.feishu import FeishuApiError
 from memopilot.delivery.effects import EffectRepository, EffectTransition
 from memopilot.delivery.feishu import FinalResponseDispatcher
-from memopilot.persistence.migrations import DatabaseKind, migrate_database
+from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
 from memopilot.runtime.contracts import ChatMessage, ModelResponse, StreamDelta, ToolSchema
 from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tools import ToolRegistry
-from memopilot.runtime.worker import RuntimeJobExecutor
+from memopilot.runtime.worker import RuntimeJobExecutor, TurnInterrupted
 from memopilot.tasks.lease import SessionLease
-from memopilot.tasks.operational import InboundCommand, OperationalRepository
+from memopilot.tasks.operational import InboundCommand, InterruptCommand, OperationalRepository
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
@@ -123,6 +125,107 @@ async def test_response_loss_marks_effect_and_job_needs_review_without_blind_ret
 
 
 @pytest.mark.asyncio
+async def test_known_send_failure_is_not_left_in_operator_review_list(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    transport.send.side_effect = FeishuApiError(230001, "request rejected")
+    executor = RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_Provider(), tools=ToolRegistry()),
+        final_response_dispatcher=FinalResponseDispatcher(
+            repository, effects, transport, clock=lambda: NOW
+        ),
+        clock=lambda: NOW,
+    )
+
+    await executor.execute(
+        claim=claim,
+        lease=lease,
+        turn=TurnInput(session_key=claim.session_key, content="你好"),
+        now=NOW,
+    )
+
+    assert repository.get_job(claim.job_id).state == "failed"  # type: ignore[union-attr]
+    assert effects.for_run(claim.run_id).state == "cancelled"  # type: ignore[union-attr]
+    assert effects.list_reviewable() == ()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_post_send_error_remains_reviewable(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    transport.send.side_effect = RuntimeError("successful response missing message_id")
+    executor = RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_Provider(), tools=ToolRegistry()),
+        final_response_dispatcher=FinalResponseDispatcher(
+            repository, effects, transport, clock=lambda: NOW
+        ),
+        clock=lambda: NOW,
+    )
+
+    await executor.execute(
+        claim=claim,
+        lease=lease,
+        turn=TurnInput(session_key=claim.session_key, content="你好"),
+        now=NOW,
+    )
+
+    assert repository.get_job(claim.job_id).state == "needs_review"  # type: ignore[union-attr]
+    assert effects.for_run(claim.run_id).state == "unknown"  # type: ignore[union-attr]
+    assert len(effects.list_reviewable()) == 1
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_started_send_marks_effect_unknown_without_replay(
+    tmp_path: Path,
+) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    sending = asyncio.Event()
+
+    class _BlockingTransport:
+        async def send(self, chat_id: str, message: str, *, provider_uuid: str) -> SendReceipt:
+            sending.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    executor = RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_Provider(), tools=ToolRegistry()),
+        final_response_dispatcher=FinalResponseDispatcher(
+            repository, effects, _BlockingTransport(), clock=lambda: NOW
+        ),
+        clock=lambda: NOW,
+    )
+    task = asyncio.create_task(
+        executor.execute(
+            claim=claim,
+            lease=lease,
+            turn=TurnInput(session_key=claim.session_key, content="你好"),
+            now=NOW,
+        )
+    )
+    await sending.wait()
+    repository.request_interrupt(
+        InterruptCommand(
+            event_id="stop-event",
+            message_id="stop-message",
+            session_key=claim.session_key,
+            channel="feishu",
+            chat_id="chat-1",
+            requested_at=NOW,
+        )
+    )
+    task.cancel()
+
+    with pytest.raises(TurnInterrupted):
+        await task
+
+    assert effects.for_run(claim.run_id).state == "unknown"  # type: ignore[union-attr]
+    assert repository.get_job(claim.job_id).state == "needs_review"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
 async def test_explicit_reconciliation_retry_reuses_uuid_and_resolves_job(
     tmp_path: Path,
 ) -> None:
@@ -163,6 +266,41 @@ async def test_explicit_reconciliation_retry_reuses_uuid_and_resolves_job(
     assert transport.send.await_args_list[1].kwargs["provider_uuid"] == first_uuid
     assert effects.get(effect.operation_id).message_id == "om_retried"  # type: ignore[union-attr]
     assert repository.get_job(claim.job_id).state == "succeeded"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_unexpected_error_stays_in_review(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    transport.send.side_effect = [
+        httpx.ReadTimeout("response lost"),
+        RuntimeError("successful response missing message_id"),
+    ]
+    dispatcher = FinalResponseDispatcher(
+        repository,
+        effects,
+        transport,
+        clock=lambda: NOW,
+    )
+    await RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_Provider(), tools=ToolRegistry()),
+        final_response_dispatcher=dispatcher,
+        clock=lambda: NOW,
+    ).execute(
+        claim=claim,
+        lease=lease,
+        turn=TurnInput(session_key=claim.session_key, content="你好"),
+        now=NOW,
+    )
+    effect = effects.for_run(claim.run_id)
+    assert effect is not None
+
+    result = await dispatcher.retry_unknown(effect.operation_id, lease=lease)
+
+    assert result.outcome == "needs_review"
+    assert effects.get(effect.operation_id).state == "unknown"  # type: ignore[union-attr]
+    assert repository.get_job(claim.job_id).state == "needs_review"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -211,6 +349,58 @@ async def test_confirmed_effect_closes_job_after_reconciliation_process_crash(
     assert result.outcome == "confirmed"
     transport.send.assert_not_awaited()
     assert repository.get_job(claim.job_id).state == "succeeded"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "message_id", "effect_state", "job_state"),
+    [
+        ("confirmed", "om-observed", "confirmed", "succeeded"),
+        ("failed", None, "cancelled", "failed"),
+    ],
+)
+async def test_manual_effect_decision_atomically_closes_effect_job_and_run(
+    tmp_path: Path,
+    decision: str,
+    message_id: str | None,
+    effect_state: str,
+    job_state: str,
+) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    transport.send.side_effect = httpx.ReadTimeout("response lost")
+    executor = RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_Provider(), tools=ToolRegistry()),
+        final_response_dispatcher=FinalResponseDispatcher(
+            repository, effects, transport, clock=lambda: NOW
+        ),
+        clock=lambda: NOW,
+    )
+    await executor.execute(
+        claim=claim,
+        lease=lease,
+        turn=TurnInput(session_key=claim.session_key, content="你好"),
+        now=NOW,
+    )
+    effect = effects.for_run(claim.run_id)
+    assert effect is not None
+
+    repository.resolve_effect_review(
+        effect.operation_id,
+        lease=lease,
+        decision=decision,
+        message_id=message_id,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert effects.get(effect.operation_id).state == effect_state  # type: ignore[union-attr]
+    assert repository.get_job(claim.job_id).state == job_state  # type: ignore[union-attr]
+    with connect_database(repository.database) as connection:
+        run_state = connection.execute(
+            "SELECT state FROM runs WHERE run_id = ?", (claim.run_id,)
+        ).fetchone()["state"]
+    assert run_state == job_state
 
 
 @pytest.mark.asyncio
@@ -265,7 +455,7 @@ async def test_runtime_streams_thinking_to_process_card_before_reliable_final_re
 
 
 @pytest.mark.asyncio
-async def test_live_card_stops_patching_after_new_user_activity(tmp_path: Path) -> None:
+async def test_passive_live_card_keeps_patching_after_new_user_activity(tmp_path: Path) -> None:
     repository, effects, lease, claim = _claimed(tmp_path)
     transport = AsyncMock()
     transport.send_card.return_value = SendReceipt(message_id="om-live")
@@ -285,10 +475,66 @@ async def test_live_card_stops_patching_after_new_user_activity(tmp_path: Path) 
             received_at=NOW + timedelta(seconds=1),
         )
     )
-    await progress.on_stream_delta(StreamDelta(content_delta="旧 Turn 临时答案"))
+    await progress.on_stream_delta(StreamDelta(content_delta="继续刷新" * 60))
 
     transport.send_card.assert_awaited_once()
-    transport.patch_card.assert_not_awaited()
+    transport.patch_card.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_proactive_delivery_still_yields_to_new_user_activity(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    with connect_database(repository.database) as connection:
+        connection.execute(
+            "UPDATE agent_jobs SET kind = 'agent.proactive' WHERE job_id = ?",
+            (claim.job_id,),
+        )
+    repository.accept_inbound(
+        InboundCommand(
+            event_id="event-2",
+            message_id="message-2",
+            session_key=claim.session_key,
+            channel="feishu",
+            chat_id="chat-1",
+            payload={"text": "用户正在聊天", "chat_id": "chat-1"},
+            received_at=NOW + timedelta(seconds=1),
+        )
+    )
+    transport = AsyncMock()
+    dispatcher = FinalResponseDispatcher(repository, effects, transport, clock=lambda: NOW)
+
+    delivery = await dispatcher.dispatch(
+        claim=claim,
+        lease=lease,
+        text="主动推送",
+    )
+
+    assert delivery.outcome == "cancelled"
+    assert delivery.effect.cancel_on_activity is True
+    transport.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_targeted_stop_blocks_live_card_even_for_passive_turn(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    dispatcher = FinalResponseDispatcher(repository, effects, transport, clock=lambda: NOW)
+    progress = dispatcher.create_live_progress(claim=claim, lease=lease)
+    assert progress is not None
+    repository.request_interrupt(
+        InterruptCommand(
+            event_id="stop-event",
+            message_id="stop-message",
+            session_key=claim.session_key,
+            channel="feishu",
+            chat_id="chat-1",
+            requested_at=NOW,
+        )
+    )
+
+    await progress.on_stream_delta(StreamDelta(thinking_delta="不应再发送" * 60))
+
+    transport.send_card.assert_not_awaited()
 
 
 @pytest.mark.asyncio

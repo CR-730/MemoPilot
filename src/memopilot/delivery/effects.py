@@ -33,6 +33,7 @@ class EffectRequest:
     expected_activity_version: int
     lease: FenceToken
     now: datetime
+    cancel_on_activity: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +52,7 @@ class EffectRecord:
     fencing_epoch: int
     message_id: str | None
     first_requested_at: str | None
+    cancel_on_activity: bool
 
     @property
     def text(self) -> str:
@@ -85,6 +87,7 @@ class EffectRepository:
                     payload_hash,
                     provider_uuid,
                     request.expected_activity_version,
+                    request.cancel_on_activity,
                 )
                 actual = (
                     record.run_id,
@@ -94,6 +97,7 @@ class EffectRepository:
                     record.payload_hash,
                     record.provider_uuid,
                     record.expected_activity_version,
+                    record.cancel_on_activity,
                 )
                 if actual != expected:
                     raise ValueError("同一 operation_id 不允许改变 payload 或发送身份")
@@ -105,7 +109,8 @@ class EffectRepository:
                     operation_id, run_id, session_key, payload_hash, provider_uuid,
                     expected_activity_version, state, owner_id, fencing_epoch,
                     created_at, updated_at, channel, chat_id, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+                    , cancel_on_activity
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request.operation_id,
@@ -121,6 +126,7 @@ class EffectRepository:
                     request.channel,
                     request.chat_id,
                     payload_json,
+                    int(request.cancel_on_activity),
                 ),
             )
             row = connection.execute(
@@ -174,11 +180,28 @@ class EffectRepository:
             if record.state == "unknown":
                 connection.execute("COMMIT")
                 return EffectTransition.NEEDS_REVIEW
+            interrupted = connection.execute(
+                """
+                SELECT 1 FROM session_interrupts
+                WHERE target_run_id = ? AND state = 'pending' LIMIT 1
+                """,
+                (record.run_id,),
+            ).fetchone()
+            if interrupted is not None:
+                connection.execute(
+                    """
+                    UPDATE outbound_effects SET state = 'cancelled', updated_at = ?
+                    WHERE operation_id = ?
+                    """,
+                    (now_text, operation_id),
+                )
+                connection.execute("COMMIT")
+                return EffectTransition.CANCELLED
             activity = connection.execute(
                 "SELECT activity_version FROM session_activity WHERE session_key = ?",
                 (record.session_key,),
             ).fetchone()
-            if (
+            if record.cancel_on_activity and (
                 activity is None
                 or int(activity["activity_version"]) != record.expected_activity_version
             ):
@@ -268,7 +291,7 @@ class EffectRepository:
                 "SELECT activity_version FROM session_activity WHERE session_key = ?",
                 (record.session_key,),
             ).fetchone()
-            if (
+            if record.cancel_on_activity and (
                 activity is None
                 or int(activity["activity_version"]) != record.expected_activity_version
             ):
@@ -326,7 +349,7 @@ class EffectRepository:
         self._finish_sending(
             operation_id,
             lease=lease,
-            state="needs_review",
+            state="cancelled",
             now=now,
             error=error,
         )
@@ -346,6 +369,17 @@ class EffectRepository:
                 (run_id,),
             ).fetchone()
         return None if row is None else _record(row)
+
+    def list_reviewable(self) -> tuple[EffectRecord, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM outbound_effects
+                WHERE state IN ('sending', 'unknown', 'needs_review')
+                ORDER BY created_at, operation_id
+                """
+            ).fetchall()
+        return tuple(_record(row) for row in rows)
 
     def _finish_sending(
         self,
@@ -462,6 +496,7 @@ def _record(row: sqlite3.Row) -> EffectRecord:
             if row["first_requested_at"] is not None
             else None
         ),
+        cancel_on_activity=bool(row["cancel_on_activity"]),
     )
 
 

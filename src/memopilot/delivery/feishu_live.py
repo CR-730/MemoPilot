@@ -90,6 +90,8 @@ class FeishuLiveProgress:
             self._reply += delta.content_delta
         if delta.thinking_delta:
             self._thinking += delta.thinking_delta
+        if self._message_id is None and not self._thinking.strip() and not self._tools:
+            return
         live_length = len(self._reply) + len(self._thinking)
         now = self._monotonic()
         if now < self._next_at and live_length - self._last_length < _LIVE_STREAM_MIN_CHARS:

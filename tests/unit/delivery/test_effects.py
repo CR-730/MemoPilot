@@ -10,6 +10,7 @@ from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.tasks.lease import SessionLease
 from memopilot.tasks.operational import (
     InboundCommand,
+    InterruptCommand,
     LostLeaseError,
     OperationalRepository,
     RunClaim,
@@ -54,6 +55,7 @@ def _request(
     activity_version: int,
     *,
     text: str = "回复",
+    cancel_on_activity: bool = True,
 ) -> EffectRequest:
     return EffectRequest(
         operation_id=f"{claim.run_id}:final-text",
@@ -65,6 +67,7 @@ def _request(
         expected_activity_version=activity_version,
         lease=lease,
         now=NOW,
+        cancel_on_activity=cancel_on_activity,
     )
 
 
@@ -113,6 +116,47 @@ def test_begin_send_atomically_checks_fence_and_activity_version(tmp_path: Path)
         effects.begin_send(effect.operation_id, lease=lease, now=NOW)
 
 
+def test_passive_effect_is_not_cancelled_by_later_ordinary_message(tmp_path: Path) -> None:
+    operational, effects, lease, claim, activity_version = _claimed(tmp_path)
+    effect = effects.create(
+        _request(claim, lease, activity_version, cancel_on_activity=False)
+    )
+    operational.accept_inbound(
+        InboundCommand(
+            event_id="event-2",
+            message_id="message-2",
+            session_key="feishu:chat-1",
+            channel="feishu",
+            chat_id="chat-1",
+            payload={"text": "排队的新问题"},
+            received_at=NOW + timedelta(seconds=1),
+        )
+    )
+
+    assert effects.begin_send(effect.operation_id, lease=lease, now=NOW) is EffectTransition.SEND
+
+
+def test_targeted_stop_cancels_passive_effect_before_send(tmp_path: Path) -> None:
+    operational, effects, lease, claim, activity_version = _claimed(tmp_path)
+    effect = effects.create(
+        _request(claim, lease, activity_version, cancel_on_activity=False)
+    )
+    operational.request_interrupt(
+        InterruptCommand(
+            event_id="stop-event",
+            message_id="stop-message",
+            session_key=claim.session_key,
+            channel="feishu",
+            chat_id="chat-1",
+            requested_at=NOW,
+        )
+    )
+
+    transition = effects.begin_send(effect.operation_id, lease=lease, now=NOW)
+
+    assert transition is EffectTransition.CANCELLED
+
+
 def test_unknown_effect_requires_explicit_reconciliation_and_expires_after_one_hour(
     tmp_path: Path,
 ) -> None:
@@ -151,3 +195,14 @@ def test_unknown_effect_requires_explicit_reconciliation_and_expires_after_one_h
 
     assert expired is EffectTransition.NEEDS_REVIEW
     assert effects.get(effect.operation_id).state == "needs_review"  # type: ignore[union-attr]
+
+
+def test_effects_can_be_listed_for_operator_review(tmp_path: Path) -> None:
+    _, effects, lease, claim, activity_version = _claimed(tmp_path)
+    effect = effects.create(_request(claim, lease, activity_version))
+    assert effects.begin_send(effect.operation_id, lease=lease, now=NOW) is EffectTransition.SEND
+    effects.mark_unknown(effect.operation_id, lease=lease, error="lost", now=NOW)
+
+    records = effects.list_reviewable()
+
+    assert [record.operation_id for record in records] == [effect.operation_id]

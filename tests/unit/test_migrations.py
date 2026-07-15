@@ -34,6 +34,7 @@ EXPECTED_TABLES = {
         "messages",
         "session_identities",
         "session_interrupts",
+        "turn_interrupt_snapshots",
     },
     DatabaseKind.MEMORY: {
         "memory_items",
@@ -66,7 +67,7 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
 
     assert report.from_version == 0
     expected_version = {
-        DatabaseKind.OPERATIONAL: 3,
+        DatabaseKind.OPERATIONAL: 5,
         DatabaseKind.MEMORY: 2,
         DatabaseKind.WAKE: 1,
     }[kind]
@@ -85,7 +86,7 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
-def test_operational_v1_upgrades_to_v3_without_losing_existing_rows(tmp_path: Path) -> None:
+def test_operational_v1_upgrades_to_v5_without_losing_existing_rows(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
     v1_sql = (
         files("memopilot.persistence.schema")
@@ -103,8 +104,8 @@ def test_operational_v1_upgrades_to_v3_without_losing_existing_rows(tmp_path: Pa
     report = migrate_database(database, DatabaseKind.OPERATIONAL)
 
     assert report.from_version == 1
-    assert report.to_version == 3
-    assert report.applied_versions == (2, 3)
+    assert report.to_version == 5
+    assert report.applied_versions == (2, 3, 4, 5)
     assert report.backup_path is not None
     with connect_database(database) as connection:
         session = connection.execute(
@@ -123,9 +124,81 @@ def test_operational_v1_upgrades_to_v3_without_losing_existing_rows(tmp_path: Pa
             for row in connection.execute("PRAGMA table_info(messages)").fetchall()
         }
     assert session is not None and session[0] == "chat-1"
-    assert {"channel", "chat_id", "payload_json", "last_attempt_at"} <= effect_columns
+    assert {
+        "channel",
+        "chat_id",
+        "payload_json",
+        "last_attempt_at",
+        "cancel_on_activity",
+    } <= effect_columns
     assert "last_consolidated_position" in session_columns
     assert "session_position" in message_columns
+
+
+def test_operational_v4_upgrades_to_v5_without_losing_existing_rows(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    with sqlite3.connect(database) as connection:
+        for version in range(1, 5):
+            sql = (
+                files("memopilot.persistence.schema")
+                .joinpath(f"operational_v{version}.sql")
+                .read_text("utf-8")
+            )
+            connection.executescript(sql)
+        connection.execute("PRAGMA user_version = 4")
+        connection.execute(
+            "INSERT INTO sessions(session_key, channel, chat_id, created_at, updated_at) "
+            "VALUES ('feishu:chat-v4', 'feishu', 'chat-v4', 'now', 'now')"
+        )
+
+    report = migrate_database(database, DatabaseKind.OPERATIONAL)
+
+    assert report.from_version == 4
+    assert report.to_version == 5
+    assert report.applied_versions == (5,)
+    with connect_database(database) as connection:
+        session = connection.execute(
+            "SELECT chat_id, last_consolidated_position FROM sessions "
+            "WHERE session_key = 'feishu:chat-v4'"
+        ).fetchone()
+    assert session is not None
+    assert tuple(session) == ("chat-v4", 0)
+
+
+def test_operational_v5_backfills_existing_message_positions(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    with sqlite3.connect(database) as connection:
+        for version in range(1, 5):
+            sql = (
+                files("memopilot.persistence.schema")
+                .joinpath(f"operational_v{version}.sql")
+                .read_text("utf-8")
+            )
+            connection.executescript(sql)
+        connection.execute("PRAGMA user_version = 4")
+    with connect_database(database) as connection:
+        connection.execute(
+            "INSERT INTO sessions(session_key, channel, chat_id, created_at, updated_at) "
+            "VALUES ('s1', 'feishu', 'c1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        connection.executemany(
+            "INSERT INTO messages(message_id, session_key, role, content, turn_id, "
+            "turn_position, created_at) VALUES (?, 's1', ?, ?, ?, ?, ?)",
+            [
+                ("m2", "assistant", "答复", "t1", 1, "2026-01-01T00:00:01Z"),
+                ("m1", "user", "问题", "t1", 0, "2026-01-01T00:00:00Z"),
+            ],
+        )
+        connection.commit()
+
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+
+    with connect_database(database) as connection:
+        rows = connection.execute(
+            "SELECT message_id, session_position FROM messages "
+            "WHERE session_key = 's1' ORDER BY session_position"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [("m1", 1), ("m2", 2)]
 
 
 def test_migration_backs_up_existing_database_before_upgrade(tmp_path: Path) -> None:

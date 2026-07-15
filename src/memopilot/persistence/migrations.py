@@ -160,7 +160,7 @@ def migrate_all_databases(settings: MemoPilotSettings) -> tuple[MigrationReport,
 def _load_migrations(kind: DatabaseKind) -> tuple[Migration, ...]:
     schema = files("memopilot.persistence.schema")
     versions = {
-        DatabaseKind.OPERATIONAL: (1, 2, 3),
+        DatabaseKind.OPERATIONAL: (1, 2, 3, 4, 5),
         DatabaseKind.MEMORY: (1, 2),
         DatabaseKind.WAKE: (1,),
     }[kind]

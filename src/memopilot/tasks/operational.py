@@ -21,6 +21,10 @@ class LostLeaseError(RuntimeError):
     """写入者持有的 fencing epoch 已经过期。"""
 
 
+class PendingInterruptError(RuntimeError):
+    """Run 收尾事务检测到尚未处理的定向中断。"""
+
+
 class FenceToken(Protocol):
     @property
     def session_key(self) -> str: ...
@@ -65,6 +69,23 @@ class EnqueueResult:
 class InterruptResult:
     activity_version: int
     created: bool
+    target_run_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TurnInterruptSnapshot:
+    original_message: str
+    partial_reply: str = ""
+    partial_thinking: str = ""
+    tools_used: tuple[str, ...] = ()
+    tool_chain: tuple[Mapping[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TurnInterruptSnapshotRecord(TurnInterruptSnapshot):
+    snapshot_id: str = ""
+    source_run_id: str = ""
+    session_key: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +177,7 @@ class OperationalRepository:
             "run_attempts",
             "session_identities",
             "session_interrupts",
+            "turn_interrupt_snapshots",
             "steps",
             "messages",
             "consolidation_manifests",
@@ -404,14 +426,20 @@ class OperationalRepository:
         try:
             existing = connection.execute(
                 """
-                SELECT activity_version FROM session_interrupts
+                SELECT activity_version, target_run_id FROM session_interrupts
                 WHERE event_id = ? OR message_id = ?
                 """,
                 (command.event_id, command.message_id),
             ).fetchone()
             if existing is not None:
                 connection.execute("COMMIT")
-                return InterruptResult(int(existing["activity_version"]), False)
+                return InterruptResult(
+                    int(existing["activity_version"]),
+                    False,
+                    str(existing["target_run_id"])
+                    if existing["target_run_id"] is not None
+                    else None,
+                )
             connection.execute(
                 """
                 INSERT INTO sessions(session_key, channel, chat_id, created_at, updated_at)
@@ -447,11 +475,25 @@ class OperationalRepository:
             ).fetchone()
             assert row is not None
             activity_version = int(row["activity_version"])
+            active = connection.execute(
+                """
+                SELECT r.run_id
+                FROM runs AS r
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                WHERE j.session_key = ? AND j.kind = 'agent.turn'
+                  AND r.state = 'running' AND j.state = 'running'
+                ORDER BY r.started_at DESC, r.run_id DESC
+                LIMIT 1
+                """,
+                (command.session_key,),
+            ).fetchone()
+            target_run_id = str(active["run_id"]) if active is not None else None
             connection.execute(
                 """
                 INSERT INTO session_interrupts(
-                    event_id, message_id, session_key, activity_version, requested_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    event_id, message_id, session_key, activity_version, requested_at,
+                    target_run_id, state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     command.event_id,
@@ -459,16 +501,201 @@ class OperationalRepository:
                     command.session_key,
                     activity_version,
                     requested_at,
+                    target_run_id,
+                    "pending" if target_run_id is not None else "no_active",
                 ),
             )
             connection.execute("COMMIT")
-            return InterruptResult(activity_version, True)
+            return InterruptResult(activity_version, True, target_run_id)
         except Exception:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
         finally:
             connection.close()
+
+    def has_pending_interrupt(self, run_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM session_interrupts
+                WHERE target_run_id = ? AND state = 'pending' LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        return row is not None
+
+    def finish_interrupted_run(
+        self,
+        run_id: str,
+        *,
+        lease: FenceToken,
+        snapshot: TurnInterruptSnapshot,
+        now: datetime,
+        ttl: timedelta = timedelta(minutes=30),
+    ) -> str:
+        if ttl.total_seconds() <= 0:
+            raise ValueError("中断快照 TTL 必须大于 0")
+        now_text = _utc_iso(now)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.require_current_fence(connection, lease)
+            run = connection.execute(
+                """
+                SELECT r.job_id FROM runs AS r
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                WHERE r.run_id = ? AND r.state = 'running' AND j.state = 'running'
+                  AND r.owner_id = ? AND r.fencing_epoch = ? AND j.session_key = ?
+                """,
+                (run_id, lease.owner_id, lease.epoch, lease.session_key),
+            ).fetchone()
+            pending = connection.execute(
+                """
+                SELECT 1 FROM session_interrupts
+                WHERE target_run_id = ? AND state = 'pending' LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if run is None or pending is None:
+                raise LostLeaseError("Run 已失权或没有待处理的定向中断")
+            uncertain_effect = connection.execute(
+                """
+                SELECT 1 FROM outbound_effects
+                WHERE run_id = ? AND state IN ('sending', 'unknown', 'needs_review')
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            outcome = "needs_review" if uncertain_effect is not None else "cancelled"
+            snapshot_id = _stable_id("interrupt", run_id)
+            connection.execute(
+                """
+                INSERT INTO turn_interrupt_snapshots(
+                    snapshot_id, source_run_id, session_key, original_message,
+                    partial_reply, partial_thinking, tools_json, tool_chain_json,
+                    interrupted_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_run_id) DO NOTHING
+                """,
+                (
+                    snapshot_id,
+                    run_id,
+                    lease.session_key,
+                    snapshot.original_message,
+                    snapshot.partial_reply,
+                    snapshot.partial_thinking,
+                    _json(snapshot.tools_used),
+                    _json(snapshot.tool_chain),
+                    now_text,
+                    _utc_iso(now + ttl),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE session_interrupts SET state = 'acknowledged', acknowledged_at = ?
+                WHERE target_run_id = ? AND state = 'pending'
+                """,
+                (now_text, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE runs SET state = ?, finished_at = ?, heartbeat_at = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (outcome, now_text, now_text, now_text, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE run_attempts SET outcome = ?, finished_at = ?, heartbeat_at = ?
+                WHERE run_id = ? AND owner_id = ? AND fencing_epoch = ? AND finished_at IS NULL
+                """,
+                (outcome, now_text, now_text, run_id, lease.owner_id, lease.epoch),
+            )
+            connection.execute(
+                """
+                UPDATE agent_jobs
+                SET state = ?, heartbeat_at = ?, finished_at = ?, updated_at = ?
+                WHERE job_id = ? AND state = 'running'
+                """,
+                (outcome, now_text, now_text, now_text, run["job_id"]),
+            )
+            connection.execute("COMMIT")
+            return snapshot_id
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def reserve_interrupt_snapshot(
+        self,
+        session_key: str,
+        *,
+        job_id: str,
+        now: datetime,
+    ) -> TurnInterruptSnapshotRecord | None:
+        now_text = _utc_iso(now)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                """
+                SELECT s.* FROM turn_interrupt_snapshots AS s
+                JOIN agent_jobs AS j ON j.job_id = ?
+                WHERE s.session_key = ? AND s.consumed_at IS NULL AND s.expires_at > ?
+                  AND s.interrupted_at < j.created_at
+                  AND (s.reserved_job_id IS NULL OR s.reserved_job_id = ?)
+                ORDER BY s.interrupted_at DESC LIMIT 1
+                """,
+                (job_id, session_key, now_text, job_id),
+            ).fetchone()
+            if row is None:
+                connection.execute("COMMIT")
+                return None
+            changed = connection.execute(
+                """
+                UPDATE turn_interrupt_snapshots SET reserved_job_id = ?
+                WHERE snapshot_id = ? AND (reserved_job_id IS NULL OR reserved_job_id = ?)
+                """,
+                (job_id, row["snapshot_id"], job_id),
+            ).rowcount
+            if changed != 1:
+                connection.execute("ROLLBACK")
+                return None
+            connection.execute("COMMIT")
+            return _interrupt_snapshot_record(row)
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def consume_interrupt_snapshot(
+        self, snapshot_id: str, *, job_id: str, now: datetime
+    ) -> bool:
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE turn_interrupt_snapshots SET consumed_at = ?
+                WHERE snapshot_id = ? AND reserved_job_id = ? AND consumed_at IS NULL
+                """,
+                (_utc_iso(now), snapshot_id, job_id),
+            ).rowcount
+        return changed == 1
+
+    def release_interrupt_snapshot(self, snapshot_id: str, *, job_id: str) -> bool:
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE turn_interrupt_snapshots SET reserved_job_id = NULL
+                WHERE snapshot_id = ? AND reserved_job_id = ? AND consumed_at IS NULL
+                """,
+                (snapshot_id, job_id),
+            ).rowcount
+        return changed == 1
 
     def claim_next_outbox(
         self,
@@ -529,6 +756,7 @@ class OperationalRepository:
             raise
         finally:
             connection.close()
+
 
     def mark_outbox_published(
         self,
@@ -871,6 +1099,7 @@ class OperationalRepository:
         expected_activity_version: int,
         now: datetime,
         creating: bool,
+        cancel_on_activity: bool = True,
     ) -> bool:
         """原子确认 live 副作用仍属于当前 Run，且创建未超过一小时窗口。"""
         creation_cutoff = _utc_iso(now - timedelta(hours=1))
@@ -887,7 +1116,12 @@ class OperationalRepository:
                   AND r.owner_id = ? AND r.fencing_epoch = ?
                   AND j.session_key = ?
                   AND f.owner_id = ? AND f.current_epoch = ?
-                  AND j.activity_version = ? AND a.activity_version = ?
+                  AND j.activity_version = ?
+                  AND (? = 0 OR a.activity_version = ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_interrupts AS i
+                      WHERE i.target_run_id = r.run_id AND i.state = 'pending'
+                  )
                   AND (? = 0 OR r.started_at >= ?)
                 """,
                 (
@@ -898,6 +1132,7 @@ class OperationalRepository:
                     lease.owner_id,
                     lease.epoch,
                     expected_activity_version,
+                    int(cancel_on_activity),
                     expected_activity_version,
                     int(creating),
                     creation_cutoff,
@@ -1158,9 +1393,14 @@ class OperationalRepository:
         lease: FenceToken,
         outcome: str,
         now: datetime,
+        resume_snapshot_id: str | None = None,
+        reject_pending_interrupt: bool = False,
+        acknowledge_pending_interrupt: bool = False,
     ) -> None:
         if outcome not in {"succeeded", "failed", "cancelled", "needs_review"}:
             raise ValueError(f"不支持的 Run 终态: {outcome}")
+        if reject_pending_interrupt and acknowledge_pending_interrupt:
+            raise ValueError("不能同时拒绝并确认待处理中断")
         now_text = _utc_iso(now)
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
@@ -1178,6 +1418,45 @@ class OperationalRepository:
             ).fetchone()
             if run is None:
                 raise LostLeaseError("Run 已不属于当前 lease")
+            pending_interrupt = connection.execute(
+                """
+                SELECT 1 FROM session_interrupts
+                WHERE target_run_id = ? AND state = 'pending' LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if pending_interrupt is not None and reject_pending_interrupt:
+                raise PendingInterruptError(run_id)
+            if pending_interrupt is not None and acknowledge_pending_interrupt:
+                connection.execute(
+                    """
+                    UPDATE session_interrupts
+                    SET state = 'acknowledged', acknowledged_at = ?
+                    WHERE target_run_id = ? AND state = 'pending'
+                    """,
+                    (now_text, run_id),
+                )
+            if resume_snapshot_id is not None:
+                if outcome == "succeeded":
+                    changed = connection.execute(
+                        """
+                        UPDATE turn_interrupt_snapshots SET consumed_at = ?
+                        WHERE snapshot_id = ? AND reserved_job_id = ?
+                          AND consumed_at IS NULL
+                        """,
+                        (now_text, resume_snapshot_id, run["job_id"]),
+                    ).rowcount
+                    if changed != 1:
+                        raise LostLeaseError("续接快照已失效或不属于当前 Job")
+                else:
+                    connection.execute(
+                        """
+                        UPDATE turn_interrupt_snapshots SET reserved_job_id = NULL
+                        WHERE snapshot_id = ? AND reserved_job_id = ?
+                          AND consumed_at IS NULL
+                        """,
+                        (resume_snapshot_id, run["job_id"]),
+                    )
             connection.execute(
                 """
                 UPDATE runs
@@ -1219,11 +1498,16 @@ class OperationalRepository:
         user_content: str,
         assistant_content: str,
         now: datetime,
+        resume_snapshot_id: str | None = None,
+        reject_pending_interrupt: bool = False,
+        acknowledge_pending_interrupt: bool = False,
         failpoint: Failpoint | None = None,
     ) -> TurnCommitResult:
         """原子保存成功 Turn、关闭 Run，并创建唯一的异步 Consolidation Job。"""
         if not user_content.strip() or not assistant_content.strip():
             raise ValueError("成功 Turn 的用户消息和助手回复不能为空")
+        if reject_pending_interrupt and acknowledge_pending_interrupt:
+            raise ValueError("不能同时拒绝并确认待处理中断")
         now_text = _utc_iso(now)
         consolidation_job_id = _stable_id("job", f"consolidate:{run_id}")
         outbox_id = _stable_id("outbox", consolidation_job_id)
@@ -1271,6 +1555,36 @@ class OperationalRepository:
             ).fetchone()
             if owned is None:
                 raise LostLeaseError("Run 已不属于当前 lease")
+
+            pending_interrupt = connection.execute(
+                """
+                SELECT 1 FROM session_interrupts
+                WHERE target_run_id = ? AND state = 'pending' LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if pending_interrupt is not None and reject_pending_interrupt:
+                raise PendingInterruptError(run_id)
+            if pending_interrupt is not None and acknowledge_pending_interrupt:
+                connection.execute(
+                    """
+                    UPDATE session_interrupts
+                    SET state = 'acknowledged', acknowledged_at = ?
+                    WHERE target_run_id = ? AND state = 'pending'
+                    """,
+                    (now_text, run_id),
+                )
+            if resume_snapshot_id is not None:
+                changed = connection.execute(
+                    """
+                    UPDATE turn_interrupt_snapshots SET consumed_at = ?
+                    WHERE snapshot_id = ? AND reserved_job_id = ?
+                      AND consumed_at IS NULL
+                    """,
+                    (now_text, resume_snapshot_id, run["job_id"]),
+                ).rowcount
+                if changed != 1:
+                    raise LostLeaseError("续接快照已失效或不属于当前 Job")
 
             position_row = connection.execute(
                 "SELECT COALESCE(MAX(session_position), 0) FROM messages WHERE session_key = ?",
@@ -1511,6 +1825,107 @@ class OperationalRepository:
         finally:
             connection.close()
 
+    def resolve_effect_review(
+        self,
+        operation_id: str,
+        *,
+        lease: FenceToken,
+        decision: str,
+        message_id: str | None,
+        now: datetime,
+    ) -> None:
+        """把人工核对结论原子写入 Effect、Run 与 Job。"""
+        if decision not in {"confirmed", "failed"}:
+            raise ValueError("人工核对结论只能是 confirmed 或 failed")
+        if decision == "confirmed" and not str(message_id or "").strip():
+            raise ValueError("确认远端成功时必须提供飞书 message_id")
+        now_text = _utc_iso(now)
+        effect_state = "confirmed" if decision == "confirmed" else "cancelled"
+        outcome = "succeeded" if decision == "confirmed" else "failed"
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.require_current_fence(connection, lease)
+            row = connection.execute(
+                """
+                SELECT e.run_id, e.session_key, e.state AS effect_state,
+                       r.job_id, r.state AS run_state, j.state AS job_state
+                FROM outbound_effects AS e
+                JOIN runs AS r ON r.run_id = e.run_id
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                WHERE e.operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(operation_id)
+            if str(row["session_key"]) != lease.session_key:
+                raise LostLeaseError("待核对 Effect 与当前会话 Lease 不匹配")
+            if (
+                row["effect_state"] == effect_state
+                and row["run_state"] == outcome
+                and row["job_state"] == outcome
+            ):
+                connection.execute("COMMIT")
+                return
+            if row["effect_state"] not in {"sending", "unknown", "needs_review"}:
+                raise LostLeaseError("Effect 已不处于可人工核对状态")
+            if row["run_state"] != "needs_review" or row["job_state"] != "needs_review":
+                raise LostLeaseError("Effect 对应 Run/Job 已不处于 needs_review")
+            connection.execute(
+                """
+                UPDATE outbound_effects
+                SET state = ?, owner_id = ?, fencing_epoch = ?,
+                    message_id = COALESCE(?, message_id),
+                    confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END,
+                    error_json = ?, updated_at = ?
+                WHERE operation_id = ?
+                """,
+                (
+                    effect_state,
+                    lease.owner_id,
+                    lease.epoch,
+                    message_id,
+                    decision,
+                    now_text,
+                    _json({"manual_decision": decision}),
+                    now_text,
+                    operation_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE runs
+                SET state = ?, owner_id = ?, fencing_epoch = ?,
+                    finished_at = ?, heartbeat_at = ?, updated_at = ?
+                WHERE run_id = ? AND state = 'needs_review'
+                """,
+                (
+                    outcome,
+                    lease.owner_id,
+                    lease.epoch,
+                    now_text,
+                    now_text,
+                    now_text,
+                    row["run_id"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE agent_jobs
+                SET state = ?, heartbeat_at = ?, finished_at = ?, updated_at = ?
+                WHERE job_id = ? AND state = 'needs_review'
+                """,
+                (outcome, now_text, now_text, now_text, row["job_id"]),
+            )
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
     @staticmethod
     def require_current_fence(connection: sqlite3.Connection, lease: FenceToken) -> None:
         row = connection.execute(
@@ -1595,7 +2010,7 @@ def _stable_id(kind: str, identity: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"memopilot:{kind}:{identity}"))
 
 
-def _json(value: Mapping[str, Any]) -> str:
+def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -1618,6 +2033,19 @@ def _outbox_record(row: sqlite3.Row) -> OutboxRecord:
     )
 
 
+def _interrupt_snapshot_record(row: sqlite3.Row) -> TurnInterruptSnapshotRecord:
+    return TurnInterruptSnapshotRecord(
+        snapshot_id=str(row["snapshot_id"]),
+        source_run_id=str(row["source_run_id"]),
+        session_key=str(row["session_key"]),
+        original_message=str(row["original_message"]),
+        partial_reply=str(row["partial_reply"]),
+        partial_thinking=str(row["partial_thinking"]),
+        tools_used=tuple(str(item) for item in json.loads(row["tools_json"])),
+        tool_chain=tuple(json.loads(row["tool_chain_json"])),
+    )
+
+
 __all__ = [
     "EnqueueResult",
     "FenceToken",
@@ -1628,9 +2056,12 @@ __all__ = [
     "LostLeaseError",
     "MessageRecord",
     "OperationalRepository",
+    "PendingInterruptError",
     "OutboxRecord",
     "RunClaim",
     "SessionIdentityRecord",
     "StepRecord",
     "TurnCommitResult",
+    "TurnInterruptSnapshot",
+    "TurnInterruptSnapshotRecord",
 ]

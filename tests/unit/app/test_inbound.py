@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
 from memopilot.app.inbound import InboundBridge, OperationalInterruptController
 from memopilot.channels.contracts import InboundMessage, MessageBus
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
+from memopilot.tasks.lease import SessionLease
 from memopilot.tasks.operational import InboundCommand, OperationalRepository
 
 NOW = datetime(2026, 7, 14, 10, 0, tzinfo=UTC)
@@ -98,8 +100,43 @@ async def test_stop_controller_is_idempotent_and_invalidates_previous_activity(
     second = await controller.request_interrupt(stop)
 
     assert first == second
-    assert first.message == "已请求中断。"
+    assert first.message == "当前没有正在执行的任务。"
     assert len(first.provider_uuid) == 36
     assert repository.get_activity_version("feishu:chat-1") == 2
     assert repository.count("session_interrupts") == 1
     assert repository.count("agent_jobs") == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_controller_publishes_targeted_run_to_interrupt_signal(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    accepted = repository.accept_inbound(
+        InboundCommand(
+            event_id="event-0",
+            message_id="message-0",
+            session_key="feishu:chat-1",
+            channel="feishu",
+            chat_id="chat-1",
+            payload={"text": "执行长任务"},
+            received_at=NOW,
+        )
+    )
+    epoch = repository.allocate_fence("feishu:chat-1", owner_id="worker-a", now=NOW)
+    lease = SessionLease(
+        session_key="feishu:chat-1",
+        owner_id="worker-a",
+        epoch=epoch,
+        redis_key="lease",
+        redis_value="worker-a|epoch|1",
+    )
+    claim = repository.claim_job(accepted.job_id, lease=lease, now=NOW)
+    assert claim is not None
+    signal = AsyncMock()
+    controller = OperationalInterruptController(repository, signal=signal)
+
+    result = await controller.request_interrupt(_message(text="/stop", event_id="stop-event"))
+
+    assert result.message == "已收到停止请求，正在中断本轮任务。"
+    signal.publish.assert_awaited_once_with(claim.run_id)

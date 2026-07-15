@@ -31,6 +31,9 @@ class TurnInput:
     content: str
     system_prompt: str = ""
     history: tuple[ChatMessage, ...] = ()
+    current_user_content: str | None = None
+    resume_snapshot_id: str | None = None
+    interrupt_original_message: str | None = None
 
 
 @dataclass(frozen=True)

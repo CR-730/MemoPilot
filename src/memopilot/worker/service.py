@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from memopilot.runtime.contracts import ChatMessage
 from memopilot.runtime.engine import TurnInput
-from memopilot.runtime.worker import RuntimeJobExecutor
+from memopilot.runtime.interrupts import render_resumed_message
+from memopilot.runtime.worker import RuntimeJobExecutor, TurnInterrupted
+from memopilot.tasks.interrupts import InterruptSignalPort
 from memopilot.tasks.lease import SessionLease, SessionLeaseManager
 from memopilot.tasks.operational import LostLeaseError, OperationalRepository, RunClaim
 from memopilot.tasks.recovery import (
@@ -36,6 +39,9 @@ class WorkerService:
         stale_heartbeat: timedelta = timedelta(seconds=60),
         pending_reclaim_every: int = 20,
         short_term_message_limit: int = 12,
+        interrupt_poll_interval: float = 0.1,
+        monotonic: Callable[[], float] = time.monotonic,
+        interrupt_signal: InterruptSignalPort | None = None,
     ) -> None:
         self._repository = repository
         self._queue = queue
@@ -59,6 +65,11 @@ class WorkerService:
         self._heartbeat_interval = heartbeat_interval or derived_interval
         if self._heartbeat_interval <= 0:
             raise ValueError("heartbeat_interval 必须大于 0")
+        if interrupt_poll_interval <= 0:
+            raise ValueError("interrupt_poll_interval 必须大于 0")
+        self._interrupt_poll_interval = interrupt_poll_interval
+        self._monotonic = monotonic
+        self._interrupt_signal = interrupt_signal
 
     async def run_once(self) -> bool:
         pending = None
@@ -122,6 +133,15 @@ class WorkerService:
         finally:
             await self._leases.release(lease)
 
+    async def run_forever(self, *, idle_interval: float = 0.05) -> None:
+        if idle_interval <= 0:
+            raise ValueError("idle_interval 必须大于 0")
+        await self._queue.ensure_consumer_groups()
+        while True:
+            processed = await self.run_once()
+            if not processed:
+                await asyncio.sleep(idle_interval)
+
     async def _reclaim_pending(
         self,
     ) -> tuple[QueueMessage, PendingDisposition] | None:
@@ -151,15 +171,40 @@ class WorkerService:
                 now=self._clock(),
             )
         )
+        next_heartbeat = self._monotonic() + self._heartbeat_interval
         try:
             while True:
+                timeout = min(
+                    self._interrupt_poll_interval,
+                    max(0.0, next_heartbeat - self._monotonic()),
+                )
                 done, _ = await asyncio.wait(
                     {execution},
-                    timeout=self._heartbeat_interval,
+                    timeout=timeout,
                 )
                 if done:
                     await execution
                     return
+                redis_pending = False
+                if self._interrupt_signal is not None:
+                    try:
+                        redis_pending = await self._interrupt_signal.pending(claim.run_id)
+                    except Exception:
+                        redis_pending = False
+                if redis_pending or self._repository.has_pending_interrupt(claim.run_id):
+                    execution.cancel()
+                    try:
+                        await execution
+                    except TurnInterrupted:
+                        pass
+                    if self._interrupt_signal is not None:
+                        try:
+                            await self._interrupt_signal.clear(claim.run_id)
+                        except Exception:
+                            pass
+                    return
+                if self._monotonic() < next_heartbeat:
+                    continue
                 if not await self._leases.renew(lease, now=self._clock()):
                     execution.cancel()
                     await asyncio.gather(execution, return_exceptions=True)
@@ -169,6 +214,7 @@ class WorkerService:
                     lease=lease,
                     now=self._clock(),
                 )
+                next_heartbeat = self._monotonic() + self._heartbeat_interval
         except BaseException:
             if not execution.done():
                 execution.cancel()
@@ -179,6 +225,8 @@ class WorkerService:
         job = self._repository.get_job(message.job_id)
         if job is None:
             raise KeyError(message.job_id)
+        if job.kind.startswith("memory."):
+            return TurnInput(session_key=claim.session_key, content="")
         payload = json.loads(job.payload_json)
         content = str(payload.get("text") or "")
         records = self._repository.list_recent_messages(
@@ -193,10 +241,26 @@ class WorkerService:
                 history.append(ChatMessage.assistant(content=record.content))
             elif record.role == "system":
                 history.append(ChatMessage.system(record.content))
+        snapshot = self._repository.reserve_interrupt_snapshot(
+            claim.session_key,
+            job_id=claim.job_id,
+            now=self._clock(),
+        )
+        if snapshot is None:
+            return TurnInput(
+                session_key=claim.session_key,
+                content=content,
+                history=tuple(history),
+                current_user_content=content,
+                interrupt_original_message=content,
+            )
         return TurnInput(
             session_key=claim.session_key,
-            content=content,
+            content=render_resumed_message(snapshot, content),
             history=tuple(history),
+            current_user_content=content,
+            resume_snapshot_id=snapshot.snapshot_id,
+            interrupt_original_message=snapshot.original_message,
         )
 
     async def _ack_if_terminal(self, message: QueueMessage) -> None:

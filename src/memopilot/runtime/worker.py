@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Callable
@@ -10,11 +11,13 @@ from typing import Protocol
 
 from memopilot.delivery.feishu import DeliveryOutcome, FinalResponseDispatcher
 from memopilot.runtime.engine import AgentRuntime, TurnInput, TurnResult
+from memopilot.runtime.interrupts import CompositeProgressObserver, InterruptProgressRecorder
 from memopilot.runtime.persistence import OperationalStepSink
 from memopilot.tasks.operational import (
     FenceToken,
     LostLeaseError,
     OperationalRepository,
+    PendingInterruptError,
     RunClaim,
 )
 
@@ -31,6 +34,10 @@ class MemoryJobExecutor(Protocol):
         run_id: str,
         lease: FenceToken,
     ) -> None: ...
+
+
+class TurnInterrupted(RuntimeError):
+    """当前 Run 已按用户 `/stop` 请求安全中断并保存快照。"""
 
 
 class RuntimeJobExecutor:
@@ -107,69 +114,130 @@ class RuntimeJobExecutor:
             lease=lease,
             clock=self._clock,
         )
-        progress = None
+        live_progress = None
         if self._final_response_dispatcher is not None:
             try:
-                progress = self._final_response_dispatcher.create_live_progress(
+                live_progress = self._final_response_dispatcher.create_live_progress(
                     claim=claim,
                     lease=lease,
                 )
             except Exception as exc:
                 logger.warning("飞书 live 初始化异常，核心 Runtime 继续执行: %s", exc)
+        recorder = InterruptProgressRecorder()
+        progress = CompositeProgressObserver(
+            (recorder,) if live_progress is None else (recorder, live_progress)
+        )
         try:
             result = await self._runtime.run(
                 turn,
                 step_sink=step_sink,
                 progress=progress,
             )
+        except asyncio.CancelledError:
+            if self._repository.has_pending_interrupt(claim.run_id):
+                self._repository.finish_interrupted_run(
+                    claim.run_id,
+                    lease=lease,
+                    snapshot=recorder.snapshot(
+                        original_message=turn.interrupt_original_message or turn.content
+                    ),
+                    now=self._clock(),
+                )
+                raise TurnInterrupted(claim.run_id) from None
+            raise
         except Exception:
             try:
                 self._repository.finish_job(
                     claim.run_id,
                     lease=lease,
                     outcome="failed",
-                    now=now,
+                    now=self._clock(),
+                    resume_snapshot_id=turn.resume_snapshot_id,
                 )
             except LostLeaseError:
                 pass
             raise
-        if progress is not None:
+        if live_progress is not None:
             try:
-                await progress.finalize()
+                await live_progress.finalize()
+            except asyncio.CancelledError:
+                if self._repository.has_pending_interrupt(claim.run_id):
+                    self._repository.finish_interrupted_run(
+                        claim.run_id,
+                        lease=lease,
+                        snapshot=recorder.snapshot(
+                            original_message=turn.interrupt_original_message or turn.content
+                        ),
+                        now=self._clock(),
+                    )
+                    raise TurnInterrupted(claim.run_id) from None
+                raise
             except Exception as exc:
                 logger.warning("飞书过程卡定格异常，最终回复继续发送: %s", exc)
+        delivery_confirmed = False
         if result.react.infrastructure_error:
             outcome = "failed"
         elif self._final_response_dispatcher is None:
             outcome = "succeeded"
         else:
-            delivery = await self._final_response_dispatcher.dispatch(
-                claim=claim,
-                lease=lease,
-                text=result.reply,
-            )
+            try:
+                delivery = await self._final_response_dispatcher.dispatch(
+                    claim=claim,
+                    lease=lease,
+                    text=result.reply,
+                )
+            except asyncio.CancelledError:
+                if self._repository.has_pending_interrupt(claim.run_id):
+                    self._repository.finish_interrupted_run(
+                        claim.run_id,
+                        lease=lease,
+                        snapshot=recorder.snapshot(
+                            original_message=turn.interrupt_original_message or turn.content
+                        ),
+                        now=self._clock(),
+                    )
+                    raise TurnInterrupted(claim.run_id) from None
+                raise
             outcome = {
                 DeliveryOutcome.CONFIRMED: "succeeded",
                 DeliveryOutcome.CANCELLED: "cancelled",
                 DeliveryOutcome.FAILED: "failed",
                 DeliveryOutcome.NEEDS_REVIEW: "needs_review",
             }[delivery.outcome]
-        if outcome == "succeeded":
-            self._repository.commit_successful_turn(
+            delivery_confirmed = delivery.outcome is DeliveryOutcome.CONFIRMED
+        try:
+            if outcome == "succeeded":
+                self._repository.commit_successful_turn(
+                    claim.run_id,
+                    lease=lease,
+                    user_content=turn.current_user_content or turn.content,
+                    assistant_content=result.reply,
+                    now=self._clock(),
+                    resume_snapshot_id=turn.resume_snapshot_id,
+                    reject_pending_interrupt=not delivery_confirmed,
+                    acknowledge_pending_interrupt=delivery_confirmed,
+                )
+            else:
+                self._repository.finish_job(
+                    claim.run_id,
+                    lease=lease,
+                    outcome=outcome,
+                    now=self._clock(),
+                    resume_snapshot_id=turn.resume_snapshot_id,
+                    reject_pending_interrupt=not delivery_confirmed,
+                    acknowledge_pending_interrupt=delivery_confirmed,
+                )
+        except PendingInterruptError:
+            self._repository.finish_interrupted_run(
                 claim.run_id,
                 lease=lease,
-                user_content=turn.content,
-                assistant_content=result.reply,
-                now=now,
+                snapshot=recorder.snapshot(
+                    original_message=turn.interrupt_original_message or turn.content
+                ),
+                now=self._clock(),
             )
-        else:
-            self._repository.finish_job(
-                claim.run_id,
-                lease=lease,
-                outcome=outcome,
-                now=now,
-            )
+            raise TurnInterrupted(claim.run_id) from None
         return result
 
 
-__all__ = ["MemoryJobExecutor", "RuntimeJobExecutor"]
+__all__ = ["MemoryJobExecutor", "RuntimeJobExecutor", "TurnInterrupted"]

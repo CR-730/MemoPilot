@@ -18,6 +18,9 @@ dependencies = [
   "uvicorn[standard]>=0.35,<1",
 ]
 
+[project.scripts]
+memopilot = "memopilot.cli:main"
+
 [dependency-groups]
 dev = [
   "mypy>=1.17,<2",
@@ -53,4 +56,3 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 python_version = "3.12"
 strict = true
 packages = ["memopilot"]
-

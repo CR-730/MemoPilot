@@ -41,6 +41,8 @@ class _Leases:
 
 
 class _Repository:
+    interrupted = False
+
     def claim_job(self, job_id: str, *, lease: Any, now: datetime) -> Any:
         return SimpleNamespace(
             run_id="run-1",
@@ -51,10 +53,20 @@ class _Repository:
         )
 
     def get_job(self, job_id: str) -> Any:
-        return SimpleNamespace(payload_json='{"text":"你好"}', state="running")
+        return SimpleNamespace(
+            payload_json='{"text":"你好"}',
+            state="running",
+            kind="agent.turn",
+        )
 
     def list_recent_messages(self, session_key: str, *, limit: int) -> tuple[Any, ...]:
         return ()
+
+    def has_pending_interrupt(self, run_id: str) -> bool:
+        return self.interrupted
+
+    def reserve_interrupt_snapshot(self, session_key: str, *, job_id: str, now: datetime) -> None:
+        return None
 
 
 class _Executor:
@@ -84,7 +96,18 @@ class _HeartbeatRepository(_Repository):
 
 class _CompletingExecutor:
     async def execute(self, **kwargs: Any) -> None:
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+
+
+class _InterruptingExecutor:
+    cancelled = False
+
+    async def execute(self, **kwargs: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 @pytest.mark.asyncio
@@ -142,7 +165,7 @@ def test_turn_input_loads_short_term_history_before_current_message() -> None:
         clock=lambda: NOW,
         short_term_message_limit=12,
     )
-    claim = SimpleNamespace(session_key="feishu:chat-1")
+    claim = SimpleNamespace(session_key="feishu:chat-1", job_id="job-1")
     message = SimpleNamespace(job_id="job-1")
 
     turn = worker._turn_input(message, claim)
@@ -152,3 +175,64 @@ def test_turn_input_loads_short_term_history_before_current_message() -> None:
         ("assistant", "上一答"),
     ]
     assert turn.content == "你好"
+
+
+def test_memory_job_skips_chat_history_and_interrupt_snapshot() -> None:
+    class MemoryRepository(_Repository):
+        def get_job(self, job_id: str) -> Any:
+            return SimpleNamespace(
+                payload_json='{"trigger_run_id":"run-1"}',
+                state="running",
+                kind="memory.consolidate",
+            )
+
+        def list_recent_messages(self, session_key: str, *, limit: int) -> tuple[Any, ...]:
+            raise AssertionError("记忆任务不应加载聊天历史")
+
+        def reserve_interrupt_snapshot(
+            self,
+            session_key: str,
+            *,
+            job_id: str,
+            now: datetime,
+        ) -> None:
+            raise AssertionError("记忆任务不应占用中断快照")
+
+    worker = WorkerService(
+        MemoryRepository(),  # type: ignore[arg-type]
+        _Queue(),  # type: ignore[arg-type]
+        _Leases(),  # type: ignore[arg-type]
+        _CompletingExecutor(),  # type: ignore[arg-type]
+        owner_id="worker-1",
+        clock=lambda: NOW,
+    )
+
+    turn = worker._turn_input(
+        SimpleNamespace(job_id="memory-job"),
+        SimpleNamespace(session_key="feishu:chat-1", job_id="memory-job"),
+    )
+
+    assert turn.content == ""
+    assert turn.history == ()
+
+
+@pytest.mark.asyncio
+async def test_pending_interrupt_cancels_execution_before_next_heartbeat() -> None:
+    repository = _Repository()
+    repository.interrupted = True
+    executor = _InterruptingExecutor()
+    worker = WorkerService(
+        repository,  # type: ignore[arg-type]
+        _Queue(),  # type: ignore[arg-type]
+        _RenewingLeases(),  # type: ignore[arg-type]
+        executor,  # type: ignore[arg-type]
+        owner_id="worker-1",
+        clock=lambda: NOW,
+        heartbeat_interval=30,
+        interrupt_poll_interval=0.001,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run_once()
+
+    assert executor.cancelled is True
