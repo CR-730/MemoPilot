@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -17,9 +18,9 @@ from memopilot.runtime.contracts import ChatMessage, ModelResponse, StreamDelta,
 from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tools import ToolRegistry
-from memopilot.runtime.worker import RuntimeJobExecutor
+from memopilot.runtime.worker import RuntimeJobExecutor, TurnInterrupted
 from memopilot.tasks.lease import SessionLease
-from memopilot.tasks.operational import InboundCommand, OperationalRepository
+from memopilot.tasks.operational import InboundCommand, InterruptCommand, OperationalRepository
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
@@ -120,6 +121,55 @@ async def test_response_loss_marks_effect_and_job_needs_review_without_blind_ret
     assert repository.get_job(claim.job_id).state == "needs_review"  # type: ignore[union-attr]
     assert effects.for_run(claim.run_id).state == "unknown"  # type: ignore[union-attr]
     assert transport.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_started_send_marks_effect_unknown_without_replay(
+    tmp_path: Path,
+) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    sending = asyncio.Event()
+
+    class _BlockingTransport:
+        async def send(self, chat_id: str, message: str, *, provider_uuid: str) -> SendReceipt:
+            sending.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    executor = RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_Provider(), tools=ToolRegistry()),
+        final_response_dispatcher=FinalResponseDispatcher(
+            repository, effects, _BlockingTransport(), clock=lambda: NOW
+        ),
+        clock=lambda: NOW,
+    )
+    task = asyncio.create_task(
+        executor.execute(
+            claim=claim,
+            lease=lease,
+            turn=TurnInput(session_key=claim.session_key, content="你好"),
+            now=NOW,
+        )
+    )
+    await sending.wait()
+    repository.request_interrupt(
+        InterruptCommand(
+            event_id="stop-event",
+            message_id="stop-message",
+            session_key=claim.session_key,
+            channel="feishu",
+            chat_id="chat-1",
+            requested_at=NOW,
+        )
+    )
+    task.cancel()
+
+    with pytest.raises(TurnInterrupted):
+        await task
+
+    assert effects.for_run(claim.run_id).state == "unknown"  # type: ignore[union-attr]
+    assert repository.get_job(claim.job_id).state == "needs_review"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -289,6 +339,29 @@ async def test_passive_live_card_keeps_patching_after_new_user_activity(tmp_path
 
     transport.send_card.assert_awaited_once()
     transport.patch_card.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_targeted_stop_blocks_live_card_even_for_passive_turn(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    dispatcher = FinalResponseDispatcher(repository, effects, transport, clock=lambda: NOW)
+    progress = dispatcher.create_live_progress(claim=claim, lease=lease)
+    assert progress is not None
+    repository.request_interrupt(
+        InterruptCommand(
+            event_id="stop-event",
+            message_id="stop-message",
+            session_key=claim.session_key,
+            channel="feishu",
+            chat_id="chat-1",
+            requested_at=NOW,
+        )
+    )
+
+    await progress.on_stream_delta(StreamDelta(thinking_delta="不应再发送" * 60))
+
+    transport.send_card.assert_not_awaited()
 
 
 @pytest.mark.asyncio

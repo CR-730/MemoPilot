@@ -41,6 +41,8 @@ class _Leases:
 
 
 class _Repository:
+    interrupted = False
+
     def claim_job(self, job_id: str, *, lease: Any, now: datetime) -> Any:
         return SimpleNamespace(
             run_id="run-1",
@@ -52,6 +54,12 @@ class _Repository:
 
     def get_job(self, job_id: str) -> Any:
         return SimpleNamespace(payload_json='{"text":"你好"}', state="running")
+
+    def has_pending_interrupt(self, run_id: str) -> bool:
+        return self.interrupted
+
+    def reserve_interrupt_snapshot(self, session_key: str, *, job_id: str, now: datetime) -> None:
+        return None
 
 
 class _Executor:
@@ -81,7 +89,18 @@ class _HeartbeatRepository(_Repository):
 
 class _CompletingExecutor:
     async def execute(self, **kwargs: Any) -> None:
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+
+
+class _InterruptingExecutor:
+    cancelled = False
+
+    async def execute(self, **kwargs: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 @pytest.mark.asyncio
@@ -118,3 +137,25 @@ async def test_successful_lease_renewal_also_refreshes_run_heartbeat() -> None:
 
     assert await worker.run_once() is True
     assert repository.heartbeats > 0
+
+
+@pytest.mark.asyncio
+async def test_pending_interrupt_cancels_execution_before_next_heartbeat() -> None:
+    repository = _Repository()
+    repository.interrupted = True
+    executor = _InterruptingExecutor()
+    worker = WorkerService(
+        repository,  # type: ignore[arg-type]
+        _Queue(),  # type: ignore[arg-type]
+        _RenewingLeases(),  # type: ignore[arg-type]
+        executor,  # type: ignore[arg-type]
+        owner_id="worker-1",
+        clock=lambda: NOW,
+        heartbeat_interval=30,
+        interrupt_poll_interval=0.001,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run_once()
+
+    assert executor.cancelled is True

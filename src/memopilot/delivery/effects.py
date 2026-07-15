@@ -180,6 +180,23 @@ class EffectRepository:
             if record.state == "unknown":
                 connection.execute("COMMIT")
                 return EffectTransition.NEEDS_REVIEW
+            interrupted = connection.execute(
+                """
+                SELECT 1 FROM session_interrupts
+                WHERE target_run_id = ? AND state = 'pending' LIMIT 1
+                """,
+                (record.run_id,),
+            ).fetchone()
+            if interrupted is not None:
+                connection.execute(
+                    """
+                    UPDATE outbound_effects SET state = 'cancelled', updated_at = ?
+                    WHERE operation_id = ?
+                    """,
+                    (now_text, operation_id),
+                )
+                connection.execute("COMMIT")
+                return EffectTransition.CANCELLED
             activity = connection.execute(
                 "SELECT activity_version FROM session_activity WHERE session_key = ?",
                 (record.session_key,),

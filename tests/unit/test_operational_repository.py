@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
+from memopilot.tasks.lease import SessionLease
 from memopilot.tasks.operational import (
     InboundCommand,
     InterruptCommand,
     OperationalRepository,
+    TurnInterruptSnapshot,
 )
 
 NOW = datetime(2026, 7, 13, 8, 0, tzinfo=UTC)
@@ -157,3 +159,99 @@ def test_duplicate_interrupt_only_increments_activity_once_and_creates_no_job(
     assert repository.get_activity_version("feishu:chat-1") == 2
     assert repository.count("session_interrupts") == 1
     assert repository.count("agent_jobs") == 1
+
+
+def test_interrupt_targets_only_the_run_active_when_command_arrives(tmp_path: Path) -> None:
+    repository = make_repository(tmp_path)
+    accepted = repository.accept_inbound(make_command())
+    epoch = repository.allocate_fence("feishu:chat-1", owner_id="worker-a", now=NOW)
+    lease = SessionLease(
+        session_key="feishu:chat-1",
+        owner_id="worker-a",
+        epoch=epoch,
+        redis_key="lease",
+        redis_value="worker-a|epoch|1",
+    )
+    claim = repository.claim_job(accepted.job_id, lease=lease, now=NOW)
+    assert claim is not None
+
+    result = repository.request_interrupt(
+        InterruptCommand(
+            event_id="stop-event",
+            message_id="stop-message",
+            session_key="feishu:chat-1",
+            channel="feishu",
+            chat_id="chat-1",
+            requested_at=NOW,
+        )
+    )
+
+    assert result.target_run_id == claim.run_id
+    assert repository.has_pending_interrupt(claim.run_id) is True
+
+
+def test_interrupted_run_snapshot_is_reserved_once_and_expires(tmp_path: Path) -> None:
+    repository = make_repository(tmp_path)
+    accepted = repository.accept_inbound(make_command())
+    epoch = repository.allocate_fence("feishu:chat-1", owner_id="worker-a", now=NOW)
+    lease = SessionLease(
+        session_key="feishu:chat-1",
+        owner_id="worker-a",
+        epoch=epoch,
+        redis_key="lease",
+        redis_value="worker-a|epoch|1",
+    )
+    claim = repository.claim_job(accepted.job_id, lease=lease, now=NOW)
+    assert claim is not None
+    repository.request_interrupt(
+        InterruptCommand(
+            event_id="stop-event",
+            message_id="stop-message",
+            session_key="feishu:chat-1",
+            channel="feishu",
+            chat_id="chat-1",
+            requested_at=NOW,
+        )
+    )
+    repository.finish_interrupted_run(
+        claim.run_id,
+        lease=lease,
+        snapshot=TurnInterruptSnapshot(
+            original_message="查询天气并发邮件",
+            partial_reply="已经查到天气",
+            partial_thinking="下一步准备发邮件",
+            tools_used=("weather",),
+            tool_chain=({"tool": "weather", "status": "done"},),
+        ),
+        now=NOW,
+        ttl=timedelta(minutes=30),
+    )
+
+    resume = repository.accept_inbound(
+        make_command(
+            event_id="resume-event",
+            message_id="resume-message",
+            payload={"text": "继续"},
+            received_at=NOW + timedelta(minutes=1),
+        )
+    )
+    reserved = repository.reserve_interrupt_snapshot(
+        "feishu:chat-1", job_id=resume.job_id, now=NOW + timedelta(minutes=29)
+    )
+    assert reserved is not None
+    assert reserved.partial_reply == "已经查到天气"
+    assert repository.reserve_interrupt_snapshot(
+        "feishu:chat-1", job_id="another-job", now=NOW + timedelta(minutes=29)
+    ) is None
+    repository.release_interrupt_snapshot(reserved.snapshot_id, job_id=resume.job_id)
+    late = repository.accept_inbound(
+        make_command(
+            event_id="late-event",
+            message_id="late-message",
+            payload={"text": "太晚了"},
+            received_at=NOW + timedelta(minutes=31),
+        )
+    )
+    assert repository.reserve_interrupt_snapshot(
+        "feishu:chat-1", job_id=late.job_id, now=NOW + timedelta(minutes=31)
+    ) is None

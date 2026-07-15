@@ -34,6 +34,7 @@ EXPECTED_TABLES = {
         "messages",
         "session_identities",
         "session_interrupts",
+        "turn_interrupt_snapshots",
     },
     DatabaseKind.MEMORY: {
         "memory_items",
@@ -61,7 +62,7 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
     report = migrate_database(database, kind)
 
     assert report.from_version == 0
-    expected_version = 3 if kind is DatabaseKind.OPERATIONAL else 1
+    expected_version = 4 if kind is DatabaseKind.OPERATIONAL else 1
     assert report.to_version == expected_version
     assert report.backup_path is None
     with connect_database(database) as connection:
@@ -95,8 +96,8 @@ def test_operational_v1_upgrades_to_v2_without_losing_existing_rows(tmp_path: Pa
     report = migrate_database(database, DatabaseKind.OPERATIONAL)
 
     assert report.from_version == 1
-    assert report.to_version == 3
-    assert report.applied_versions == (2, 3)
+    assert report.to_version == 4
+    assert report.applied_versions == (2, 3, 4)
     assert report.backup_path is not None
     with connect_database(database) as connection:
         session = connection.execute(

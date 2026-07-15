@@ -10,7 +10,7 @@ import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
 
-from memopilot.app.inbound import InboundBridge
+from memopilot.app.inbound import InboundBridge, OperationalInterruptController
 from memopilot.channels.contracts import InboundMessage, MessageBus, SendReceipt
 from memopilot.delivery.effects import EffectRepository
 from memopilot.delivery.feishu import FinalResponseDispatcher
@@ -23,6 +23,7 @@ from memopilot.runtime.contracts import ChatMessage, ModelResponse, ToolSchema
 from memopilot.runtime.engine import AgentRuntime
 from memopilot.runtime.tools import ToolRegistry
 from memopilot.runtime.worker import RuntimeJobExecutor
+from memopilot.tasks.interrupts import RedisInterruptSignal
 from memopilot.tasks.lease import SessionLeaseManager
 from memopilot.tasks.operational import OperationalRepository
 from memopilot.tasks.outbox import OutboxDispatcher
@@ -154,6 +155,119 @@ async def test_private_message_reaches_one_confirmed_agent_reply(
     assert len(transport.calls) == 1
     pending = await redis_client.xpending(queue.stream_key(0), queue.group)
     assert pending["pending"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_interrupts_worker_and_next_message_resumes_snapshot(
+    tmp_path: Path,
+    redis_client: Redis,
+) -> None:
+    repository = _repository(tmp_path)
+    current = [NOW]
+    first = await InboundBridge(repository).handle(
+        InboundMessage(
+            channel="feishu",
+            sender="ou-user",
+            chat_id="oc-chat",
+            content="查天气后发邮件",
+            timestamp=NOW,
+            metadata={"event_id": "event-1", "message_id": "om-1"},
+        )
+    )
+    queue = RedisTaskQueue(redis_client)
+    signal = RedisInterruptSignal(redis_client)
+    await queue.ensure_consumer_groups()
+    assert await OutboxDispatcher(repository, queue, owner_id="app-1").dispatch_one(now=NOW)
+
+    class _ResumableProvider:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.messages: list[str] = []
+
+        async def complete(
+            self,
+            *,
+            messages: Sequence[ChatMessage],
+            tools: Sequence[ToolSchema],
+        ) -> ModelResponse:
+            content = messages[-1].content or ""
+            self.messages.append(content)
+            if len(self.messages) == 1:
+                self.started.set()
+                await asyncio.Event().wait()
+            return ModelResponse(content="已按补充要求继续完成", tool_calls=())
+
+    provider = _ResumableProvider()
+    transport = _Transport()
+    executor = RuntimeJobExecutor(
+        repository,
+        AgentRuntime(provider, ToolRegistry()),
+        final_response_dispatcher=FinalResponseDispatcher(
+            repository,
+            EffectRepository(repository.database),
+            transport,
+            clock=lambda: current[0],
+        ),
+        clock=lambda: current[0],
+    )
+    worker = WorkerService(
+        repository,
+        queue,
+        SessionLeaseManager(redis_client, repository, ttl=timedelta(seconds=2)),
+        executor,
+        owner_id="worker-1",
+        clock=lambda: current[0],
+        heartbeat_interval=0.05,
+        interrupt_poll_interval=0.01,
+        interrupt_signal=signal,
+    )
+
+    running = asyncio.create_task(worker.run_once())
+    await provider.started.wait()
+    current[0] = NOW + timedelta(seconds=1)
+    acknowledgement = await OperationalInterruptController(
+        repository, signal=signal
+    ).request_interrupt(
+        InboundMessage(
+            channel="feishu",
+            sender="ou-user",
+            chat_id="oc-chat",
+            content="/stop",
+            timestamp=current[0],
+            metadata={"event_id": "stop-event", "message_id": "om-stop"},
+        )
+    )
+
+    assert "本轮已中断" in acknowledgement.message
+    assert await running is True
+    assert repository.get_job(first.job_id).state == "cancelled"  # type: ignore[union-attr]
+    assert transport.calls == []
+
+    current[0] = NOW + timedelta(seconds=2)
+    second = await InboundBridge(repository).handle(
+        InboundMessage(
+            channel="feishu",
+            sender="ou-user",
+            chat_id="oc-chat",
+            content="改成发给小王",
+            timestamp=current[0],
+            metadata={"event_id": "event-2", "message_id": "om-2"},
+        )
+    )
+    assert await OutboxDispatcher(repository, queue, owner_id="app-1").dispatch_one(
+        now=current[0]
+    )
+    assert await worker.run_once() is True
+
+    assert repository.get_job(second.job_id).state == "succeeded"  # type: ignore[union-attr]
+    assert "上一轮任务" in provider.messages[-1]
+    assert "查天气后发邮件" in provider.messages[-1]
+    assert "改成发给小王" in provider.messages[-1]
+    with connect_database(repository.database) as connection:
+        consumed = connection.execute(
+            "SELECT consumed_at FROM turn_interrupt_snapshots"
+        ).fetchone()
+    assert consumed is not None and consumed["consumed_at"] is not None
 
 
 @pytest.mark.asyncio

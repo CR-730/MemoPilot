@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -11,10 +12,11 @@ from memopilot.runtime.contracts import ChatMessage, ModelResponse, ToolSchema
 from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tools import ToolRegistry
-from memopilot.runtime.worker import RuntimeJobExecutor
+from memopilot.runtime.worker import RuntimeJobExecutor, TurnInterrupted
 from memopilot.tasks.lease import SessionLease
 from memopilot.tasks.operational import (
     InboundCommand,
+    InterruptCommand,
     LostLeaseError,
     OperationalRepository,
     RunClaim,
@@ -181,6 +183,69 @@ async def test_executor_rejects_turn_from_another_session(tmp_path: Path) -> Non
         )
 
     assert repository.list_steps(claim.run_id) == ()
+
+
+async def test_targeted_interrupt_cancels_runtime_and_persists_resume_snapshot(
+    tmp_path: Path,
+) -> None:
+    repository, lease, claim = _claimed_run(tmp_path)
+
+    class _BlockingProvider(ChatProvider):
+        async def complete(
+            self,
+            *,
+            messages: Sequence[ChatMessage],
+            tools: Sequence[ToolSchema],
+        ) -> ModelResponse:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    executor = RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_BlockingProvider(), tools=ToolRegistry()),
+        clock=lambda: NOW,
+    )
+    task = asyncio.create_task(
+        executor.execute(
+            claim=claim,
+            lease=lease,
+            turn=TurnInput(session_key="fake:1", content="查天气后发邮件"),
+            now=NOW,
+        )
+    )
+    await asyncio.sleep(0)
+    repository.request_interrupt(
+        InterruptCommand(
+            event_id="stop-event",
+            message_id="stop-message",
+            session_key="fake:1",
+            channel="fake",
+            chat_id="1",
+            requested_at=NOW,
+        )
+    )
+    task.cancel()
+
+    with pytest.raises(TurnInterrupted):
+        await task
+
+    assert repository.get_job(claim.job_id).state == "cancelled"  # type: ignore[union-attr]
+    next_job = repository.accept_inbound(
+        InboundCommand(
+            event_id="event-2",
+            message_id="message-2",
+            session_key="fake:1",
+            channel="fake",
+            chat_id="1",
+            payload={"text": "继续，但改发给小王"},
+            received_at=NOW + timedelta(seconds=1),
+        )
+    )
+    resumed = repository.reserve_interrupt_snapshot(
+        "fake:1", job_id=next_job.job_id, now=NOW + timedelta(seconds=1)
+    )
+    assert resumed is not None
+    assert resumed.original_message == "查天气后发邮件"
 
 
 class _FailingProvider(ChatProvider):

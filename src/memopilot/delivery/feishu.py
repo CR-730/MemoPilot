@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Callable
@@ -153,6 +154,14 @@ class FinalResponseDispatcher:
                 effect.text,
                 provider_uuid=effect.provider_uuid,
             )
+        except asyncio.CancelledError:
+            self._effects.mark_unknown(
+                effect.operation_id,
+                lease=lease,
+                error="send cancelled after request started; remote effect unknown",
+                now=self._clock(),
+            )
+            raise
         except httpx.RequestError as exc:
             self._effects.mark_unknown(
                 effect.operation_id,

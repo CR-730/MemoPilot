@@ -10,6 +10,7 @@ from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.tasks.lease import SessionLease
 from memopilot.tasks.operational import (
     InboundCommand,
+    InterruptCommand,
     LostLeaseError,
     OperationalRepository,
     RunClaim,
@@ -133,6 +134,27 @@ def test_passive_effect_is_not_cancelled_by_later_ordinary_message(tmp_path: Pat
     )
 
     assert effects.begin_send(effect.operation_id, lease=lease, now=NOW) is EffectTransition.SEND
+
+
+def test_targeted_stop_cancels_passive_effect_before_send(tmp_path: Path) -> None:
+    operational, effects, lease, claim, activity_version = _claimed(tmp_path)
+    effect = effects.create(
+        _request(claim, lease, activity_version, cancel_on_activity=False)
+    )
+    operational.request_interrupt(
+        InterruptCommand(
+            event_id="stop-event",
+            message_id="stop-message",
+            session_key=claim.session_key,
+            channel="feishu",
+            chat_id="chat-1",
+            requested_at=NOW,
+        )
+    )
+
+    transition = effects.begin_send(effect.operation_id, lease=lease, now=NOW)
+
+    assert transition is EffectTransition.CANCELLED
 
 
 def test_unknown_effect_requires_explicit_reconciliation_and_expires_after_one_hour(
