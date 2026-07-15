@@ -20,7 +20,16 @@ from memopilot.delivery.effects import EffectRepository
 from memopilot.delivery.feishu import FinalResponseDispatcher
 from memopilot.delivery.reconciliation import EffectReconciliationService
 from memopilot.extensions.events import EventBus
-from memopilot.extensions.plugins import ExtensionRegistry
+from memopilot.extensions.plugins import (
+    ExtensionRegistry,
+    PluginDiagnostic,
+    PluginRuntime,
+)
+from memopilot.extensions.skills import (
+    SkillCatalog,
+    SkillDiagnostic,
+    SkillLoader,
+)
 from memopilot.memory.consolidation import ConsolidationService
 from memopilot.memory.contracts import EmbeddingProvider
 from memopilot.memory.engine import LayeredMemoryEngine
@@ -96,6 +105,9 @@ class RuntimeBundle:
     memory_jobs: MemoryJobRouter
     runtime: AgentRuntime
     executor: RuntimeJobExecutor
+    skills: SkillCatalog
+    plugin_diagnostics: tuple[PluginDiagnostic, ...]
+    skill_diagnostics: tuple[SkillDiagnostic, ...]
 
 
 def build_app(settings: MemoPilotSettings) -> AppBundle:
@@ -189,6 +201,7 @@ def build_runtime_bundle(
     final_response_dispatcher: FinalResponseDispatcher | None = None,
     repository: OperationalRepository | None = None,
     extensions: ExtensionRegistry | None = None,
+    skills: SkillCatalog | None = None,
 ) -> RuntimeBundle:
     """从类型化配置创建 Worker 使用的 Agent 与分层记忆链路。"""
     migrate_all_databases(settings)
@@ -225,12 +238,28 @@ def build_runtime_bundle(
         retriever,
         hypothesis_provider=ChatHypothesisProvider(provider),
     )
-    registered_extensions = extensions or ExtensionRegistry()
+    if extensions is None:
+        plugin_result = PluginRuntime().load_directory(settings.plugins_dir)
+        registered_extensions = plugin_result.registry
+        plugin_diagnostics = plugin_result.diagnostics
+    else:
+        registered_extensions = extensions
+        plugin_diagnostics = ()
     registry = ToolRegistry(
         (*tools, *registered_extensions.tools),
         hooks=registered_extensions.tool_hooks,
     )
     registry.register(build_recall_memory_tool(memory_engine))
+    if skills is None:
+        skill_result = SkillLoader(
+            workspace_root=settings.skills_dir,
+            available_tools=frozenset(registry.tool_names),
+        ).load()
+        active_skills = SkillCatalog(skill_result.skills)
+        skill_diagnostics = skill_result.diagnostics
+    else:
+        active_skills = skills
+        skill_diagnostics = ()
     runtime = AgentRuntime(
         provider,
         registry,
@@ -240,6 +269,7 @@ def build_runtime_bundle(
         modules=registered_extensions.phase_modules,
         prompt_blocks=registered_extensions.prompt_blocks,
         event_bus=EventBus(registered_extensions.event_handlers),
+        skills=active_skills,
     )
     memory_jobs = MemoryJobRouter(
         ConsolidationService(
@@ -270,6 +300,9 @@ def build_runtime_bundle(
         memory_jobs=memory_jobs,
         runtime=runtime,
         executor=executor,
+        skills=active_skills,
+        plugin_diagnostics=plugin_diagnostics,
+        skill_diagnostics=skill_diagnostics,
     )
 
 

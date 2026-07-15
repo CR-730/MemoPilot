@@ -97,6 +97,63 @@ async def test_runtime_bundle_wires_plugin_tools_and_hooks(tmp_path: Path) -> No
     assert observation.result == "rewritten"
 
 
+def test_runtime_bundle_discovers_workspace_plugin_and_skill(tmp_path: Path) -> None:
+    plugin = tmp_path / "plugins" / "demo"
+    plugin.mkdir(parents=True)
+    (plugin / "manifest.yaml").write_text(
+        """
+plugin_id: demo
+version: 1.0.0
+api_version: 1
+entrypoint: plugin.py:register
+requires: []
+capabilities: [tools]
+""",
+        encoding="utf-8",
+    )
+    (plugin / "plugin.py").write_text(
+        """
+from memopilot.runtime.tools import Tool
+async def search(query):
+    return query
+def register(context):
+    context.register_tool(Tool("search", "search", {"type": "object"}, search))
+""",
+        encoding="utf-8",
+    )
+    skill = tmp_path / "skills" / "research"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        """---
+name: research
+description: 调研
+background_allowed: true
+required_tools: [search]
+---
+先检索再总结。
+""",
+        encoding="utf-8",
+    )
+    settings = MemoPilotSettings(
+        workspace=tmp_path,
+        embedding_base_url="https://embedding.example/v1",
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        _env_file=None,
+    )
+
+    bundle = build_runtime_bundle(
+        settings,
+        chat_provider=_ChatProvider(),  # type: ignore[arg-type]
+        embedder=_Embedder(),  # type: ignore[arg-type]
+    )
+
+    assert "search" in bundle.tools.tool_names
+    assert [skill.name for skill in bundle.skills.background_candidates()] == ["research"]
+    assert bundle.plugin_diagnostics == ()
+    assert bundle.skill_diagnostics == ()
+
+
 async def test_builds_separate_app_and_worker_without_starting_scheduler(
     tmp_path: Path,
 ) -> None:

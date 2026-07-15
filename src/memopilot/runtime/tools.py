@@ -115,6 +115,10 @@ class ToolRegistry:
             for tool in self._tools.values()
         )
 
+    @property
+    def tool_names(self) -> tuple[str, ...]:
+        return tuple(self._tools)
+
     async def execute(self, call: FunctionCall) -> ToolObservation:
         tool = self._tools.get(call.name)
         if tool is None:

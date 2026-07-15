@@ -9,6 +9,7 @@ from typing import Any, Protocol, cast
 
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.prompts import PromptBlock, PromptRenderer
+from memopilot.extensions.skills import SkillCatalog
 from memopilot.memory.contracts import MemoryQuery, MemoryQueryEngine
 from memopilot.runtime.contracts import ChatMessage, ModelResponse
 from memopilot.runtime.phases import (
@@ -105,6 +106,7 @@ class AgentRuntime:
         prompt_blocks: Sequence[PromptBlock] = (),
         prompt_max_chars: int = 12000,
         event_bus: EventBus | None = None,
+        skills: SkillCatalog | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -135,7 +137,7 @@ class AgentRuntime:
         all_modules = cast(
             Sequence[PhaseModule],
             (
-                *_default_modules(prompt_renderer, prompt_max_chars),
+                *_default_modules(prompt_renderer, prompt_max_chars, skills),
                 *memory_modules,
                 *modules,
             ),
@@ -334,6 +336,7 @@ async def _prompt_render(
     *,
     renderer: PromptRenderer,
     max_chars: int,
+    skills: SkillCatalog | None,
 ) -> Mapping[str, Any]:
     turn = context.slots["reasoning.input"]
     if not isinstance(turn, TurnInput):
@@ -343,6 +346,10 @@ async def _prompt_render(
     memory_context = context.slots.get("memory.context")
     if isinstance(memory_context, str) and memory_context.strip():
         system_parts.append("以下是与当前问题相关的长期记忆：\n" + memory_context.strip())
+    if skills is not None:
+        skill_prompt = skills.render_mentions(turn.content, max_chars=max_chars // 2)
+        if skill_prompt:
+            system_parts.append(skill_prompt)
     system_prompt = renderer.render(
         scope=turn.prompt_scope,
         base_prompt="\n\n".join(part for part in system_parts if part),
@@ -374,6 +381,7 @@ async def _after_turn(context: PhaseContext) -> Mapping[str, Any]:
 def _default_modules(
     prompt_renderer: PromptRenderer,
     prompt_max_chars: int,
+    skills: SkillCatalog | None,
 ) -> tuple[FunctionPhaseModule, ...]:
     return (
         FunctionPhaseModule(
@@ -399,6 +407,7 @@ def _default_modules(
                 _prompt_render,
                 renderer=prompt_renderer,
                 max_chars=prompt_max_chars,
+                skills=skills,
             ),
         ),
         FunctionPhaseModule(

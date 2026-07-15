@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from memopilot.extensions.prompts import PromptBlock
+from memopilot.extensions.skills import SkillCatalog, SkillDefinition
 from memopilot.memory.contracts import MemoryQueryResult
 from memopilot.runtime.contracts import (
     ChatMessage,
@@ -210,3 +211,26 @@ async def test_runtime_renders_scoped_plugin_prompt_blocks() -> None:
     )
 
     assert provider.messages[0].content == "核心提示\n\n插件提示"
+
+
+async def test_runtime_injects_only_explicitly_mentioned_skills() -> None:
+    provider = _CapturingProvider()
+    catalog = SkillCatalog(
+        (
+            SkillDefinition(
+                name="review",
+                description="审查",
+                background_allowed=False,
+                required_tools=(),
+                content="先运行测试，再检查差异。",
+                source="workspace",
+                path=None,
+            ),
+        )
+    )
+    runtime = AgentRuntime(provider, ToolRegistry(), skills=catalog)
+
+    await runtime.run(TurnInput(session_key="feishu:1", content="请用 $review"))
+
+    assert "# Skill: review" in (provider.messages[0].content or "")
+    assert "先运行测试" in (provider.messages[0].content or "")

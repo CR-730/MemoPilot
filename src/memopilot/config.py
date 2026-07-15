@@ -43,6 +43,8 @@ class MemoPilotSettings(BaseSettings):
     uploads_dir: Path = Path("uploads")
     restore_dir: Path = Path("restore")
     traces_dir: Path = Path("traces")
+    plugins_dir: Path = Path("plugins")
+    skills_dir: Path = Path("skills")
 
     chat_base_url: str = "https://api.deepseek.com"
     chat_model: str = "deepseek-v4-flash"
@@ -129,6 +131,8 @@ class MemoPilotSettings(BaseSettings):
             "uploads_dir",
             "restore_dir",
             "traces_dir",
+            "plugins_dir",
+            "skills_dir",
         ):
             configured = getattr(self, field_name).expanduser()
             resolved = (
