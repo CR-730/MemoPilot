@@ -128,6 +128,15 @@ class WorkerService:
         finally:
             await self._leases.release(lease)
 
+    async def run_forever(self, *, idle_interval: float = 0.05) -> None:
+        if idle_interval <= 0:
+            raise ValueError("idle_interval 必须大于 0")
+        await self._queue.ensure_consumer_groups()
+        while True:
+            processed = await self.run_once()
+            if not processed:
+                await asyncio.sleep(idle_interval)
+
     async def _reclaim_pending(
         self,
     ) -> tuple[QueueMessage, PendingDisposition] | None:

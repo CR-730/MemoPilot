@@ -402,6 +402,8 @@ class FeishuChannel:
         disconnect = getattr(client, "_disconnect", None) if client is not None else None
         if disconnect is None:
             return
+        if client is not None and hasattr(client, "_auto_reconnect"):
+            client._auto_reconnect = False
         try:
             ws_loop = self._get_ws_loop()
             if ws_loop is not None and ws_loop.is_running():
@@ -410,6 +412,8 @@ class FeishuChannel:
                     asyncio.wrap_future(future),
                     timeout=timeout_seconds,
                 )
+                if ws_loop is not asyncio.get_running_loop():
+                    ws_loop.call_soon_threadsafe(ws_loop.stop)
         except TimeoutError:
             raise
         except Exception as exc:

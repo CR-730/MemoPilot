@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from memopilot.config import MemoPilotSettings
+from memopilot.config import MemoPilotSettings, load_settings
 
 
 def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -100,7 +100,7 @@ def test_runtime_validation_reports_all_missing_required_configuration(tmp_path:
     assert "MEMOPILOT_EMBEDDING_DIMENSION" in message
     assert "MEMOPILOT_FEISHU_APP_ID" in message
     assert "MEMOPILOT_FEISHU_APP_SECRET" in message
-    assert "MEMOPILOT_FEISHU_ALLOW_FROM" in message
+    assert "MEMOPILOT_FEISHU_ALLOW_FROM" not in message
 
 
 def test_runtime_validation_accepts_complete_configuration(tmp_path: Path) -> None:
@@ -118,3 +118,68 @@ def test_runtime_validation_accepts_complete_configuration(tmp_path: Path) -> No
     )
 
     settings.validate_runtime_ready()
+
+
+def test_prototype_toml_maps_llm_and_feishu_without_copying_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "chat-secret")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret")
+    config = tmp_path / "config.toml"
+    config.write_text(
+        """
+[llm]
+provider = "deepseek"
+[llm.main]
+model = "deepseek-chat"
+api_key = "${DEEPSEEK_API_KEY}"
+base_url = "https://api.deepseek.com/v1"
+enable_thinking = true
+[agent]
+max_tokens = 4096
+max_iterations = 12
+[channels.feishu]
+enabled = true
+app_id = "cli-app"
+app_secret = "${FEISHU_APP_SECRET}"
+receive_mode = "ws"
+allow_from = []
+channel_name = "feishu_work"
+""",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config, workspace=tmp_path / "workspace")
+
+    assert settings.chat_model == "deepseek-chat"
+    assert settings.chat_api_key.get_secret_value() == "chat-secret"
+    assert settings.llm_thinking_enabled is True
+    assert settings.llm_max_output_tokens == 4096
+    assert settings.llm_max_iterations == 12
+    assert settings.feishu_app_id == "cli-app"
+    assert settings.feishu_app_secret.get_secret_value() == "feishu-secret"
+    assert settings.feishu_allow_from == ()
+    assert settings.feishu_channel_name == "feishu_work"
+
+
+def test_phase3_process_validation_is_split_and_empty_allowlist_is_allowed(
+    tmp_path: Path,
+) -> None:
+    app = MemoPilotSettings(
+        workspace=tmp_path / "app",
+        feishu_app_id="cli-app",
+        feishu_app_secret="secret",
+        feishu_allow_from=(),
+        _env_file=None,
+    )
+    worker = MemoPilotSettings(
+        workspace=tmp_path / "worker",
+        chat_api_key="chat-secret",
+        feishu_app_id="cli-app",
+        feishu_app_secret="secret",
+        _env_file=None,
+    )
+
+    app.validate_app_ready()
+    worker.validate_worker_ready()

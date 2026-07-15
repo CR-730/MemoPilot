@@ -289,6 +289,25 @@ async def test_ws_disconnect_obeys_stop_timeout(
 
 
 @pytest.mark.asyncio
+async def test_ws_disconnect_disables_sdk_auto_reconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel, _ = _channel(tmp_path)
+
+    async def disconnect() -> None:
+        return None
+
+    client = SimpleNamespace(_disconnect=disconnect, _auto_reconnect=True)
+    channel._ws_client = client
+    monkeypatch.setattr(channel, "_get_ws_loop", asyncio.get_running_loop)
+
+    await channel._disconnect_ws_client_once(timeout_seconds=1)
+
+    assert client._auto_reconnect is False
+
+
+@pytest.mark.asyncio
 async def test_text_send_uses_caller_supplied_uuid_and_returns_message_id(tmp_path: Path) -> None:
     channel, _ = _channel(tmp_path)
     channel._get_tenant_access_token = AsyncMock(return_value="token")  # type: ignore[method-assign]
