@@ -19,6 +19,8 @@ from memopilot.config import MemoPilotSettings
 from memopilot.delivery.effects import EffectRepository
 from memopilot.delivery.feishu import FinalResponseDispatcher
 from memopilot.delivery.reconciliation import EffectReconciliationService
+from memopilot.extensions.events import EventBus
+from memopilot.extensions.plugins import ExtensionRegistry
 from memopilot.memory.consolidation import ConsolidationService
 from memopilot.memory.contracts import EmbeddingProvider
 from memopilot.memory.engine import LayeredMemoryEngine
@@ -186,6 +188,7 @@ def build_runtime_bundle(
     tools: Iterable[Tool] = (),
     final_response_dispatcher: FinalResponseDispatcher | None = None,
     repository: OperationalRepository | None = None,
+    extensions: ExtensionRegistry | None = None,
 ) -> RuntimeBundle:
     """从类型化配置创建 Worker 使用的 Agent 与分层记忆链路。"""
     migrate_all_databases(settings)
@@ -222,7 +225,11 @@ def build_runtime_bundle(
         retriever,
         hypothesis_provider=ChatHypothesisProvider(provider),
     )
-    registry = ToolRegistry(tools)
+    registered_extensions = extensions or ExtensionRegistry()
+    registry = ToolRegistry(
+        (*tools, *registered_extensions.tools),
+        hooks=registered_extensions.tool_hooks,
+    )
     registry.register(build_recall_memory_tool(memory_engine))
     runtime = AgentRuntime(
         provider,
@@ -230,6 +237,9 @@ def build_runtime_bundle(
         max_iterations=settings.llm_max_iterations,
         memory_engine=memory_engine,
         memory_profile=markdown,
+        modules=registered_extensions.phase_modules,
+        prompt_blocks=registered_extensions.prompt_blocks,
+        event_bus=EventBus(registered_extensions.event_handlers),
     )
     memory_jobs = MemoryJobRouter(
         ConsolidationService(

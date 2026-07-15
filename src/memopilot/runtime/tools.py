@@ -12,6 +12,7 @@ from typing import Any
 from jsonschema import SchemaError, ValidationError
 from jsonschema.validators import validator_for
 
+from memopilot.extensions.hooks import ToolHook
 from memopilot.runtime.contracts import FunctionCall, ToolSchema
 
 ToolHandler = Callable[..., Any]
@@ -46,6 +47,9 @@ class ToolObservation:
     result: Any = None
     error_type: str | None = None
     error_message: str | None = None
+    original_arguments: dict[str, Any] | None = None
+    final_arguments: dict[str, Any] | None = None
+    hook_trace: tuple[str, ...] = ()
 
     @property
     def content(self) -> str:
@@ -61,10 +65,18 @@ class ToolObservation:
 
 
 class ToolRegistry:
-    def __init__(self, tools: Iterable[Tool] = ()) -> None:
+    def __init__(
+        self,
+        tools: Iterable[Tool] = (),
+        *,
+        hooks: Iterable[ToolHook] = (),
+    ) -> None:
         self._tools: dict[str, Tool] = {}
+        self._hooks: list[ToolHook] = []
         for tool in tools:
             self.register(tool)
+        for hook in hooks:
+            self.register_hook(hook)
 
     def register(self, tool: Tool) -> None:
         if not tool.name:
@@ -85,6 +97,11 @@ class ToolRegistry:
             raise ValueError(f"工具 {tool.name} 的 JSON Schema 无效: {exc.message}") from exc
         self._tools[tool.name] = tool
 
+    def register_hook(self, hook: ToolHook) -> None:
+        if any(existing.hook_id == hook.hook_id for existing in self._hooks):
+            raise ValueError(f"ToolHook 重复: {hook.hook_id}")
+        self._hooks.append(hook)
+
     def schemas(self) -> tuple[ToolSchema, ...]:
         return tuple(
             {
@@ -104,14 +121,59 @@ class ToolRegistry:
             return self._failure(call, "unknown_tool", f"工具不存在: {call.name}")
         if call.argument_error is not None:
             return self._failure(call, "invalid_arguments", call.argument_error)
+        original_arguments = dict(call.arguments)
+        final_arguments = dict(call.arguments)
+        hook_trace: list[str] = []
+        for hook in self._hooks:
+            if hook.before is None:
+                continue
+            try:
+                decision = await hook.before(call.name, dict(final_arguments))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                hook_trace.append(f"{hook.hook_id}:error")
+                return self._failure(
+                    call,
+                    "hook_error",
+                    f"工具前置 Hook 异常: {hook.hook_id}",
+                    original_arguments=original_arguments,
+                    final_arguments=final_arguments,
+                    hook_trace=tuple(hook_trace),
+                )
+            if decision is None:
+                hook_trace.append(f"{hook.hook_id}:passed")
+                continue
+            if decision.denied:
+                hook_trace.append(f"{hook.hook_id}:denied")
+                return self._failure(
+                    call,
+                    "hook_denied",
+                    decision.reason or "Hook 已拒绝工具调用",
+                    original_arguments=original_arguments,
+                    final_arguments=final_arguments,
+                    hook_trace=tuple(hook_trace),
+                )
+            if decision.arguments is not None:
+                final_arguments = dict(decision.arguments)
+                hook_trace.append(f"{hook.hook_id}:rewritten")
+            else:
+                hook_trace.append(f"{hook.hook_id}:passed")
         try:
-            validator_for(tool.parameters)(tool.parameters).validate(call.arguments)
+            validator_for(tool.parameters)(tool.parameters).validate(final_arguments)
         except ValidationError as exc:
-            return self._failure(call, "invalid_arguments", exc.message)
+            return self._failure(
+                call,
+                "invalid_arguments",
+                exc.message,
+                original_arguments=original_arguments,
+                final_arguments=final_arguments,
+                hook_trace=tuple(hook_trace),
+            )
         try:
             async with asyncio.timeout(tool.timeout_seconds):
                 try:
-                    result = await tool.handler(**call.arguments)
+                    result = await tool.handler(**final_arguments)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -119,27 +181,61 @@ class ToolRegistry:
                         call,
                         "tool_execution_error",
                         f"{type(exc).__name__}: {exc}",
+                        original_arguments=original_arguments,
+                        final_arguments=final_arguments,
+                        hook_trace=tuple(hook_trace),
                     )
         except TimeoutError:
             return self._failure(
                 call,
                 "tool_timeout",
                 f"工具执行超过 {tool.timeout_seconds:g} 秒",
+                original_arguments=original_arguments,
+                final_arguments=final_arguments,
+                hook_trace=tuple(hook_trace),
             )
         except asyncio.CancelledError:
             raise
-        return ToolObservation(
+        observation = ToolObservation(
             call_id=call.id,
             tool_name=call.name,
             ok=True,
             result=result,
+            original_arguments=original_arguments,
+            final_arguments=final_arguments,
+            hook_trace=tuple(hook_trace),
         )
+        for hook in self._hooks:
+            if hook.after is None:
+                continue
+            try:
+                await hook.after(call.name, observation)
+                hook_trace.append(f"{hook.hook_id}:observed")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                hook_trace.append(f"{hook.hook_id}:after_error")
+        if tuple(hook_trace) != observation.hook_trace:
+            observation = ToolObservation(
+                call_id=observation.call_id,
+                tool_name=observation.tool_name,
+                ok=observation.ok,
+                result=observation.result,
+                original_arguments=observation.original_arguments,
+                final_arguments=observation.final_arguments,
+                hook_trace=tuple(hook_trace),
+            )
+        return observation
 
     @staticmethod
     def _failure(
         call: FunctionCall,
         error_type: str,
         message: str,
+        *,
+        original_arguments: dict[str, Any] | None = None,
+        final_arguments: dict[str, Any] | None = None,
+        hook_trace: tuple[str, ...] = (),
     ) -> ToolObservation:
         return ToolObservation(
             call_id=call.id,
@@ -147,6 +243,9 @@ class ToolRegistry:
             ok=False,
             error_type=error_type,
             error_message=message,
+            original_arguments=original_arguments,
+            final_arguments=final_arguments,
+            hook_trace=hook_trace,
         )
 
 

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Protocol, cast
 
+from memopilot.extensions.events import EventBus
+from memopilot.extensions.prompts import PromptBlock, PromptRenderer
 from memopilot.memory.contracts import MemoryQuery, MemoryQueryEngine
 from memopilot.runtime.contracts import ChatMessage, ModelResponse
 from memopilot.runtime.phases import (
@@ -34,6 +37,7 @@ class TurnInput:
     current_user_content: str | None = None
     resume_snapshot_id: str | None = None
     interrupt_original_message: str | None = None
+    prompt_scope: str = "passive"
 
 
 @dataclass(frozen=True)
@@ -98,12 +102,19 @@ class AgentRuntime:
         memory_engine: MemoryQueryEngine | None = None,
         memory_profile: LongTermMemoryProfile | None = None,
         memory_markdown_max_chars: int = 6000,
+        prompt_blocks: Sequence[PromptBlock] = (),
+        prompt_max_chars: int = 12000,
+        event_bus: EventBus | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
         self._max_iterations = max_iterations
         self._memory_engine = memory_engine
         self._memory_profile = memory_profile
+        self._event_bus = event_bus
+        prompt_renderer = PromptRenderer(tuple(prompt_blocks))
+        if prompt_max_chars <= 0:
+            raise ValueError("Prompt 总预算必须大于 0")
         if memory_markdown_max_chars < 500:
             raise ValueError("Markdown 记忆注入预算不能少于 500 字符")
         self._memory_markdown_max_chars = memory_markdown_max_chars
@@ -123,7 +134,11 @@ class AgentRuntime:
             )
         all_modules = cast(
             Sequence[PhaseModule],
-            (*_default_modules(), *memory_modules, *modules),
+            (
+                *_default_modules(prompt_renderer, prompt_max_chars),
+                *memory_modules,
+                *modules,
+            ),
         )
         self._pipeline = PhasePipeline(
             all_modules,
@@ -173,7 +188,12 @@ class AgentRuntime:
         progress: ReActProgressObserver | None = None,
     ) -> TurnResult:
         context = PhaseContext(slots={"turn.input": turn})
-        execution = _RuntimeExecution(self._pipeline, context, step_sink)
+        execution = _RuntimeExecution(
+            self._pipeline,
+            context,
+            step_sink,
+            event_bus=self._event_bus,
+        )
         await execution.run_phase(LifecyclePhase.BEFORE_TURN)
         await execution.run_phase(LifecyclePhase.BEFORE_REASONING)
         await execution.run_phase(LifecyclePhase.PROMPT_RENDER)
@@ -205,15 +225,21 @@ class _RuntimeExecution(ReActObserver):
         pipeline: PhasePipeline,
         context: PhaseContext,
         sink: RuntimeStepSink | None,
+        *,
+        event_bus: EventBus | None = None,
     ) -> None:
         self._pipeline = pipeline
         self._context = context
         self._sink = sink
+        self._event_bus = event_bus
         self.phase_trace: list[PhaseTraceEntry] = []
         self.trace: list[RuntimeTraceEvent] = []
         self._iteration: int | None = None
 
     async def run_phase(self, phase: LifecyclePhase) -> None:
+        if self._event_bus is not None:
+            updated = await self._event_bus.emit(phase.value, self._context.slots)
+            self._context.slots.update(updated)
         trace_start = len(self._context.trace)
         await self._pipeline.run_phase(phase, self._context)
         for traced_phase, module_slot in self._context.trace[trace_start:]:
@@ -276,6 +302,9 @@ class _RuntimeExecution(ReActObserver):
                         "result": record.observation.result,
                         "error_type": record.observation.error_type,
                         "error_message": record.observation.error_message,
+                        "original_arguments": record.observation.original_arguments,
+                        "final_arguments": record.observation.final_arguments,
+                        "hook_trace": record.observation.hook_trace,
                     },
                 )
             )
@@ -300,7 +329,12 @@ async def _before_reasoning(context: PhaseContext) -> Mapping[str, Any]:
     return {"reasoning.input": context.slots["turn.request"]}
 
 
-async def _prompt_render(context: PhaseContext) -> Mapping[str, Any]:
+async def _prompt_render(
+    context: PhaseContext,
+    *,
+    renderer: PromptRenderer,
+    max_chars: int,
+) -> Mapping[str, Any]:
     turn = context.slots["reasoning.input"]
     if not isinstance(turn, TurnInput):
         raise TypeError("reasoning.input 必须是 TurnInput")
@@ -309,7 +343,11 @@ async def _prompt_render(context: PhaseContext) -> Mapping[str, Any]:
     memory_context = context.slots.get("memory.context")
     if isinstance(memory_context, str) and memory_context.strip():
         system_parts.append("以下是与当前问题相关的长期记忆：\n" + memory_context.strip())
-    system_prompt = "\n\n".join(part for part in system_parts if part)
+    system_prompt = renderer.render(
+        scope=turn.prompt_scope,
+        base_prompt="\n\n".join(part for part in system_parts if part),
+        max_chars=max_chars,
+    )
     if system_prompt:
         messages.append(ChatMessage.system(system_prompt))
     messages.extend(turn.history)
@@ -333,7 +371,10 @@ async def _after_turn(context: PhaseContext) -> Mapping[str, Any]:
     return {"turn.completed": context.slots["turn.output"] is not None}
 
 
-def _default_modules() -> tuple[FunctionPhaseModule, ...]:
+def _default_modules(
+    prompt_renderer: PromptRenderer,
+    prompt_max_chars: int,
+) -> tuple[FunctionPhaseModule, ...]:
     return (
         FunctionPhaseModule(
             LifecyclePhase.BEFORE_TURN,
@@ -354,7 +395,11 @@ def _default_modules() -> tuple[FunctionPhaseModule, ...]:
             "prompt_render.messages",
             ("reasoning.input",),
             ("prompt.messages",),
-            _prompt_render,
+            partial(
+                _prompt_render,
+                renderer=prompt_renderer,
+                max_chars=prompt_max_chars,
+            ),
         ),
         FunctionPhaseModule(
             LifecyclePhase.BEFORE_STEP,

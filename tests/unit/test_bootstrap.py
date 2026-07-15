@@ -5,7 +5,10 @@ from pathlib import Path
 from memopilot.app.service import AppService
 from memopilot.bootstrap import build_app, build_effects, build_runtime_bundle, build_worker
 from memopilot.config import MemoPilotSettings
-from memopilot.runtime.contracts import ChatMessage, ModelResponse, ToolSchema
+from memopilot.extensions.hooks import ToolHook, ToolHookDecision
+from memopilot.extensions.plugins import ExtensionRegistry
+from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse, ToolSchema
+from memopilot.runtime.tools import Tool
 from memopilot.worker.service import WorkerService
 
 
@@ -48,6 +51,50 @@ def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(tmp_path: P
     assert bundle.memory_jobs.repository is bundle.repository
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
+
+
+async def test_runtime_bundle_wires_plugin_tools_and_hooks(tmp_path: Path) -> None:
+    async def echo(value: str) -> str:
+        return value
+
+    async def rewrite(tool_name: str, arguments: dict[str, object]) -> ToolHookDecision:
+        del tool_name, arguments
+        return ToolHookDecision(arguments={"value": "rewritten"})
+
+    extensions = ExtensionRegistry(
+        tools=(
+            Tool(
+                "plugin_echo",
+                "echo",
+                {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+                echo,
+            ),
+        ),
+        tool_hooks=(ToolHook("rewrite", before=rewrite),),
+    )
+    settings = MemoPilotSettings(
+        workspace=tmp_path,
+        embedding_base_url="https://embedding.example/v1",
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        _env_file=None,
+    )
+
+    bundle = build_runtime_bundle(
+        settings,
+        chat_provider=_ChatProvider(),  # type: ignore[arg-type]
+        embedder=_Embedder(),  # type: ignore[arg-type]
+        extensions=extensions,
+    )
+
+    observation = await bundle.tools.execute(
+        FunctionCall("call-1", "plugin_echo", {"value": "original"})
+    )
+    assert observation.result == "rewritten"
 
 
 async def test_builds_separate_app_and_worker_without_starting_scheduler(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from memopilot.extensions.prompts import PromptBlock
 from memopilot.memory.contracts import MemoryQueryResult
 from memopilot.runtime.contracts import (
     ChatMessage,
@@ -187,3 +188,25 @@ async def test_runtime_prerecall_uses_raw_context_query_and_injects_system_memor
         entry.module_slot == "before_reasoning.memory_prerecall"
         for entry in result.phase_trace
     )
+
+
+async def test_runtime_renders_scoped_plugin_prompt_blocks() -> None:
+    provider = _CapturingProvider()
+    runtime = AgentRuntime(
+        provider,
+        ToolRegistry(),
+        prompt_blocks=(
+            PromptBlock("plugin.prompt", "插件提示", scopes=("passive",)),
+            PromptBlock("background.only", "后台提示", scopes=("background",)),
+        ),
+    )
+
+    await runtime.run(
+        TurnInput(
+            session_key="feishu:chat-1",
+            content="你好",
+            system_prompt="核心提示",
+        )
+    )
+
+    assert provider.messages[0].content == "核心提示\n\n插件提示"
