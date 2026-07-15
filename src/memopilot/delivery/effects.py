@@ -370,6 +370,17 @@ class EffectRepository:
             ).fetchone()
         return None if row is None else _record(row)
 
+    def list_reviewable(self) -> tuple[EffectRecord, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM outbound_effects
+                WHERE state IN ('sending', 'unknown', 'needs_review')
+                ORDER BY created_at, operation_id
+                """
+            ).fetchall()
+        return tuple(_record(row) for row in rows)
+
     def _finish_sending(
         self,
         operation_id: str,

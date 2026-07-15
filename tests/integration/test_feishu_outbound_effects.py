@@ -13,7 +13,7 @@ import pytest
 from memopilot.channels.contracts import SendReceipt
 from memopilot.delivery.effects import EffectRepository, EffectTransition
 from memopilot.delivery.feishu import FinalResponseDispatcher
-from memopilot.persistence.migrations import DatabaseKind, migrate_database
+from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
 from memopilot.runtime.contracts import ChatMessage, ModelResponse, StreamDelta, ToolSchema
 from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.providers import ChatProvider
@@ -261,6 +261,58 @@ async def test_confirmed_effect_closes_job_after_reconciliation_process_crash(
     assert result.outcome == "confirmed"
     transport.send.assert_not_awaited()
     assert repository.get_job(claim.job_id).state == "succeeded"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "message_id", "effect_state", "job_state"),
+    [
+        ("confirmed", "om-observed", "confirmed", "succeeded"),
+        ("failed", None, "cancelled", "failed"),
+    ],
+)
+async def test_manual_effect_decision_atomically_closes_effect_job_and_run(
+    tmp_path: Path,
+    decision: str,
+    message_id: str | None,
+    effect_state: str,
+    job_state: str,
+) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    transport.send.side_effect = httpx.ReadTimeout("response lost")
+    executor = RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_Provider(), tools=ToolRegistry()),
+        final_response_dispatcher=FinalResponseDispatcher(
+            repository, effects, transport, clock=lambda: NOW
+        ),
+        clock=lambda: NOW,
+    )
+    await executor.execute(
+        claim=claim,
+        lease=lease,
+        turn=TurnInput(session_key=claim.session_key, content="你好"),
+        now=NOW,
+    )
+    effect = effects.for_run(claim.run_id)
+    assert effect is not None
+
+    repository.resolve_effect_review(
+        effect.operation_id,
+        lease=lease,
+        decision=decision,
+        message_id=message_id,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert effects.get(effect.operation_id).state == effect_state  # type: ignore[union-attr]
+    assert repository.get_job(claim.job_id).state == job_state  # type: ignore[union-attr]
+    with connect_database(repository.database) as connection:
+        run_state = connection.execute(
+            "SELECT state FROM runs WHERE run_id = ?", (claim.run_id,)
+        ).fetchone()["state"]
+    assert run_state == job_state
 
 
 @pytest.mark.asyncio

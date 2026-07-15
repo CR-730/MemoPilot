@@ -1495,6 +1495,107 @@ class OperationalRepository:
         finally:
             connection.close()
 
+    def resolve_effect_review(
+        self,
+        operation_id: str,
+        *,
+        lease: FenceToken,
+        decision: str,
+        message_id: str | None,
+        now: datetime,
+    ) -> None:
+        """把人工核对结论原子写入 Effect、Run 与 Job。"""
+        if decision not in {"confirmed", "failed"}:
+            raise ValueError("人工核对结论只能是 confirmed 或 failed")
+        if decision == "confirmed" and not str(message_id or "").strip():
+            raise ValueError("确认远端成功时必须提供飞书 message_id")
+        now_text = _utc_iso(now)
+        effect_state = "confirmed" if decision == "confirmed" else "cancelled"
+        outcome = "succeeded" if decision == "confirmed" else "failed"
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_current_fence(connection, lease)
+            row = connection.execute(
+                """
+                SELECT e.run_id, e.session_key, e.state AS effect_state,
+                       r.job_id, r.state AS run_state, j.state AS job_state
+                FROM outbound_effects AS e
+                JOIN runs AS r ON r.run_id = e.run_id
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                WHERE e.operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(operation_id)
+            if str(row["session_key"]) != lease.session_key:
+                raise LostLeaseError("待核对 Effect 与当前会话 Lease 不匹配")
+            if (
+                row["effect_state"] == effect_state
+                and row["run_state"] == outcome
+                and row["job_state"] == outcome
+            ):
+                connection.execute("COMMIT")
+                return
+            if row["effect_state"] not in {"sending", "unknown", "needs_review"}:
+                raise LostLeaseError("Effect 已不处于可人工核对状态")
+            if row["run_state"] != "needs_review" or row["job_state"] != "needs_review":
+                raise LostLeaseError("Effect 对应 Run/Job 已不处于 needs_review")
+            connection.execute(
+                """
+                UPDATE outbound_effects
+                SET state = ?, owner_id = ?, fencing_epoch = ?,
+                    message_id = COALESCE(?, message_id),
+                    confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END,
+                    error_json = ?, updated_at = ?
+                WHERE operation_id = ?
+                """,
+                (
+                    effect_state,
+                    lease.owner_id,
+                    lease.epoch,
+                    message_id,
+                    decision,
+                    now_text,
+                    _json({"manual_decision": decision}),
+                    now_text,
+                    operation_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE runs
+                SET state = ?, owner_id = ?, fencing_epoch = ?,
+                    finished_at = ?, heartbeat_at = ?, updated_at = ?
+                WHERE run_id = ? AND state = 'needs_review'
+                """,
+                (
+                    outcome,
+                    lease.owner_id,
+                    lease.epoch,
+                    now_text,
+                    now_text,
+                    now_text,
+                    row["run_id"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE agent_jobs
+                SET state = ?, heartbeat_at = ?, finished_at = ?, updated_at = ?
+                WHERE job_id = ? AND state = 'needs_review'
+                """,
+                (outcome, now_text, now_text, now_text, row["job_id"]),
+            )
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
     @staticmethod
     def _require_current_fence(connection: sqlite3.Connection, lease: FenceToken) -> None:
         row = connection.execute(

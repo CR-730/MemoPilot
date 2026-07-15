@@ -195,3 +195,14 @@ def test_unknown_effect_requires_explicit_reconciliation_and_expires_after_one_h
 
     assert expired is EffectTransition.NEEDS_REVIEW
     assert effects.get(effect.operation_id).state == "needs_review"  # type: ignore[union-attr]
+
+
+def test_effects_can_be_listed_for_operator_review(tmp_path: Path) -> None:
+    _, effects, lease, claim, activity_version = _claimed(tmp_path)
+    effect = effects.create(_request(claim, lease, activity_version))
+    assert effects.begin_send(effect.operation_id, lease=lease, now=NOW) is EffectTransition.SEND
+    effects.mark_unknown(effect.operation_id, lease=lease, error="lost", now=NOW)
+
+    records = effects.list_reviewable()
+
+    assert [record.operation_id for record in records] == [effect.operation_id]
