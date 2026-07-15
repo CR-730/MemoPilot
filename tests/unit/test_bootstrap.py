@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from memopilot.app.service import AppService
 from memopilot.bootstrap import build_app, build_effects, build_runtime_bundle, build_worker
 from memopilot.config import MemoPilotSettings
 from memopilot.extensions.hooks import ToolHook, ToolHookDecision
+from memopilot.extensions.mcp import McpServerConfig
 from memopilot.extensions.plugins import ExtensionRegistry
 from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse, ToolSchema
 from memopilot.runtime.tools import Tool
 from memopilot.worker.service import WorkerService
+
+FAKE_MCP_SERVER = Path(__file__).parents[1] / "fixtures" / "fake_mcp_server.py"
 
 
 class _ChatProvider:
@@ -198,3 +202,52 @@ async def test_effects_process_does_not_require_model_credentials(tmp_path: Path
 
     assert effects.service is not None
     await effects.close()
+
+
+async def test_worker_starts_local_mcp_tools_without_blocking_core_runtime(
+    tmp_path: Path,
+) -> None:
+    skill = tmp_path / "workspace" / "skills" / "mcp_research"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        """---
+name: mcp_research
+description: MCP 调研
+background_allowed: true
+required_tools: [mcp_fake__echo]
+---
+调用 MCP 工具调研。
+""",
+        encoding="utf-8",
+    )
+    settings = MemoPilotSettings(
+        workspace=tmp_path / "workspace",
+        chat_api_key="chat-secret",
+        embedding_api_key="embedding-secret",
+        embedding_base_url="https://embedding.example/v1",
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        feishu_app_id="cli-app",
+        feishu_app_secret="feishu-secret",
+        mcp_servers=(
+            McpServerConfig(
+                server_id="fake",
+                command=(sys.executable,),
+                args=(str(FAKE_MCP_SERVER),),
+                startup_timeout_seconds=5,
+                call_timeout_seconds=1,
+            ),
+        ),
+        _env_file=None,
+    )
+    worker = build_worker(settings)
+    try:
+        assert worker.runtime.skills.background_candidates() == ()
+        await worker.start_extensions()
+        assert "mcp_fake__echo" in worker.runtime.tools.tool_names
+        assert [
+            skill.name for skill in worker.runtime.skills.background_candidates()
+        ] == ["mcp_research"]
+        assert worker.mcp_diagnostics == []
+    finally:
+        await worker.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -73,6 +74,10 @@ class ExtensionRegistry:
             (f"{handler.event}/{handler.handler_id}" for handler in candidate.event_handlers),
             "EventHandler",
         )
+        if candidate.phase_modules:
+            from memopilot.runtime.engine import validate_extension_phase_modules
+
+            validate_extension_phase_modules(candidate.phase_modules)
         return candidate
 
 
@@ -164,7 +169,11 @@ class PluginRuntime:
             context = PluginContext(manifest)
             try:
                 register = _load_entrypoint(manifest)
-                register(context)
+                registered = register(context)
+                if inspect.isawaitable(registered):
+                    if inspect.iscoroutine(registered):
+                        registered.close()
+                    raise ValueError("插件 register 必须是同步函数")
                 registry = registry.merge(context.freeze())
             except Exception as exc:
                 diagnostics.append(

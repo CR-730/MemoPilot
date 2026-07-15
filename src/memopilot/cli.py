@@ -45,6 +45,9 @@ async def _run(args: argparse.Namespace) -> None:
     if args.command == "worker":
         worker_bundle = build_worker(settings)
         try:
+            await worker_bundle.start_extensions()
+            for diagnostic in worker_bundle.mcp_diagnostics:
+                logger.warning("MCP Server 不可用，核心 Runtime 继续启动: %s", diagnostic)
             logger.info("MemoPilot Worker 已启动：Agent Runtime + 飞书外发")
             await worker_bundle.service.run_forever()
         finally:

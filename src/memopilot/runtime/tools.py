@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import json
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from jsonschema import SchemaError, ValidationError
@@ -37,6 +37,8 @@ class Tool:
     parameters: dict[str, Any]
     handler: ToolHandler
     timeout_seconds: float = 30.0
+    source: str = "builtin"
+    side_effect_class: str = "none"
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,8 @@ class ToolObservation:
     original_arguments: dict[str, Any] | None = None
     final_arguments: dict[str, Any] | None = None
     hook_trace: tuple[str, ...] = ()
+    retryable: bool = False
+    side_effect_status: str = "not_started"
 
     @property
     def content(self) -> str:
@@ -60,6 +64,8 @@ class ToolObservation:
             payload["error"] = {
                 "type": self.error_type,
                 "message": self.error_message,
+                "retryable": self.retryable,
+                "side_effect_status": self.side_effect_status,
             }
         return json.dumps(payload, ensure_ascii=False, default=str)
 
@@ -85,6 +91,8 @@ class ToolRegistry:
             raise ValueError(f"工具名称重复: {tool.name}")
         if tool.timeout_seconds <= 0:
             raise ValueError(f"工具 {tool.name} 的 timeout_seconds 必须大于 0")
+        if tool.side_effect_class not in {"none", "idempotent", "non_idempotent"}:
+            raise ValueError(f"工具 {tool.name} 的 side_effect_class 无效")
         if not _is_async_callable(tool.handler):
             raise ValueError(
                 f"工具 {tool.name} 必须提供异步 Handler；"
@@ -96,6 +104,15 @@ class ToolRegistry:
         except SchemaError as exc:
             raise ValueError(f"工具 {tool.name} 的 JSON Schema 无效: {exc.message}") from exc
         self._tools[tool.name] = tool
+
+    def register_many(self, tools: Iterable[Tool]) -> None:
+        previous = dict(self._tools)
+        try:
+            for tool in tools:
+                self.register(tool)
+        except Exception:
+            self._tools = previous
+            raise
 
     def register_hook(self, hook: ToolHook) -> None:
         if any(existing.hook_id == hook.hook_id for existing in self._hooks):
@@ -122,9 +139,15 @@ class ToolRegistry:
     async def execute(self, call: FunctionCall) -> ToolObservation:
         tool = self._tools.get(call.name)
         if tool is None:
-            return self._failure(call, "unknown_tool", f"工具不存在: {call.name}")
+            return await self._run_after_hooks(
+                call.name,
+                self._failure(call, "unknown_tool", f"工具不存在: {call.name}"),
+            )
         if call.argument_error is not None:
-            return self._failure(call, "invalid_arguments", call.argument_error)
+            return await self._run_after_hooks(
+                call.name,
+                self._failure(call, "invalid_arguments", call.argument_error),
+            )
         original_arguments = dict(call.arguments)
         final_arguments = dict(call.arguments)
         hook_trace: list[str] = []
@@ -137,26 +160,32 @@ class ToolRegistry:
                 raise
             except Exception:
                 hook_trace.append(f"{hook.hook_id}:error")
-                return self._failure(
-                    call,
-                    "hook_error",
-                    f"工具前置 Hook 异常: {hook.hook_id}",
-                    original_arguments=original_arguments,
-                    final_arguments=final_arguments,
-                    hook_trace=tuple(hook_trace),
+                return await self._run_after_hooks(
+                    call.name,
+                    self._failure(
+                        call,
+                        "hook_error",
+                        f"工具前置 Hook 异常: {hook.hook_id}",
+                        original_arguments=original_arguments,
+                        final_arguments=final_arguments,
+                        hook_trace=tuple(hook_trace),
+                    ),
                 )
             if decision is None:
                 hook_trace.append(f"{hook.hook_id}:passed")
                 continue
             if decision.denied:
                 hook_trace.append(f"{hook.hook_id}:denied")
-                return self._failure(
-                    call,
-                    "hook_denied",
-                    decision.reason or "Hook 已拒绝工具调用",
-                    original_arguments=original_arguments,
-                    final_arguments=final_arguments,
-                    hook_trace=tuple(hook_trace),
+                return await self._run_after_hooks(
+                    call.name,
+                    self._failure(
+                        call,
+                        "hook_denied",
+                        decision.reason or "Hook 已拒绝工具调用",
+                        original_arguments=original_arguments,
+                        final_arguments=final_arguments,
+                        hook_trace=tuple(hook_trace),
+                    ),
                 )
             if decision.arguments is not None:
                 final_arguments = dict(decision.arguments)
@@ -166,13 +195,16 @@ class ToolRegistry:
         try:
             validator_for(tool.parameters)(tool.parameters).validate(final_arguments)
         except ValidationError as exc:
-            return self._failure(
-                call,
-                "invalid_arguments",
-                exc.message,
-                original_arguments=original_arguments,
-                final_arguments=final_arguments,
-                hook_trace=tuple(hook_trace),
+            return await self._run_after_hooks(
+                call.name,
+                self._failure(
+                    call,
+                    "invalid_arguments",
+                    exc.message,
+                    original_arguments=original_arguments,
+                    final_arguments=final_arguments,
+                    hook_trace=tuple(hook_trace),
+                ),
             )
         try:
             async with asyncio.timeout(tool.timeout_seconds):
@@ -181,22 +213,32 @@ class ToolRegistry:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    return self._failure(
-                        call,
-                        "tool_execution_error",
-                        f"{type(exc).__name__}: {exc}",
-                        original_arguments=original_arguments,
-                        final_arguments=final_arguments,
-                        hook_trace=tuple(hook_trace),
+                    return await self._run_after_hooks(
+                        call.name,
+                        self._failure(
+                            call,
+                            str(getattr(exc, "error_type", "tool_execution_error")),
+                            f"{type(exc).__name__}: {exc}",
+                            original_arguments=original_arguments,
+                            final_arguments=final_arguments,
+                            hook_trace=tuple(hook_trace),
+                            retryable=bool(getattr(exc, "retryable", False)),
+                            side_effect_status=str(
+                                getattr(exc, "side_effect_status", "unknown")
+                            ),
+                        ),
                     )
         except TimeoutError:
-            return self._failure(
-                call,
-                "tool_timeout",
-                f"工具执行超过 {tool.timeout_seconds:g} 秒",
-                original_arguments=original_arguments,
-                final_arguments=final_arguments,
-                hook_trace=tuple(hook_trace),
+            return await self._run_after_hooks(
+                call.name,
+                self._failure(
+                    call,
+                    "tool_timeout",
+                    f"工具执行超过 {tool.timeout_seconds:g} 秒",
+                    original_arguments=original_arguments,
+                    final_arguments=final_arguments,
+                    hook_trace=tuple(hook_trace),
+                ),
             )
         except asyncio.CancelledError:
             raise
@@ -208,28 +250,29 @@ class ToolRegistry:
             original_arguments=original_arguments,
             final_arguments=final_arguments,
             hook_trace=tuple(hook_trace),
+            side_effect_status=(
+                "not_applicable" if tool.side_effect_class == "none" else "confirmed"
+            ),
         )
+        return await self._run_after_hooks(call.name, observation)
+
+    async def _run_after_hooks(
+        self,
+        tool_name: str,
+        observation: ToolObservation,
+    ) -> ToolObservation:
+        hook_trace = list(observation.hook_trace)
         for hook in self._hooks:
             if hook.after is None:
                 continue
             try:
-                await hook.after(call.name, observation)
+                await hook.after(tool_name, observation)
                 hook_trace.append(f"{hook.hook_id}:observed")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 hook_trace.append(f"{hook.hook_id}:after_error")
-        if tuple(hook_trace) != observation.hook_trace:
-            observation = ToolObservation(
-                call_id=observation.call_id,
-                tool_name=observation.tool_name,
-                ok=observation.ok,
-                result=observation.result,
-                original_arguments=observation.original_arguments,
-                final_arguments=observation.final_arguments,
-                hook_trace=tuple(hook_trace),
-            )
-        return observation
+        return replace(observation, hook_trace=tuple(hook_trace))
 
     @staticmethod
     def _failure(
@@ -240,6 +283,8 @@ class ToolRegistry:
         original_arguments: dict[str, Any] | None = None,
         final_arguments: dict[str, Any] | None = None,
         hook_trace: tuple[str, ...] = (),
+        retryable: bool = False,
+        side_effect_status: str = "not_started",
     ) -> ToolObservation:
         return ToolObservation(
             call_id=call.id,
@@ -250,6 +295,8 @@ class ToolRegistry:
             original_arguments=original_arguments,
             final_arguments=final_arguments,
             hook_trace=hook_trace,
+            retryable=retryable,
+            side_effect_status=side_effect_status,
         )
 
 

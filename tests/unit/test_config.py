@@ -239,3 +239,27 @@ def test_toml_loader_uses_environment_for_omitted_embedding_values(
     assert settings.embedding_model == "env-embedding"
     assert settings.embedding_api_key.get_secret_value() == "env-secret"
     assert settings.embedding_dimension == 768
+
+
+def test_toml_loader_parses_array_only_mcp_stdio_servers(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        """
+[[mcp.servers]]
+server_id = "local"
+command = ["python"]
+args = ["server.py"]
+env = { TOKEN = "${MCP_TOKEN}" }
+startup_timeout_s = 3
+call_timeout_s = 4
+""",
+        encoding="utf-8",
+    )
+    settings = load_settings(config, workspace=tmp_path / "workspace")
+
+    assert len(settings.mcp_servers) == 1
+    server = settings.mcp_servers[0]
+    assert server.command == ("python",)
+    assert server.args == ("server.py",)
+    assert server.startup_timeout_seconds == 3
+    assert server.call_timeout_seconds == 4

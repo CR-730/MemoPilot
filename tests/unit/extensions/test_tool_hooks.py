@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from typing import cast
+
 from memopilot.extensions.hooks import ToolHook, ToolHookDecision
 from memopilot.runtime.contracts import FunctionCall
-from memopilot.runtime.tools import Tool, ToolRegistry
+from memopilot.runtime.tools import Tool, ToolObservation, ToolRegistry
 
 
 async def test_tool_hook_rewrites_arguments_and_records_trace() -> None:
@@ -86,3 +88,24 @@ async def test_before_hook_exception_fails_closed() -> None:
     assert result.error_type == "hook_error"
     assert result.hook_trace == ("broken:error",)
 
+
+async def test_after_hook_observes_failed_tool_result() -> None:
+    observed: list[bool] = []
+
+    async def handler() -> str:
+        raise RuntimeError("failed")
+
+    async def after(tool_name: str, observation: object) -> None:
+        del tool_name
+        observed.append(cast(ToolObservation, observation).ok)
+
+    registry = ToolRegistry(
+        (Tool("demo", "demo", {"type": "object"}, handler),),
+        hooks=(ToolHook("audit", after=after),),
+    )
+
+    result = await registry.execute(FunctionCall("c1", "demo", {}))
+
+    assert result.ok is False
+    assert observed == [False]
+    assert result.hook_trace == ("audit:observed",)

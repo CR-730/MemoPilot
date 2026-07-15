@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +138,15 @@ class SkillCatalog:
             if skill.background_allowed and skill.available
         )
 
+    def refresh_available_tools(self, available_tools: frozenset[str]) -> None:
+        for name, skill in tuple(self._skills.items()):
+            missing = tuple(sorted(set(skill.required_tools).difference(available_tools)))
+            self._skills[name] = replace(
+                skill,
+                available=not missing,
+                missing_tools=missing,
+            )
+
 
 class _SkillError(ValueError):
     def __init__(self, code: str, message: str) -> None:
@@ -199,4 +208,3 @@ __all__ = [
     "SkillLoadResult",
     "SkillLoader",
 ]
-

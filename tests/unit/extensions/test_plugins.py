@@ -145,3 +145,36 @@ def test_prompt_renderer_applies_block_and_total_budgets_deterministically() -> 
     assert renderer.render(scope="passive", base_prompt="BASE", max_chars=14) == (
         "BASE\n\nAAAA\n\nBB"
     )
+
+
+def test_invalid_phase_dependency_disables_plugin_before_runtime_start(tmp_path: Path) -> None:
+    _write_plugin(
+        tmp_path,
+        "bad_phase",
+        """
+from memopilot.runtime.engine import FunctionPhaseModule
+from memopilot.runtime.phases import LifecyclePhase
+
+async def run(context):
+    return {"plugin.output": True}
+
+def register(context):
+    context.register_phase_module(
+        FunctionPhaseModule(
+            LifecyclePhase.AFTER_TURN,
+            "after_turn.bad",
+            ("missing.slot",),
+            ("plugin.output",),
+            run,
+        )
+    )
+""",
+        capabilities=("phase_modules",),
+    )
+
+    loaded = PluginRuntime().load_directory(tmp_path)
+
+    assert loaded.enabled_plugin_ids == ()
+    assert loaded.registry.phase_modules == ()
+    assert loaded.diagnostics[0].code == "registration_failed"
+    assert "missing_dependency" in loaded.diagnostics[0].message

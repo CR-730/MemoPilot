@@ -307,6 +307,8 @@ class _RuntimeExecution(ReActObserver):
                         "original_arguments": record.observation.original_arguments,
                         "final_arguments": record.observation.final_arguments,
                         "hook_trace": record.observation.hook_trace,
+                        "retryable": record.observation.retryable,
+                        "side_effect_status": record.observation.side_effect_status,
                     },
                 )
             )
@@ -441,6 +443,24 @@ def _default_modules(
     )
 
 
+def validate_extension_phase_modules(modules: Sequence[PhaseModule]) -> None:
+    """用真实核心 Phase 合同在插件提交前验证扩展模块。"""
+    all_modules = cast(
+        Sequence[PhaseModule],
+        (*_default_modules(PromptRenderer(), 12000, None), *modules),
+    )
+    PhasePipeline(
+        all_modules,
+        initial_slots={"turn.input"},
+        provided_slots={
+            LifecyclePhase.BEFORE_REASONING: {"memory.context"},
+            LifecyclePhase.BEFORE_STEP: {"step.iteration", "step.messages"},
+            LifecyclePhase.AFTER_STEP: {"step.response"},
+            LifecyclePhase.AFTER_REASONING: {"reasoning.result"},
+        },
+    )
+
+
 __all__ = [
     "AgentRuntime",
     "FunctionPhaseModule",
@@ -450,4 +470,5 @@ __all__ = [
     "RuntimeTraceEvent",
     "TurnInput",
     "TurnResult",
+    "validate_extension_phase_modules",
 ]

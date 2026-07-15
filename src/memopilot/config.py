@@ -18,6 +18,8 @@ from pydantic_settings import (
     YamlConfigSettingsSource,
 )
 
+from memopilot.extensions.mcp import McpServerConfig
+
 
 class MemoPilotSettings(BaseSettings):
     """运行配置。
@@ -73,6 +75,7 @@ class MemoPilotSettings(BaseSettings):
     sqlite_busy_timeout_seconds: float = Field(default=5, gt=0)
     mcp_startup_timeout_seconds: float = Field(default=15, gt=0)
     mcp_call_timeout_seconds: float = Field(default=30, gt=0)
+    mcp_servers: Annotated[tuple[McpServerConfig, ...], NoDecode] = ()
     llm_retry_limit: int = Field(default=2, ge=0)
     llm_max_iterations: int = Field(default=10, gt=0)
     llm_max_output_tokens: int = Field(default=2048, gt=0)
@@ -226,7 +229,8 @@ def load_settings(
     path = Path(config_path)
     if path.suffix.lower() != ".toml":
         raise ValueError(f"主配置仅支持 TOML: {path.suffix}")
-    data = _resolve_environment(tomllib.loads(path.read_text(encoding="utf-8")))
+    raw_data = tomllib.loads(path.read_text(encoding="utf-8"))
+    data = _resolve_environment(raw_data)
     llm = _as_dict(data.get("llm"))
     main = _as_dict(llm.get("main"))
     agent = _as_dict(data.get("agent"))
@@ -235,6 +239,7 @@ def load_settings(
     channels = _as_dict(data.get("channels"))
     feishu = _as_dict(channels.get("feishu"))
     redis = _as_dict(data.get("redis"))
+    raw_mcp = _as_dict(raw_data.get("mcp"))
     values: dict[str, Any] = {
         "chat_model": main.get("model") or "deepseek-v4-flash",
         "chat_base_url": main.get("base_url") or "https://api.deepseek.com",
@@ -246,6 +251,10 @@ def load_settings(
         "feishu_channel_name": feishu.get("channel_name", "feishu"),
         "feishu_receive_mode": feishu.get("receive_mode", "ws"),
         "redis_url": redis.get("url") or data.get("redis_url") or "redis://localhost:6379/0",
+        "mcp_servers": _parse_mcp_servers(
+            raw_mcp.get("servers"),
+            workspace=workspace or Path("workspace"),
+        ),
     }
     optional_values = {
         "chat_api_key": main.get("api_key"),
@@ -281,6 +290,62 @@ def _resolve_environment(value: Any) -> Any:
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _parse_mcp_servers(value: Any, *, workspace: Path) -> tuple[McpServerConfig, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("mcp.servers 必须是 TOML 对象数组")
+    servers: list[McpServerConfig] = []
+    workspace_root = workspace.expanduser().resolve()
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise ValueError("mcp.servers 每项必须是对象")
+        command = raw.get("command")
+        args = raw.get("args", [])
+        env = raw.get("env", {})
+        if not isinstance(command, list):
+            raise ValueError("MCP command 必须是字符串数组")
+        if not isinstance(args, list):
+            raise ValueError("MCP args 必须是字符串数组")
+        if not isinstance(env, dict) or any(
+            not isinstance(key, str) or not isinstance(item, str)
+            for key, item in env.items()
+        ):
+            raise ValueError("MCP env 必须是字符串映射")
+        cwd_value = raw.get("cwd")
+        cwd = None
+        if cwd_value is not None:
+            configured = Path(str(cwd_value)).expanduser()
+            cwd = (
+                configured.resolve()
+                if configured.is_absolute()
+                else (workspace_root / configured).resolve()
+            )
+            try:
+                cwd.relative_to(workspace_root)
+            except ValueError as exc:
+                raise ValueError("MCP cwd 必须位于 workspace 内") from exc
+        servers.append(
+            McpServerConfig(
+                server_id=str(raw.get("server_id") or ""),
+                command=tuple(command),
+                args=tuple(args),
+                env={str(key): str(item) for key, item in env.items()},
+                cwd=cwd,
+                enabled=bool(raw.get("enabled", True)),
+                startup_timeout_seconds=float(raw.get("startup_timeout_s", 15)),
+                call_timeout_seconds=float(raw.get("call_timeout_s", 30)),
+                shutdown_timeout_seconds=float(raw.get("shutdown_timeout_s", 5)),
+                max_restarts=int(raw.get("max_restarts", 3)),
+                tool_side_effects={
+                    str(key): str(item)
+                    for key, item in _as_dict(raw.get("tool_side_effects")).items()
+                },
+            )
+        )
+    return tuple(servers)
 
 
 __all__ = ["MemoPilotSettings", "load_settings"]

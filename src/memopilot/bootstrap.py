@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import cast
 from uuid import uuid4
@@ -20,6 +20,7 @@ from memopilot.delivery.effects import EffectRepository
 from memopilot.delivery.feishu import FinalResponseDispatcher
 from memopilot.delivery.reconciliation import EffectReconciliationService
 from memopilot.extensions.events import EventBus
+from memopilot.extensions.mcp import McpServerClient
 from memopilot.extensions.plugins import (
     ExtensionRegistry,
     PluginDiagnostic,
@@ -80,8 +81,29 @@ class WorkerBundle:
     transport: FeishuChannel
     redis: Redis
     runtime: RuntimeBundle
+    mcp_clients: tuple[McpServerClient, ...] = ()
+    mcp_diagnostics: list[str] = field(default_factory=list)
+    _extensions_started: bool = False
+
+    async def start_extensions(self) -> None:
+        if self._extensions_started:
+            return
+        self._extensions_started = True
+        for client in self.mcp_clients:
+            try:
+                self.runtime.tools.register_many(await client.as_tools())
+            except Exception as exc:
+                self.mcp_diagnostics.append(
+                    f"{client.config.server_id}: {type(exc).__name__}: {exc}"
+                )
+                await client.close()
+        self.runtime.skills.refresh_available_tools(
+            frozenset(self.runtime.tools.tool_names)
+        )
 
     async def close(self) -> None:
+        for client in self.mcp_clients:
+            await client.close()
         await self.transport.stop()
         await self.redis.aclose()
 
@@ -168,7 +190,13 @@ def build_worker(settings: MemoPilotSettings) -> WorkerBundle:
         short_term_message_limit=settings.memory_short_term_message_limit,
         interrupt_signal=RedisInterruptSignal(redis),
     )
-    return WorkerBundle(service, transport, redis, runtime_bundle)
+    return WorkerBundle(
+        service,
+        transport,
+        redis,
+        runtime_bundle,
+        tuple(McpServerClient(config) for config in settings.mcp_servers if config.enabled),
+    )
 
 
 def build_effects(settings: MemoPilotSettings) -> EffectBundle:
