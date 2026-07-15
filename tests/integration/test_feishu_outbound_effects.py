@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from memopilot.channels.contracts import SendReceipt
+from memopilot.channels.feishu import FeishuApiError
 from memopilot.delivery.effects import EffectRepository, EffectTransition
 from memopilot.delivery.feishu import FinalResponseDispatcher
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
@@ -124,6 +125,58 @@ async def test_response_loss_marks_effect_and_job_needs_review_without_blind_ret
 
 
 @pytest.mark.asyncio
+async def test_known_send_failure_is_not_left_in_operator_review_list(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    transport.send.side_effect = FeishuApiError(230001, "request rejected")
+    executor = RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_Provider(), tools=ToolRegistry()),
+        final_response_dispatcher=FinalResponseDispatcher(
+            repository, effects, transport, clock=lambda: NOW
+        ),
+        clock=lambda: NOW,
+    )
+
+    await executor.execute(
+        claim=claim,
+        lease=lease,
+        turn=TurnInput(session_key=claim.session_key, content="你好"),
+        now=NOW,
+    )
+
+    assert repository.get_job(claim.job_id).state == "failed"  # type: ignore[union-attr]
+    assert effects.for_run(claim.run_id).state == "cancelled"  # type: ignore[union-attr]
+    assert effects.list_reviewable() == ()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_post_send_error_remains_reviewable(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    transport.send.side_effect = RuntimeError("successful response missing message_id")
+    executor = RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_Provider(), tools=ToolRegistry()),
+        final_response_dispatcher=FinalResponseDispatcher(
+            repository, effects, transport, clock=lambda: NOW
+        ),
+        clock=lambda: NOW,
+    )
+
+    await executor.execute(
+        claim=claim,
+        lease=lease,
+        turn=TurnInput(session_key=claim.session_key, content="你好"),
+        now=NOW,
+    )
+
+    assert repository.get_job(claim.job_id).state == "needs_review"  # type: ignore[union-attr]
+    assert effects.for_run(claim.run_id).state == "unknown"  # type: ignore[union-attr]
+    assert len(effects.list_reviewable()) == 1
+
+
+@pytest.mark.asyncio
 async def test_interrupt_during_started_send_marks_effect_unknown_without_replay(
     tmp_path: Path,
 ) -> None:
@@ -213,6 +266,41 @@ async def test_explicit_reconciliation_retry_reuses_uuid_and_resolves_job(
     assert transport.send.await_args_list[1].kwargs["provider_uuid"] == first_uuid
     assert effects.get(effect.operation_id).message_id == "om_retried"  # type: ignore[union-attr]
     assert repository.get_job(claim.job_id).state == "succeeded"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_unexpected_error_stays_in_review(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    transport.send.side_effect = [
+        httpx.ReadTimeout("response lost"),
+        RuntimeError("successful response missing message_id"),
+    ]
+    dispatcher = FinalResponseDispatcher(
+        repository,
+        effects,
+        transport,
+        clock=lambda: NOW,
+    )
+    await RuntimeJobExecutor(
+        repository,
+        AgentRuntime(_Provider(), tools=ToolRegistry()),
+        final_response_dispatcher=dispatcher,
+        clock=lambda: NOW,
+    ).execute(
+        claim=claim,
+        lease=lease,
+        turn=TurnInput(session_key=claim.session_key, content="你好"),
+        now=NOW,
+    )
+    effect = effects.for_run(claim.run_id)
+    assert effect is not None
+
+    result = await dispatcher.retry_unknown(effect.operation_id, lease=lease)
+
+    assert result.outcome == "needs_review"
+    assert effects.get(effect.operation_id).state == "unknown"  # type: ignore[union-attr]
+    assert repository.get_job(claim.job_id).state == "needs_review"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -391,6 +479,39 @@ async def test_passive_live_card_keeps_patching_after_new_user_activity(tmp_path
 
     transport.send_card.assert_awaited_once()
     transport.patch_card.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_proactive_delivery_still_yields_to_new_user_activity(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    with connect_database(repository.database) as connection:
+        connection.execute(
+            "UPDATE agent_jobs SET kind = 'agent.proactive' WHERE job_id = ?",
+            (claim.job_id,),
+        )
+    repository.accept_inbound(
+        InboundCommand(
+            event_id="event-2",
+            message_id="message-2",
+            session_key=claim.session_key,
+            channel="feishu",
+            chat_id="chat-1",
+            payload={"text": "用户正在聊天", "chat_id": "chat-1"},
+            received_at=NOW + timedelta(seconds=1),
+        )
+    )
+    transport = AsyncMock()
+    dispatcher = FinalResponseDispatcher(repository, effects, transport, clock=lambda: NOW)
+
+    delivery = await dispatcher.dispatch(
+        claim=claim,
+        lease=lease,
+        text="主动推送",
+    )
+
+    assert delivery.outcome == "cancelled"
+    assert delivery.effect.cancel_on_activity is True
+    transport.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

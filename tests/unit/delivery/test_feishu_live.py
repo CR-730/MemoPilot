@@ -15,6 +15,23 @@ from memopilot.runtime.tools import ToolObservation
 
 
 @pytest.mark.asyncio
+async def test_content_only_stream_does_not_create_empty_process_card() -> None:
+    transport = AsyncMock()
+    progress = FeishuLiveProgress(
+        transport,
+        chat_id="oc-chat",
+        provider_uuid="live-uuid",
+        min_interval_seconds=0,
+    )
+
+    await progress.on_stream_delta(StreamDelta(content_delta="直接回复"))
+    await progress.finalize()
+
+    transport.send_card.assert_not_awaited()
+    transport.patch_card.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_live_progress_creates_updates_and_freezes_one_process_card() -> None:
     transport = AsyncMock()
     transport.send_card.return_value = SendReceipt(message_id="om-live")

@@ -349,7 +349,7 @@ class EffectRepository:
         self._finish_sending(
             operation_id,
             lease=lease,
-            state="needs_review",
+            state="cancelled",
             now=now,
             error=error,
         )

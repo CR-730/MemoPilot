@@ -15,6 +15,7 @@ from uuid import NAMESPACE_URL, uuid5
 import httpx
 
 from memopilot.channels.contracts import SendReceipt
+from memopilot.channels.feishu import FeishuApiError
 from memopilot.delivery.effects import (
     EffectRecord,
     EffectRepository,
@@ -86,6 +87,7 @@ class FinalResponseDispatcher:
             if not chat_id:
                 return None
             provider_uuid = str(uuid5(NAMESPACE_URL, f"feishu:{claim.run_id}:live-card"))
+            cancel_on_activity = job.kind != "agent.turn"
             return FeishuLiveProgress(
                 cast(LiveCardTransport, cast(Any, self._transport)),
                 chat_id=chat_id,
@@ -96,7 +98,7 @@ class FinalResponseDispatcher:
                     expected_activity_version=job.activity_version,
                     now=self._clock(),
                     creating=creating,
-                    cancel_on_activity=False,
+                    cancel_on_activity=cancel_on_activity,
                 ),
             )
         except Exception as exc:
@@ -118,6 +120,7 @@ class FinalResponseDispatcher:
         if not chat_id:
             raise ValueError("Agent Job 缺少飞书 chat_id")
         now = self._clock()
+        cancel_on_activity = job.kind != "agent.turn"
         effect = self._effects.create(
             EffectRequest(
                 operation_id=f"{claim.run_id}:final-text",
@@ -129,7 +132,7 @@ class FinalResponseDispatcher:
                 expected_activity_version=job.activity_version,
                 lease=lease,
                 now=now,
-                cancel_on_activity=False,
+                cancel_on_activity=cancel_on_activity,
             )
         )
         transition = self._effects.begin_send(effect.operation_id, lease=lease, now=now)
@@ -173,7 +176,7 @@ class FinalResponseDispatcher:
                 DeliveryOutcome.NEEDS_REVIEW,
                 self._require_effect(effect.operation_id),
             )
-        except Exception as exc:
+        except FeishuApiError as exc:
             self._effects.mark_known_failure(
                 effect.operation_id,
                 lease=lease,
@@ -182,6 +185,17 @@ class FinalResponseDispatcher:
             )
             return DeliveryResult(
                 DeliveryOutcome.FAILED,
+                self._require_effect(effect.operation_id),
+            )
+        except Exception as exc:
+            self._effects.mark_unknown(
+                effect.operation_id,
+                lease=lease,
+                error=str(exc),
+                now=self._clock(),
+            )
+            return DeliveryResult(
+                DeliveryOutcome.NEEDS_REVIEW,
                 self._require_effect(effect.operation_id),
             )
         self._effects.mark_confirmed(
@@ -236,6 +250,14 @@ class FinalResponseDispatcher:
                 effect.text,
                 provider_uuid=effect.provider_uuid,
             )
+        except asyncio.CancelledError:
+            self._effects.mark_unknown(
+                operation_id,
+                lease=lease,
+                error="reconciliation send cancelled after request started; remote effect unknown",
+                now=self._clock(),
+            )
+            raise
         except httpx.RequestError as exc:
             self._effects.mark_unknown(
                 operation_id,
@@ -247,7 +269,7 @@ class FinalResponseDispatcher:
                 DeliveryOutcome.NEEDS_REVIEW,
                 self._require_effect(operation_id),
             )
-        except Exception as exc:
+        except FeishuApiError as exc:
             self._effects.mark_known_failure(
                 operation_id,
                 lease=lease,
@@ -262,6 +284,17 @@ class FinalResponseDispatcher:
             )
             return DeliveryResult(
                 DeliveryOutcome.FAILED,
+                self._require_effect(operation_id),
+            )
+        except Exception as exc:
+            self._effects.mark_unknown(
+                operation_id,
+                lease=lease,
+                error=str(exc),
+                now=self._clock(),
+            )
+            return DeliveryResult(
+                DeliveryOutcome.NEEDS_REVIEW,
                 self._require_effect(operation_id),
             )
         finished_at = self._clock()

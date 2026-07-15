@@ -20,6 +20,10 @@ class LostLeaseError(RuntimeError):
     """写入者持有的 fencing epoch 已经过期。"""
 
 
+class PendingInterruptError(RuntimeError):
+    """Run 收尾事务检测到尚未处理的定向中断。"""
+
+
 class FenceToken(Protocol):
     @property
     def session_key(self) -> str: ...
@@ -1369,9 +1373,14 @@ class OperationalRepository:
         lease: FenceToken,
         outcome: str,
         now: datetime,
+        resume_snapshot_id: str | None = None,
+        reject_pending_interrupt: bool = False,
+        acknowledge_pending_interrupt: bool = False,
     ) -> None:
         if outcome not in {"succeeded", "failed", "cancelled", "needs_review"}:
             raise ValueError(f"不支持的 Run 终态: {outcome}")
+        if reject_pending_interrupt and acknowledge_pending_interrupt:
+            raise ValueError("不能同时拒绝并确认待处理中断")
         now_text = _utc_iso(now)
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
@@ -1389,6 +1398,45 @@ class OperationalRepository:
             ).fetchone()
             if run is None:
                 raise LostLeaseError("Run 已不属于当前 lease")
+            pending_interrupt = connection.execute(
+                """
+                SELECT 1 FROM session_interrupts
+                WHERE target_run_id = ? AND state = 'pending' LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if pending_interrupt is not None and reject_pending_interrupt:
+                raise PendingInterruptError(run_id)
+            if pending_interrupt is not None and acknowledge_pending_interrupt:
+                connection.execute(
+                    """
+                    UPDATE session_interrupts
+                    SET state = 'acknowledged', acknowledged_at = ?
+                    WHERE target_run_id = ? AND state = 'pending'
+                    """,
+                    (now_text, run_id),
+                )
+            if resume_snapshot_id is not None:
+                if outcome == "succeeded":
+                    changed = connection.execute(
+                        """
+                        UPDATE turn_interrupt_snapshots SET consumed_at = ?
+                        WHERE snapshot_id = ? AND reserved_job_id = ?
+                          AND consumed_at IS NULL
+                        """,
+                        (now_text, resume_snapshot_id, run["job_id"]),
+                    ).rowcount
+                    if changed != 1:
+                        raise LostLeaseError("续接快照已失效或不属于当前 Job")
+                else:
+                    connection.execute(
+                        """
+                        UPDATE turn_interrupt_snapshots SET reserved_job_id = NULL
+                        WHERE snapshot_id = ? AND reserved_job_id = ?
+                          AND consumed_at IS NULL
+                        """,
+                        (resume_snapshot_id, run["job_id"]),
+                    )
             connection.execute(
                 """
                 UPDATE runs
@@ -1704,6 +1752,7 @@ __all__ = [
     "JobRecord",
     "LostLeaseError",
     "OperationalRepository",
+    "PendingInterruptError",
     "OutboxRecord",
     "RunClaim",
     "SessionIdentityRecord",

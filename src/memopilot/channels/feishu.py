@@ -81,12 +81,24 @@ class FeishuChannel:
         self._ws_thread: threading.Thread | None = None
         self._ws_stop_requested = threading.Event()
         self._ws_ready = threading.Event()
+        self._ws_start_error: BaseException | None = None
         self._ws_event_timeout_seconds = ws_event_timeout_seconds
         self._ws_stop_timeout_seconds = ws_stop_timeout_seconds
 
     async def start(self) -> None:
         self._identity_index.rebuild()
         self._start_ws_client()
+        ready = await asyncio.to_thread(
+            self._ws_ready.wait,
+            self._ws_stop_timeout_seconds,
+        )
+        if not ready:
+            await self._stop_ws_client()
+            raise TimeoutError("飞书长连接初始化超时")
+        if self._ws_start_error is not None:
+            error = self._ws_start_error
+            await self._stop_ws_client()
+            raise RuntimeError("飞书长连接初始化失败") from error
 
     async def stop(self) -> None:
         try:
@@ -323,6 +335,7 @@ class FeishuChannel:
             return
         self._ws_stop_requested.clear()
         self._ws_ready.clear()
+        self._ws_start_error = None
         self._main_loop = asyncio.get_running_loop()
         self._ws_thread = threading.Thread(
             target=self._run_ws_client,
@@ -342,22 +355,39 @@ class FeishuChannel:
                 .register_p2_im_message_receive_v1(self._on_ws_message)
                 .build()
             )
-            self._ws_client = lark.ws.Client(
+            client = lark.ws.Client(
                 self._app_id,
                 self._app_secret,
-                log_level=lark.LogLevel.INFO,
+                log_level=lark.LogLevel.WARNING,
                 event_handler=handler,
+                auto_reconnect=False,
             )
+            self._ws_client = client
+            original_connect = getattr(client, "_connect", None)
+            if original_connect is None:
+                raise RuntimeError("当前飞书 SDK 不支持长连接就绪探测")
+
+            async def connect_and_mark_ready() -> None:
+                await original_connect()
+                if self._ws_stop_requested.is_set():
+                    client._auto_reconnect = False
+                    raise RuntimeError("飞书长连接在首次握手期间收到停止请求")
+                client._auto_reconnect = True
+                self._ws_ready.set()
+
+            client._connect = connect_and_mark_ready
         except Exception as exc:
+            self._ws_start_error = exc
             logger.warning("[feishu] long connection initialization failed: %s", exc)
-            return
-        finally:
             self._ws_ready.set()
+            return
         if self._ws_stop_requested.is_set():
             return
         try:
             self._ws_client.start()
         except Exception as exc:
+            self._ws_start_error = exc
+            self._ws_ready.set()
             logger.warning("[feishu] long connection exited: %s", exc)
 
     def _on_ws_message(self, data: Any) -> None:

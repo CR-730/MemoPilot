@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -256,6 +257,7 @@ async def test_stop_during_ws_initialization_prevents_late_connection(tmp_path: 
 
     def delayed_start() -> None:
         initializing.set()
+        channel._ws_ready.set()
         threading.Event().wait(0.05)
         stop_requested = getattr(channel, "_ws_stop_requested", threading.Event())
         if not stop_requested.is_set():
@@ -269,6 +271,141 @@ async def test_stop_during_ws_initialization_prevents_late_connection(tmp_path: 
 
     assert connected.is_set() is False
     assert channel._ws_thread is None or channel._ws_thread.is_alive() is False
+
+
+@pytest.mark.asyncio
+async def test_ws_initialization_failure_is_propagated_from_start(tmp_path: Path) -> None:
+    channel, _ = _channel(tmp_path)
+
+    def failed_start() -> None:
+        channel._ws_start_error = RuntimeError("sdk init failed")
+        channel._ws_ready.set()
+
+    channel._run_ws_client = failed_start  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="飞书长连接初始化失败"):
+        await channel.start()
+
+
+@pytest.mark.asyncio
+async def test_ws_handshake_failure_is_propagated_from_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel, _ = _channel(tmp_path)
+
+    class _Builder:
+        def register_p2_im_message_receive_v1(self, callback: object) -> _Builder:
+            return self
+
+        def build(self) -> object:
+            return object()
+
+    class _Client:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._auto_reconnect = bool(kwargs["auto_reconnect"])
+
+        async def _connect(self) -> None:
+            raise RuntimeError("invalid credentials")
+
+        def start(self) -> None:
+            asyncio.run(self._connect())
+
+    fake_lark = SimpleNamespace(
+        EventDispatcherHandler=SimpleNamespace(builder=lambda *_: _Builder()),
+        LogLevel=SimpleNamespace(WARNING="warning"),
+        ws=SimpleNamespace(Client=_Client),
+    )
+    monkeypatch.setitem(sys.modules, "lark_oapi", fake_lark)
+
+    with pytest.raises(RuntimeError, match="飞书长连接初始化失败"):
+        await channel.start()
+
+
+def test_ws_sdk_uses_log_level_that_does_not_print_connection_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel, _ = _channel(tmp_path)
+    captured: dict[str, object] = {}
+
+    class _Builder:
+        def register_p2_im_message_receive_v1(self, callback: object) -> _Builder:
+            return self
+
+        def build(self) -> object:
+            return object()
+
+    class _Client:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self._auto_reconnect = bool(kwargs["auto_reconnect"])
+
+        async def _connect(self) -> None:
+            return None
+
+        def start(self) -> None:
+            asyncio.run(self._connect())
+
+    fake_lark = SimpleNamespace(
+        EventDispatcherHandler=SimpleNamespace(builder=lambda *_: _Builder()),
+        LogLevel=SimpleNamespace(WARNING="warning", INFO="info"),
+        ws=SimpleNamespace(Client=_Client),
+    )
+    monkeypatch.setitem(sys.modules, "lark_oapi", fake_lark)
+
+    channel._run_ws_client()
+
+    assert captured["log_level"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_stop_during_connect_does_not_reenable_auto_reconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel, _ = _channel(tmp_path)
+    connect_started = threading.Event()
+    release_connect = threading.Event()
+    clients: list[object] = []
+
+    class _Builder:
+        def register_p2_im_message_receive_v1(self, callback: object) -> _Builder:
+            return self
+
+        def build(self) -> object:
+            return object()
+
+    class _Client:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._auto_reconnect = bool(kwargs["auto_reconnect"])
+            clients.append(self)
+
+        async def _connect(self) -> None:
+            connect_started.set()
+            await asyncio.to_thread(release_connect.wait)
+
+        def start(self) -> None:
+            asyncio.run(self._connect())
+
+    fake_lark = SimpleNamespace(
+        EventDispatcherHandler=SimpleNamespace(builder=lambda *_: _Builder()),
+        LogLevel=SimpleNamespace(WARNING="warning"),
+        ws=SimpleNamespace(Client=_Client),
+    )
+    monkeypatch.setitem(sys.modules, "lark_oapi", fake_lark)
+
+    thread = threading.Thread(target=channel._run_ws_client)
+    channel._ws_thread = thread
+    thread.start()
+    await asyncio.to_thread(connect_started.wait, 1)
+    channel._ws_stop_requested.set()
+    release_connect.set()
+    await asyncio.to_thread(thread.join, 1)
+
+    assert thread.is_alive() is False
+    assert clients
+    assert clients[0]._auto_reconnect is False  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

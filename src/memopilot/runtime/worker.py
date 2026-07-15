@@ -15,6 +15,7 @@ from memopilot.tasks.operational import (
     FenceToken,
     LostLeaseError,
     OperationalRepository,
+    PendingInterruptError,
     RunClaim,
 )
 
@@ -94,17 +95,13 @@ class RuntimeJobExecutor:
                 raise TurnInterrupted(claim.run_id) from None
             raise
         except Exception:
-            if turn.resume_snapshot_id is not None:
-                self._repository.release_interrupt_snapshot(
-                    turn.resume_snapshot_id,
-                    job_id=claim.job_id,
-                )
             try:
                 self._repository.finish_job(
                     claim.run_id,
                     lease=lease,
                     outcome="failed",
-                    now=now,
+                    now=self._clock(),
+                    resume_snapshot_id=turn.resume_snapshot_id,
                 )
             except LostLeaseError:
                 pass
@@ -126,13 +123,9 @@ class RuntimeJobExecutor:
                 raise
             except Exception as exc:
                 logger.warning("飞书过程卡定格异常，最终回复继续发送: %s", exc)
+        delivery_confirmed = False
         if result.react.infrastructure_error:
             outcome = "failed"
-            if turn.resume_snapshot_id is not None:
-                self._repository.release_interrupt_snapshot(
-                    turn.resume_snapshot_id,
-                    job_id=claim.job_id,
-                )
         elif self._final_response_dispatcher is None:
             outcome = "succeeded"
         else:
@@ -160,18 +153,27 @@ class RuntimeJobExecutor:
                 DeliveryOutcome.FAILED: "failed",
                 DeliveryOutcome.NEEDS_REVIEW: "needs_review",
             }[delivery.outcome]
-        if result.react.infrastructure_error is None and turn.resume_snapshot_id is not None:
-            self._repository.consume_interrupt_snapshot(
-                turn.resume_snapshot_id,
-                job_id=claim.job_id,
+            delivery_confirmed = delivery.outcome is DeliveryOutcome.CONFIRMED
+        try:
+            self._repository.finish_job(
+                claim.run_id,
+                lease=lease,
+                outcome=outcome,
+                now=self._clock(),
+                resume_snapshot_id=turn.resume_snapshot_id,
+                reject_pending_interrupt=not delivery_confirmed,
+                acknowledge_pending_interrupt=delivery_confirmed,
+            )
+        except PendingInterruptError:
+            self._repository.finish_interrupted_run(
+                claim.run_id,
+                lease=lease,
+                snapshot=recorder.snapshot(
+                    original_message=turn.interrupt_original_message or turn.content
+                ),
                 now=self._clock(),
             )
-        self._repository.finish_job(
-            claim.run_id,
-            lease=lease,
-            outcome=outcome,
-            now=now,
-        )
+            raise TurnInterrupted(claim.run_id) from None
         return result
 
 
