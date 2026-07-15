@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +12,7 @@ from pathlib import Path
 from memopilot.memory.contracts import EmbeddingProvider
 from memopilot.memory.store import MemoryStore
 from memopilot.persistence.migrations import connect_database
+from memopilot.tasks.operational import LostLeaseError
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +33,16 @@ class VectorizationService:
         self.store = store
         self.embedder = embedder
 
-    async def run(self, consolidation_id: str) -> VectorizationResult:
+    async def run(
+        self,
+        consolidation_id: str,
+        *,
+        assert_current: Callable[[], None] | None = None,
+        fenced_write: Callable[[], AbstractContextManager[None]] | None = None,
+    ) -> VectorizationResult:
+        guard = assert_current or (lambda: None)
+        write_scope = fenced_write or nullcontext
+        guard()
         with connect_database(self.operational_database) as connection:
             manifest = connection.execute(
                 "SELECT model_output_json, state FROM consolidation_manifests "
@@ -79,33 +91,40 @@ class VectorizationService:
                     counts["unchanged"] += 1
                     continue
                 embedding = await self.embedder.embed(summary)
-                write = self.store.write_item(
-                    summary=summary,
-                    memory_type=kind,
-                    source_ref=source_ref,
-                    embedding=embedding,
-                    happened_at=_optional_text(raw.get("happened_at")),
-                    emotional_weight=_bounded_int(raw.get("emotional_weight")),
-                    extra=_object(raw.get("extra")),
-                )
-                counts[write.status] += 1
-                supersedes = _optional_text(raw.get("supersedes"))
-                if supersedes:
-                    self.store.mark_superseded(supersedes)
+                guard()
+                with write_scope():
+                    write = self.store.write_item(
+                        summary=summary,
+                        memory_type=kind,
+                        source_ref=source_ref,
+                        embedding=embedding,
+                        happened_at=_optional_text(raw.get("happened_at")),
+                        emotional_weight=_bounded_int(raw.get("emotional_weight")),
+                        extra=_object(raw.get("extra")),
+                    )
+                    counts[write.status] += 1
+                    supersedes = _optional_text(raw.get("supersedes"))
+                    if supersedes:
+                        self.store.mark_superseded(supersedes)
             now = datetime.now(UTC).isoformat()
-            with connect_database(self.store.database) as connection:
-                connection.execute(
-                    "UPDATE memory_ingestion_batches SET state = 'committed', committed_at = ?, "
-                    "updated_at = ? WHERE batch_id = ?",
-                    (now, now, batch_id),
-                )
+            guard()
+            with write_scope():
+                with connect_database(self.store.database) as connection:
+                    connection.execute(
+                        "UPDATE memory_ingestion_batches SET state = 'committed', "
+                        "committed_at = ?, updated_at = ? WHERE batch_id = ?",
+                        (now, now, batch_id),
+                    )
+        except LostLeaseError:
+            raise
         except Exception as exc:
-            with connect_database(self.store.database) as connection:
-                connection.execute(
-                    "UPDATE memory_ingestion_batches SET state = 'failed', last_error = ?, "
-                    "updated_at = ? WHERE batch_id = ?",
-                    (str(exc), datetime.now(UTC).isoformat(), batch_id),
-                )
+            with write_scope():
+                with connect_database(self.store.database) as connection:
+                    connection.execute(
+                        "UPDATE memory_ingestion_batches SET state = 'failed', last_error = ?, "
+                        "updated_at = ? WHERE batch_id = ? AND state IN ('pending', 'writing')",
+                        (str(exc), datetime.now(UTC).isoformat(), batch_id),
+                    )
             raise
         return VectorizationResult(**counts)
 

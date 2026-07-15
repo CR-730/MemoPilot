@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -702,7 +703,7 @@ class OperationalRepository:
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
         try:
-            self._require_current_fence(connection, lease)
+            self.require_current_fence(connection, lease)
             job = connection.execute(
                 "SELECT state, session_key FROM agent_jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
@@ -826,7 +827,7 @@ class OperationalRepository:
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
         try:
-            self._require_current_fence(connection, lease)
+            self.require_current_fence(connection, lease)
             run = connection.execute(
                 """
                 SELECT r.job_id FROM runs AS r
@@ -935,7 +936,7 @@ class OperationalRepository:
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
         try:
-            self._require_current_fence(connection, lease)
+            self.require_current_fence(connection, lease)
             run = connection.execute(
                 """
                 SELECT 1 FROM runs AS r
@@ -1027,9 +1028,7 @@ class OperationalRepository:
                 tool_name=str(row["tool_name"]) if row["tool_name"] is not None else None,
                 input_json=str(row["input_json"]) if row["input_json"] is not None else None,
                 observation_json=(
-                    str(row["observation_json"])
-                    if row["observation_json"] is not None
-                    else None
+                    str(row["observation_json"]) if row["observation_json"] is not None else None
                 ),
                 owner_id=str(row["owner_id"]),
                 fencing_epoch=int(row["fencing_epoch"]),
@@ -1050,7 +1049,7 @@ class OperationalRepository:
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
         try:
-            self._require_current_fence(connection, lease)
+            self.require_current_fence(connection, lease)
             run = connection.execute(
                 """
                 SELECT r.run_id, r.state, COALESCE(r.heartbeat_at, r.updated_at) AS last_seen
@@ -1166,7 +1165,7 @@ class OperationalRepository:
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
         try:
-            self._require_current_fence(connection, lease)
+            self.require_current_fence(connection, lease)
             run = connection.execute(
                 """
                 SELECT r.job_id FROM runs AS r
@@ -1231,7 +1230,7 @@ class OperationalRepository:
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
         try:
-            self._require_current_fence(connection, lease)
+            self.require_current_fence(connection, lease)
             run = connection.execute(
                 """
                 SELECT r.job_id, r.state AS run_state, j.state AS job_state,
@@ -1261,10 +1260,7 @@ class OperationalRepository:
                 connection.execute("COMMIT")
                 return TurnCommitResult(consolidation_job_id, outbox_id, False)
 
-            if (
-                str(run["run_state"]) != "running"
-                or str(run["job_state"]) != "running"
-            ):
+            if str(run["run_state"]) != "running" or str(run["job_state"]) != "running":
                 raise LostLeaseError("Run 已不处于可提交状态")
             owned = connection.execute(
                 """
@@ -1457,7 +1453,7 @@ class OperationalRepository:
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
         try:
-            self._require_current_fence(connection, lease)
+            self.require_current_fence(connection, lease)
             existing = connection.execute(
                 """
                 SELECT r.job_id, r.state AS run_state, j.state AS job_state
@@ -1516,7 +1512,7 @@ class OperationalRepository:
             connection.close()
 
     @staticmethod
-    def _require_current_fence(connection: sqlite3.Connection, lease: FenceToken) -> None:
+    def require_current_fence(connection: sqlite3.Connection, lease: FenceToken) -> None:
         row = connection.execute(
             """
             SELECT 1 FROM session_fences
@@ -1528,6 +1524,27 @@ class OperationalRepository:
             raise LostLeaseError(
                 f"会话 {lease.session_key} 的 owner/epoch 已失效: {lease.owner_id}/{lease.epoch}"
             )
+
+    def assert_current_fence(self, lease: FenceToken) -> None:
+        """在跨库或文件写入前确认当前 Worker 仍持有写权限。"""
+        with self._connect() as connection:
+            self.require_current_fence(connection, lease)
+
+    @contextmanager
+    def fenced_write(self, lease: FenceToken) -> Iterator[None]:
+        """持有 operational 写锁完成跨介质副作用，阻止更高 epoch 并发取得提交权。"""
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.require_current_fence(connection, lease)
+            yield
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
 
     def count(self, table: str) -> int:
         if table not in self._COUNTABLE_TABLES:

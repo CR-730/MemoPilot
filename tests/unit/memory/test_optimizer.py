@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from memopilot.memory.markdown import MarkdownMemoryStore
 from memopilot.memory.optimizer import MemoryOptimizer
+from memopilot.tasks.operational import LostLeaseError
 
 
 class _OptimizerModel:
@@ -54,3 +57,55 @@ async def test_optimizer_rolls_back_snapshot_on_failure_or_restart(tmp_path: Pat
     assert optimizer.recover() is True
     pending = markdown.read("PENDING.md")
     assert "旧事实" in pending and "重启后新事实" in pending
+
+
+@pytest.mark.asyncio
+async def test_optimizer_does_not_replace_files_after_losing_lease(tmp_path: Path) -> None:
+    markdown = MarkdownMemoryStore(tmp_path)
+    markdown.replace("MEMORY.md", "# 原记忆")
+    markdown.replace("SELF.md", "# 原自我")
+    markdown.replace("PENDING.md", "- 旧事实")
+    optimizer = MemoryOptimizer(markdown, _OptimizerModel())
+    scopes = 0
+
+    @contextmanager
+    def fenced_write() -> Iterator[None]:
+        nonlocal scopes
+        scopes += 1
+        if scopes >= 2:
+            raise LostLeaseError("模拟 guard 成功后、发布前失权")
+        yield
+
+    with pytest.raises(LostLeaseError, match="失权"):
+        await optimizer.run(
+            assert_current=lambda: None,
+            fenced_write=fenced_write,
+        )
+
+    assert markdown.read("MEMORY.md").strip() == "# 原记忆"
+    assert markdown.read("SELF.md").strip() == "# 原自我"
+    assert markdown.snapshot_path.exists()
+    assert optimizer.recover() is True
+    assert markdown.read("PENDING.md").strip() == "- 旧事实"
+
+
+def test_optimizer_recovers_both_files_after_process_crash_mid_publish(tmp_path: Path) -> None:
+    markdown = MarkdownMemoryStore(tmp_path)
+    markdown.replace("MEMORY.md", "# 原记忆")
+    markdown.replace("SELF.md", "# 原自我")
+    markdown.replace("PENDING.md", "- 旧事实")
+    pending = markdown.begin_pending_snapshot()
+    assert "旧事实" in pending
+    markdown.begin_optimizer_publish(
+        memory=markdown.read("MEMORY.md"),
+        self_text=markdown.read("SELF.md"),
+    )
+    markdown.replace("MEMORY.md", "# 新记忆")
+    # 模拟进程在第一份正式文件替换后被强杀；新实例只看到磁盘状态。
+    restarted = MemoryOptimizer(MarkdownMemoryStore(tmp_path), _OptimizerModel())
+
+    assert restarted.recover() is True
+    assert markdown.read("MEMORY.md").strip() == "# 原记忆"
+    assert markdown.read("SELF.md").strip() == "# 原自我"
+    assert markdown.read("PENDING.md").strip() == "- 旧事实"
+    assert not markdown.optimizer_publish_path.exists()

@@ -23,7 +23,13 @@ logger = logging.getLogger(__name__)
 
 class MemoryJobExecutor(Protocol):
     async def execute(
-        self, *, kind: str, session_key: str, payload: dict[str, object]
+        self,
+        *,
+        kind: str,
+        session_key: str,
+        payload: dict[str, object],
+        run_id: str,
+        lease: FenceToken,
     ) -> None: ...
 
 
@@ -72,6 +78,8 @@ class RuntimeJobExecutor:
                     kind=job.kind,
                     session_key=claim.session_key,
                     payload={str(key): value for key, value in payload.items()},
+                    run_id=claim.run_id,
+                    lease=lease,
                 )
                 self._repository.finish_job(
                     claim.run_id,

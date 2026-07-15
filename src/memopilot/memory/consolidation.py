@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from memopilot.memory.markdown import MarkdownMemoryStore
 from memopilot.persistence.migrations import connect_database
+from memopilot.tasks.operational import FenceToken, OperationalRepository
 
 
 class ConsolidationExtractor(Protocol):
@@ -45,15 +47,30 @@ class ConsolidationService:
         self.min_new_messages = max(1, min_new_messages)
         self.failpoint = failpoint
 
-    async def run(self, session_key: str) -> ConsolidationResult | None:
+    async def run(
+        self,
+        session_key: str,
+        *,
+        assert_current: Callable[[], None] | None = None,
+        lease: FenceToken | None = None,
+        fenced_write: Callable[[], AbstractContextManager[None]] | None = None,
+    ) -> ConsolidationResult | None:
+        guard = assert_current or (lambda: None)
+        guard()
         manifest = self._pending_manifest(session_key)
         if manifest is None:
             window = self._select_window(session_key)
             if window is None:
                 return None
             output = await self.extractor.extract(_format_conversation(window))
+            guard()
             manifest = self._create_manifest(session_key, window, output)
-        result = self._write_and_commit(manifest)
+        result = self._write_and_commit(
+            manifest,
+            assert_current=guard,
+            lease=lease,
+            fenced_write=fenced_write or nullcontext,
+        )
         return result
 
     def _select_window(self, session_key: str) -> list[sqlite3.Row] | None:
@@ -99,9 +116,7 @@ class ConsolidationService:
                 f"memopilot:consolidation:{session_key}:{first['message_id']}:{last['message_id']}",
             )
         )
-        hashes = {
-            name: self.markdown.content_hash(content) for name, content in artifacts.items()
-        }
+        hashes = {name: self.markdown.content_hash(content) for name, content in artifacts.items()}
         states = {name: "pending" for name in artifacts}
         persisted_output = dict(output)
         persisted_output["artifacts"] = artifacts
@@ -136,27 +151,36 @@ class ConsolidationService:
         assert row is not None
         return cast(sqlite3.Row, row)
 
-    def _write_and_commit(self, manifest: sqlite3.Row) -> ConsolidationResult:
+    def _write_and_commit(
+        self,
+        manifest: sqlite3.Row,
+        *,
+        assert_current: Callable[[], None],
+        lease: FenceToken | None,
+        fenced_write: Callable[[], AbstractContextManager[None]],
+    ) -> ConsolidationResult:
         consolidation_id = str(manifest["consolidation_id"])
         output = _json_object(manifest["model_output_json"])
         artifacts = _validated_artifacts(output.get("artifacts"))
         hashes = {str(k): str(v) for k, v in _json_object(manifest["artifact_hashes_json"]).items()}
-        states = {
-            str(k): str(v) for k, v in _json_object(manifest["artifact_states_json"]).items()
-        }
+        states = {str(k): str(v) for k, v in _json_object(manifest["artifact_states_json"]).items()}
+        assert_current()
         self._set_manifest_state(consolidation_id, "writing", attempts_delta=1)
         for name, content in artifacts.items():
             content_hash = hashes[name]
             if states.get(name) != "written" or not self.markdown.contains_artifact(
                 name, consolidation_id, content_hash
             ):
-                self.markdown.append_artifact(
-                    name,
-                    consolidation_id=consolidation_id,
-                    content=content,
-                    content_hash=content_hash,
-                )
+                assert_current()
+                with fenced_write():
+                    self.markdown.append_artifact(
+                        name,
+                        consolidation_id=consolidation_id,
+                        content=content,
+                        content_hash=content_hash,
+                    )
                 states[name] = "written"
+                assert_current()
                 self._save_artifact_states(consolidation_id, states)
             if self.failpoint is not None:
                 self.failpoint(f"after_artifact:{name}")
@@ -166,10 +190,12 @@ class ConsolidationService:
         ):
             raise RuntimeError("归档文件校验失败，不允许发布向量任务")
         window = _json_object(output.get("_window"))
+        assert_current()
         self._commit_manifest(
             consolidation_id,
             session_key=str(manifest["session_key"]),
             last_position=int(str(window["last_position"])),
+            lease=lease,
         )
         return ConsolidationResult(
             consolidation_id=consolidation_id,
@@ -201,7 +227,12 @@ class ConsolidationService:
             )
 
     def _commit_manifest(
-        self, consolidation_id: str, *, session_key: str, last_position: int
+        self,
+        consolidation_id: str,
+        *,
+        session_key: str,
+        last_position: int,
+        lease: FenceToken | None,
     ) -> None:
         now = datetime.now(UTC).isoformat()
         job_id = str(uuid5(NAMESPACE_URL, f"memopilot:vectorize:{consolidation_id}"))
@@ -209,6 +240,8 @@ class ConsolidationService:
         connection = connect_database(self.database)
         connection.execute("BEGIN IMMEDIATE")
         try:
+            if lease is not None:
+                OperationalRepository.require_current_fence(connection, lease)
             activity = connection.execute(
                 "SELECT activity_version FROM session_activity WHERE session_key = ?",
                 (session_key,),

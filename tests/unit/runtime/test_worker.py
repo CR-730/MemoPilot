@@ -84,8 +84,16 @@ class _MemoryJobs:
     def __init__(self) -> None:
         self.calls = []
 
-    async def execute(self, *, kind: str, session_key: str, payload: dict[str, Any]) -> None:
-        self.calls.append((kind, session_key, payload))
+    async def execute(
+        self,
+        *,
+        kind: str,
+        session_key: str,
+        payload: dict[str, Any],
+        run_id: str,
+        lease: Any,
+    ) -> None:
+        self.calls.append((kind, session_key, payload, run_id, lease))
 
 
 @pytest.mark.asyncio
@@ -93,7 +101,9 @@ async def test_memory_job_bypasses_agent_runtime_and_finishes_normally() -> None
     repository = _MemoryRepository()
     memory_jobs = _MemoryJobs()
     executor = RuntimeJobExecutor(
-        repository, _Runtime(), memory_jobs=memory_jobs  # type: ignore[arg-type]
+        repository,
+        _Runtime(),
+        memory_jobs=memory_jobs,  # type: ignore[arg-type]
     )
     claim = SimpleNamespace(
         job_id="job-memory",
@@ -113,7 +123,13 @@ async def test_memory_job_bypasses_agent_runtime_and_finishes_normally() -> None
 
     assert result is None
     assert memory_jobs.calls == [
-        ("memory.vectorize", "feishu:chat-1", {"consolidation_id": "con-1"})
+        (
+            "memory.vectorize",
+            "feishu:chat-1",
+            {"consolidation_id": "con-1"},
+            "run-memory",
+            lease,
+        )
     ]
     assert repository.commits == []
     assert repository.finishes == ["succeeded"]

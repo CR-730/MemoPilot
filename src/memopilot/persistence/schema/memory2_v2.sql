@@ -13,6 +13,9 @@ CREATE TABLE memory_vector_rows (
     item_id TEXT NOT NULL UNIQUE REFERENCES memory_items(item_id) ON DELETE CASCADE
 );
 
+INSERT OR IGNORE INTO memory_vector_rows(item_id)
+SELECT item_id FROM memory_items ORDER BY created_at, item_id;
+
 CREATE TABLE memory_ingestion_batches (
     batch_id TEXT PRIMARY KEY,
     source_ref TEXT NOT NULL UNIQUE,

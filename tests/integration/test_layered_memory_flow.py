@@ -53,9 +53,7 @@ class _Extractor:
                 "PENDING.md": "- [preference] 用户要求 Git 提交信息使用中文。",
                 "HISTORY.md": "## 2026-07-14\n\n用户明确了提交语言偏好。",
             },
-            "memories": [
-                {"kind": "preference", "summary": "用户要求 Git 提交信息使用中文。"}
-            ],
+            "memories": [{"kind": "preference", "summary": "用户要求 Git 提交信息使用中文。"}],
         }
 
 
@@ -120,6 +118,7 @@ async def test_turn_to_async_archive_vector_and_next_turn_recall(
         ),
         VectorizationService(operational, store, embedder),
         MemoryOptimizer(markdown, _OptimizerModel()),
+        repository,
     )
     queue = RedisTaskQueue(memory_redis)
     await queue.ensure_consumer_groups()

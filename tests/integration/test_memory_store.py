@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import sqlite3
+import struct
+from importlib.resources import files
 from pathlib import Path
 
 from memopilot.memory.store import MemoryStore
@@ -75,3 +79,38 @@ def test_keyword_lane_indexes_cjk_bigrams_and_ascii_terms(tmp_path: Path) -> Non
 
     assert chinese[0]["source_ref"] == "turn:keyword"
     assert ascii_hits[0]["source_ref"] == "turn:keyword"
+
+
+def test_v1_upgrade_rebuilds_keyword_and_vector_indexes(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-memory.db"
+    v1_sql = files("memopilot.persistence.schema").joinpath("memory2_v1.sql").read_text("utf-8")
+    summary = "用户长期使用 Python 开发 Agent"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(v1_sql)
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute(
+            """
+            INSERT INTO memory_items(
+                item_id, memory_type, summary, content_hash, source_ref, status,
+                reinforcement_count, emotional_weight, happened_at, extra_json,
+                created_at, updated_at
+            ) VALUES ('legacy-1', 'preference', ?, ?, 'legacy:1', 'active', 1, 0,
+                      NULL, '{}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+            """,
+            (summary, hashlib.sha256(f"preference\0{summary.casefold()}".encode()).hexdigest()),
+        )
+        connection.execute(
+            """
+            INSERT INTO memory_embeddings(
+                item_id, provider, model, dimension, embedding, content_hash, created_at, updated_at
+            ) VALUES ('legacy-1', 'test', 'test', 3, ?, 'hash',
+                      '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+            """,
+            (struct.pack("<3f", 1.0, 0.0, 0.0),),
+        )
+
+    migrate_database(database, DatabaseKind.MEMORY)
+    store = MemoryStore(database, dimension=3, vector_enabled=True)
+
+    assert store.search_keywords("Python", limit=5)[0]["item_id"] == "legacy-1"
+    assert store.search_vectors([1.0, 0.0, 0.0], limit=5)[0]["item_id"] == "legacy-1"

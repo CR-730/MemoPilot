@@ -36,7 +36,7 @@ class MemoryStore:
         self.dimension = dimension
         self._vector_requested = vector_enabled
         self._vector_available = False
-        self._initialize_vector_index()
+        self._initialize_indexes()
 
     @property
     def vector_available(self) -> bool:
@@ -221,9 +221,7 @@ class MemoryStore:
             ).fetchall()
         items = [_item_dict(row) for row in rows]
         filtered = [
-            item
-            for item in items
-            if _matches_filters(item, memory_types, time_start, time_end)
+            item for item in items if _matches_filters(item, memory_types, time_start, time_end)
         ]
         for rank, item in enumerate(filtered, start=1):
             item["keyword_rank"] = rank
@@ -267,21 +265,62 @@ class MemoryStore:
                 (datetime.now(UTC).isoformat(), item_id),
             )
 
-    def _initialize_vector_index(self) -> None:
-        if not self._vector_requested:
-            return
+    def _initialize_indexes(self) -> None:
         connection = connect_database(self.database)
         try:
-            _load_sqlite_vec(connection)
-            connection.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors "
-                f"USING vec0(embedding float[{self.dimension}] distance_metric=cosine)"
-            )
-            self._vector_available = True
+            self._rebuild_missing_keyword_rows(connection)
+            if self._vector_requested:
+                _load_sqlite_vec(connection)
+                connection.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors "
+                    f"USING vec0(embedding float[{self.dimension}] distance_metric=cosine)"
+                )
+                self._vector_available = True
+                self._rebuild_missing_vector_rows(connection)
         except (ImportError, sqlite3.Error):
             self._vector_available = False
         finally:
             connection.close()
+
+    @staticmethod
+    def _rebuild_missing_keyword_rows(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            """
+            SELECT i.item_id, i.summary
+            FROM memory_items AS i
+            LEFT JOIN memory_fts AS f ON f.item_id = i.item_id
+            WHERE f.item_id IS NULL
+            """
+        ).fetchall()
+        connection.executemany(
+            "INSERT INTO memory_fts(item_id, terms) VALUES (?, ?)",
+            ((str(row["item_id"]), " ".join(_extract_terms(str(row["summary"])))) for row in rows),
+        )
+
+    def _rebuild_missing_vector_rows(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            """
+            SELECT m.row_id, e.embedding
+            FROM memory_vector_rows AS m
+            JOIN memory_embeddings AS e ON e.item_id = m.item_id
+            LEFT JOIN memory_vectors AS v ON v.rowid = m.row_id
+            WHERE v.rowid IS NULL AND e.dimension = ?
+            """,
+            (self.dimension,),
+        ).fetchall()
+        connection.executemany(
+            "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+            (
+                (
+                    int(row["row_id"]),
+                    json.dumps(
+                        _unpack_vector(row["embedding"], self.dimension),
+                        separators=(",", ":"),
+                    ),
+                )
+                for row in rows
+            ),
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = connect_database(self.database)
