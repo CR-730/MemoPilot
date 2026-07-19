@@ -46,6 +46,7 @@ EXPECTED_TABLES = {
         "memory_vector_rows",
         "memory_ingestion_batches",
         "memory_fts",
+        "memory_usages",
     },
     DatabaseKind.WAKE: {
         "source_events",
@@ -68,7 +69,7 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
     assert report.from_version == 0
     expected_version = {
         DatabaseKind.OPERATIONAL: 5,
-        DatabaseKind.MEMORY: 2,
+        DatabaseKind.MEMORY: 3,
         DatabaseKind.WAKE: 1,
     }[kind]
     assert report.to_version == expected_version

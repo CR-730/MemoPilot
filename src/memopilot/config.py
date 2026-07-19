@@ -81,8 +81,24 @@ class MemoPilotSettings(BaseSettings):
     memory_consolidation_min_new_messages: int = Field(default=5, gt=0)
     memory_retrieval_limit: int = Field(default=8, gt=0, le=200)
     memory_score_threshold: float = Field(default=0.45, ge=0, le=1)
-    memory_relative_delta: float = Field(default=0.06, ge=0, le=1)
+    memory_score_thresholds: dict[str, float] = Field(
+        default_factory=lambda: {
+            "procedure": 0.58,
+            "preference": 0.52,
+            "event": 0.45,
+            "profile": 0.5,
+        }
+    )
+    memory_embed_timeout_seconds: float = Field(default=5, gt=0)
+    memory_procedure_guard_enabled: bool = True
+    memory_hotness_alpha: float = Field(default=0.2, ge=0, le=1)
+    memory_hotness_half_life_days: float = Field(default=14, gt=0)
     memory_inject_max_chars: int = Field(default=1200, ge=120)
+    memory_inject_max_forced: int = Field(default=3, gt=0)
+    memory_inject_max_procedure_preference: int = Field(default=4, gt=0)
+    memory_inject_max_event_profile: int = Field(default=2, ge=0)
+    memory_optimizer_enabled: bool = True
+    memory_optimizer_interval_seconds: int = Field(default=64800, gt=0)
     display_timezone: str = "Asia/Shanghai"
 
     @classmethod
@@ -231,18 +247,45 @@ def load_settings(
     channels = _as_dict(data.get("channels"))
     feishu = _as_dict(channels.get("feishu"))
     redis = _as_dict(data.get("redis"))
-    values: dict[str, Any] = {
-        "chat_model": main.get("model") or "deepseek-v4-flash",
-        "chat_base_url": main.get("base_url") or "https://api.deepseek.com",
-        "llm_thinking_enabled": bool(main.get("enable_thinking", False)),
-        "llm_max_output_tokens": int(agent.get("max_tokens", 2048)),
-        "llm_max_iterations": int(agent.get("max_iterations", 10)),
-        "feishu_enabled": bool(feishu.get("enabled", True)),
-        "feishu_allow_from": feishu.get("allow_from", feishu.get("allowFrom", ())),
-        "feishu_channel_name": feishu.get("channel_name", "feishu"),
-        "feishu_receive_mode": feishu.get("receive_mode", "ws"),
-        "redis_url": redis.get("url") or data.get("redis_url") or "redis://localhost:6379/0",
-    }
+    values: dict[str, Any] = {}
+    explicit_fields = (
+        (main, "model", "chat_model"),
+        (main, "base_url", "chat_base_url"),
+        (main, "enable_thinking", "llm_thinking_enabled"),
+        (agent, "max_tokens", "llm_max_output_tokens"),
+        (agent, "max_iterations", "llm_max_iterations"),
+        (feishu, "enabled", "feishu_enabled"),
+        (feishu, "channel_name", "feishu_channel_name"),
+        (feishu, "receive_mode", "feishu_receive_mode"),
+        (memory, "score_threshold", "memory_score_threshold"),
+        (memory, "score_thresholds", "memory_score_thresholds"),
+        (memory, "embed_timeout_seconds", "memory_embed_timeout_seconds"),
+        (memory, "procedure_guard_enabled", "memory_procedure_guard_enabled"),
+        (memory, "inject_max_forced", "memory_inject_max_forced"),
+        (
+            memory,
+            "inject_max_procedure_preference",
+            "memory_inject_max_procedure_preference",
+        ),
+        (memory, "inject_max_event_profile", "memory_inject_max_event_profile"),
+        (memory, "hotness_alpha", "memory_hotness_alpha"),
+        (memory, "hotness_half_life_days", "memory_hotness_half_life_days"),
+        (memory, "optimizer_enabled", "memory_optimizer_enabled"),
+        (
+            memory,
+            "optimizer_interval_seconds",
+            "memory_optimizer_interval_seconds",
+        ),
+    )
+    for source, source_key, field_name in explicit_fields:
+        if source_key in source:
+            values[field_name] = source[source_key]
+    if "allow_from" in feishu or "allowFrom" in feishu:
+        values["feishu_allow_from"] = feishu.get("allow_from", feishu.get("allowFrom"))
+    if "url" in redis:
+        values["redis_url"] = redis["url"]
+    elif "redis_url" in data:
+        values["redis_url"] = data["redis_url"]
     optional_values = {
         "chat_api_key": main.get("api_key"),
         "embedding_model": embedding.get("model"),
@@ -255,7 +298,7 @@ def load_settings(
     values.update({key: value for key, value in optional_values.items() if value not in (None, "")})
     if workspace is not None:
         values["workspace"] = workspace
-    return MemoPilotSettings(**values, _env_file=None)  # type: ignore[call-arg]
+    return MemoPilotSettings(**values)
 
 
 def _resolve_environment(value: Any) -> Any:

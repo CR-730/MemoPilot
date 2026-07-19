@@ -106,27 +106,68 @@ class OpenAICompatibleProvider:
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolSchema],
     ) -> ModelResponse:
+        return await self._complete_request(
+            messages=messages,
+            tools=tools,
+            max_output_tokens=self._max_output_tokens,
+            thinking_enabled=None,
+        )
+
+    async def complete_task(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSchema],
+        max_output_tokens: int,
+        thinking_enabled: bool | None = None,
+    ) -> ModelResponse:
+        return await self._complete_request(
+            messages=messages,
+            tools=tools,
+            max_output_tokens=max_output_tokens,
+            thinking_enabled=thinking_enabled,
+        )
+
+    async def _complete_request(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSchema],
+        max_output_tokens: int,
+        thinking_enabled: bool | None,
+    ) -> ModelResponse:
+        preserve_reasoning = (
+            self._preserve_reasoning_content
+            if thinking_enabled is None
+            else thinking_enabled
+        )
         request_messages = [
             message.to_openai(
-                include_provider_fields=self._preserve_reasoning_content,
+                include_provider_fields=preserve_reasoning,
             )
             for message in messages
         ]
-        if self._preserve_reasoning_content:
+        if preserve_reasoning:
             for message in request_messages:
                 if message.get("role") == "assistant":
                     message.setdefault("reasoning_content", "")
         request: dict[str, Any] = {
             "model": self._model,
             "messages": request_messages,
-            "max_tokens": self._max_output_tokens,
+            "max_tokens": max_output_tokens,
             "stream": False,
         }
         if tools:
             request["tools"] = tuple(tools)
             request["tool_choice"] = "auto"
-        if self._extra_body is not None:
-            request["extra_body"] = self._extra_body
+        extra_body = dict(self._extra_body) if self._extra_body is not None else None
+        if thinking_enabled is not None:
+            extra_body = extra_body or {}
+            extra_body["thinking"] = {
+                "type": "enabled" if thinking_enabled else "disabled"
+            }
+        if extra_body is not None:
+            request["extra_body"] = extra_body
         response = await self._client.chat.completions.create(**request)
         if not response.choices:
             raise RuntimeError("Provider 返回空 choices")
@@ -135,11 +176,11 @@ class OpenAICompatibleProvider:
         calls = tuple(self._parse_call(call) for call in (message.tool_calls or ()))
         thinking = (
             getattr(message, "reasoning_content", None)
-            if self._preserve_reasoning_content
+            if preserve_reasoning
             else None
         )
         provider_fields: dict[str, Any] = {}
-        if self._preserve_reasoning_content and (thinking is not None or calls):
+        if preserve_reasoning and (thinking is not None or calls):
             provider_fields["reasoning_content"] = (
                 str(thinking) if thinking is not None else ""
             )

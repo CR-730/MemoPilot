@@ -19,4 +19,19 @@ llm_max_iterations: 10
 llm_max_output_tokens: 2048
 llm_timeout_seconds: 60
 llm_thinking_enabled: false
+memory_score_threshold: 0.45
+memory_score_thresholds:
+  procedure: 0.58
+  preference: 0.52
+  event: 0.45
+  profile: 0.50
+memory_embed_timeout_seconds: 5
+memory_procedure_guard_enabled: true
+memory_inject_max_forced: 3
+memory_inject_max_procedure_preference: 4
+memory_inject_max_event_profile: 2
+memory_hotness_alpha: 0.2
+memory_hotness_half_life_days: 14
+memory_optimizer_enabled: true
+memory_optimizer_interval_seconds: 64800
 display_timezone: Asia/Shanghai

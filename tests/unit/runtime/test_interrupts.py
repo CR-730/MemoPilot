@@ -31,6 +31,18 @@ async def test_progress_recorder_preserves_partial_reply_thinking_and_tools() ->
     assert snapshot.tool_chain[-1]["status"] == "done"
 
 
+async def test_progress_recorder_never_persists_partial_citation_metadata() -> None:
+    recorder = InterruptProgressRecorder()
+
+    await recorder.on_stream_delta(StreamDelta(content_delta="用户可见答案\n§ci"))
+    first = recorder.snapshot(original_message="问题")
+    await recorder.on_stream_delta(StreamDelta(content_delta="ted:[mem-1]§"))
+    second = recorder.snapshot(original_message="问题")
+
+    assert first.partial_reply == "用户可见答案"
+    assert second.partial_reply == "用户可见答案"
+
+
 def test_resumed_message_matches_prototype_semantics() -> None:
     snapshot = TurnInterruptSnapshotRecord(
         snapshot_id="snapshot-1",

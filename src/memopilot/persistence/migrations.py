@@ -161,7 +161,7 @@ def _load_migrations(kind: DatabaseKind) -> tuple[Migration, ...]:
     schema = files("memopilot.persistence.schema")
     versions = {
         DatabaseKind.OPERATIONAL: (1, 2, 3, 4, 5),
-        DatabaseKind.MEMORY: (1, 2),
+        DatabaseKind.MEMORY: (1, 2, 3),
         DatabaseKind.WAKE: (1,),
     }[kind]
     return tuple(

@@ -23,18 +23,69 @@ class _Extractor:
         self.calls += 1
         assert "问题-1" in conversation and "回答-2" in conversation
         return {
-            "artifacts": {
-                "HISTORY.md": "## 2026-07-14\n\n用户完成了阶段四。",
-                "PENDING.md": "- [preference] 用户偏好先读文档再实现。",
-            },
-            "memories": [
+            "history_entries": [
                 {
-                    "kind": "preference",
-                    "summary": "用户偏好先读文档再实现。",
-                    "emotional_weight": 1,
+                    "summary": "[2026-07-14 20:00] 用户完成了阶段四。",
+                    "emotional_weight": 0,
                 }
             ],
+            "pending_items": ["- [preference] 用户偏好先读文档再实现。"],
         }
+
+
+class _RecentContext:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    async def compress(self, **kwargs: str) -> str:
+        self.calls.append(kwargs)
+        return (
+            "# Recent Context\n\n## Compression\n"
+            "until: 2026-07-14T12:00:00+00:00\n"
+            "- 最近持续关注：阶段四\n\n## Ongoing Threads\n- none\n\n"
+            "## Recent Turns\n<!-- a-preview = assistant reply preview only -->\n"
+            "[user] 问题-3\n"
+        )
+
+
+class _HistoryEntryExtractor:
+    async def extract(self, conversation: str) -> dict[str, object]:
+        return {
+            "history_entries": [
+                {
+                    "summary": "[2026-07-14 20:30] 用户完成了阶段四验收。",
+                    "emotional_weight": 6,
+                }
+            ],
+            "pending_items": ["- [preference] 用户偏好先读文档再实现。"],
+        }
+
+
+def test_daily_journal_rejects_path_escape_and_is_idempotent(tmp_path: Path) -> None:
+    markdown = MarkdownMemoryStore(tmp_path / "memory")
+    content = "用户完成了阶段四。"
+    content_hash = markdown.content_hash(content)
+
+    assert markdown.append_journal(
+        "2026-07-14",
+        content,
+        consolidation_id="con-1",
+        content_hash=content_hash,
+    )
+    assert not markdown.append_journal(
+        "2026-07-14",
+        "重复内容不应写入。",
+        consolidation_id="con-1",
+        content_hash=content_hash,
+    )
+    with pytest.raises(ValueError, match="日期"):
+        markdown.append_journal(
+            "../bad",
+            "越界",
+            consolidation_id="con-2",
+            content_hash=markdown.content_hash("越界"),
+        )
+    assert markdown.read_journal("2026-07-14").count("memopilot:con-1") == 1
 
 
 def _committed_turn(
@@ -108,6 +159,109 @@ async def test_consolidation_window_keeps_recent_messages_and_requires_minimum(
 
 
 @pytest.mark.asyncio
+async def test_consolidation_writes_independent_recent_context_and_daily_journal(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    for index in range(1, 4):
+        _committed_turn(
+            repository,
+            index=index,
+            user=f"问题-{index}",
+            assistant=f"回答-{index}",
+        )
+    recent = _RecentContext()
+    markdown = MarkdownMemoryStore(tmp_path / "memory")
+    service = ConsolidationService(
+        database,
+        markdown,
+        _Extractor(),
+        recent_context=recent,
+        keep_count=2,
+        min_new_messages=4,
+    )
+
+    await service.run("feishu:chat-1")
+
+    assert len(recent.calls) == 1
+    assert markdown.read("RECENT_CONTEXT.md").startswith("# Recent Context")
+    journal = markdown.read_journal("2026-07-14")
+    assert journal.startswith("# 2026-07-14")
+    assert "用户完成了阶段四" in journal
+
+
+@pytest.mark.asyncio
+async def test_below_threshold_refreshes_recent_turns_without_model_call(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    for index in range(1, 3):
+        _committed_turn(
+            repository,
+            index=index,
+            user=f"问题-{index}",
+            assistant=f"回答-{index}",
+        )
+    markdown = MarkdownMemoryStore(tmp_path / "memory")
+    markdown.replace(
+        "RECENT_CONTEXT.md",
+        "# Recent Context\n\n## Compression\n- 旧压缩信息\n\n## Recent Turns\n- 旧消息",
+    )
+    extractor = _Extractor()
+    service = ConsolidationService(
+        database,
+        markdown,
+        extractor,
+        keep_count=4,
+        min_new_messages=5,
+    )
+
+    result = await service.run("feishu:chat-1")
+
+    assert result is None
+    assert extractor.calls == 0
+    recent = markdown.read("RECENT_CONTEXT.md")
+    assert "旧压缩信息" in recent
+    assert "旧消息" not in recent
+    assert "[user] 问题-2" in recent
+    assert "[a-preview] 回答-2" in recent
+    assert "问题-1" not in recent
+
+
+@pytest.mark.asyncio
+async def test_history_entries_are_single_source_for_history_and_journal(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    _committed_turn(repository, index=1, user="问题-1", assistant="回答-1")
+    markdown = MarkdownMemoryStore(tmp_path / "memory")
+    service = ConsolidationService(
+        database,
+        markdown,
+        _HistoryEntryExtractor(),
+        keep_count=0,
+        min_new_messages=1,
+    )
+
+    result = await service.run("feishu:chat-1")
+
+    assert result is not None
+    assert "[2026-07-14 20:30] 用户完成了阶段四验收。" in markdown.read("HISTORY.md")
+    journal = markdown.read_journal("2026-07-14")
+    assert "[2026-07-14 20:30] 用户完成了阶段四验收。" in journal
+    with connect_database(database) as connection:
+        output = json.loads(
+            connection.execute(
+                "SELECT model_output_json FROM consolidation_manifests"
+            ).fetchone()[0]
+        )
+    assert output["history_entries"][0]["emotional_weight"] == 6
+    assert "memories" not in output
+
+
+@pytest.mark.asyncio
 async def test_manifest_resumes_only_missing_artifact_and_publishes_vectorize_once(
     tmp_path: Path,
 ) -> None:
@@ -177,10 +331,17 @@ async def test_manifest_resumes_only_missing_artifact_and_publishes_vectorize_on
         assert (
             connection.execute(
                 "SELECT COUNT(*) FROM outbox_events "
-                "WHERE json_extract(payload_json, '$.kind') = 'memory.vectorize'"
+                "WHERE json_extract(payload_json, '$.kind') = 'memory.vectorize' "
+                "AND event_type = 'agent.job.queued'"
             ).fetchone()[0]
             == 1
         )
+        vector_job_id = str(
+            connection.execute(
+                "SELECT job_id FROM agent_jobs WHERE kind = 'memory.vectorize'"
+            ).fetchone()[0]
+        )
+    assert OperationalRepository(database).get_outbox_for_job(vector_job_id).state == "pending"
 
 
 @pytest.mark.asyncio

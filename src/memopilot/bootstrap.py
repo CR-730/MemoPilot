@@ -23,16 +23,27 @@ from memopilot.memory.consolidation import ConsolidationService
 from memopilot.memory.contracts import EmbeddingProvider
 from memopilot.memory.engine import LayeredMemoryEngine
 from memopilot.memory.markdown import MarkdownMemoryStore
+from memopilot.memory.memorizer import MemoryMemorizer
 from memopilot.memory.optimizer import MemoryOptimizer
+from memopilot.memory.post_response import OperationalPostResponseService, PostResponseMemoryWorker
 from memopilot.memory.providers import (
     ChatConsolidationExtractor,
     ChatHypothesisProvider,
+    ChatImplicitMemoryExtractor,
     ChatOptimizerModel,
+    ChatPostResponseModel,
+    ChatProcedureTagger,
+    ChatRecentContextCompressor,
     OpenAIEmbeddingProvider,
 )
 from memopilot.memory.retrieval import MemoryRetriever, RetrievalStore
+from memopilot.memory.scheduler import MemoryMaintenanceScheduler
 from memopilot.memory.store import MemoryStore
-from memopilot.memory.tools import build_recall_memory_tool
+from memopilot.memory.tools import (
+    build_forget_memory_tool,
+    build_memorize_tool,
+    build_recall_memory_tool,
+)
 from memopilot.memory.vectorization import VectorizationService
 from memopilot.memory.worker import MemoryJobRouter
 from memopilot.persistence.memory_metadata import EmbeddingIdentity, ensure_embedding_identity
@@ -86,6 +97,11 @@ class EffectBundle:
         await self.redis.aclose()
 
 
+@dataclass(slots=True)
+class SchedulerBundle:
+    service: MemoryMaintenanceScheduler
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeBundle:
     repository: OperationalRepository
@@ -117,6 +133,17 @@ def build_app(settings: MemoPilotSettings) -> AppBundle:
         outbox=OutboxDispatcher(repository, queue, owner_id=f"app-{uuid4().hex[:8]}"),
     )
     return AppBundle(service, redis)
+
+
+def build_scheduler(settings: MemoPilotSettings) -> SchedulerBundle:
+    repository = _repository(settings)
+    return SchedulerBundle(
+        MemoryMaintenanceScheduler(
+            repository,
+            enabled=settings.memory_optimizer_enabled,
+            interval=timedelta(seconds=settings.memory_optimizer_interval_seconds),
+        )
+    )
 
 
 def build_worker(settings: MemoPilotSettings) -> WorkerBundle:
@@ -188,6 +215,7 @@ def build_runtime_bundle(
     repository: OperationalRepository | None = None,
 ) -> RuntimeBundle:
     """从类型化配置创建 Worker 使用的 Agent 与分层记忆链路。"""
+    configured_tools = tuple(tools)
     migrate_all_databases(settings)
     operational = repository or OperationalRepository(
         settings.operational_database,
@@ -210,20 +238,46 @@ def build_runtime_bundle(
     )
 
     markdown = MarkdownMemoryStore(settings.memory_dir)
-    store = MemoryStore(settings.memory_database, dimension=settings.embedding_dimension)
+    store = MemoryStore(
+        settings.memory_database,
+        dimension=settings.embedding_dimension,
+        hotness_alpha=settings.memory_hotness_alpha,
+        hotness_half_life_days=settings.memory_hotness_half_life_days,
+    )
     retriever = MemoryRetriever(
         cast(RetrievalStore, store),
         embedding_provider,
         score_threshold=settings.memory_score_threshold,
-        relative_delta=settings.memory_relative_delta,
+        score_thresholds=settings.memory_score_thresholds,
+        embed_timeout_seconds=settings.memory_embed_timeout_seconds,
+        procedure_guard_enabled=settings.memory_procedure_guard_enabled,
         inject_max_chars=settings.memory_inject_max_chars,
+        inject_max_forced=settings.memory_inject_max_forced,
+        inject_max_procedure_preference=settings.memory_inject_max_procedure_preference,
+        inject_max_event_profile=settings.memory_inject_max_event_profile,
     )
     memory_engine = LayeredMemoryEngine(
         retriever,
         hypothesis_provider=ChatHypothesisProvider(provider),
     )
-    registry = ToolRegistry(tools)
+    memorizer = MemoryMemorizer(
+        store,
+        embedding_provider,
+        procedure_tagger=ChatProcedureTagger(
+            provider,
+            allowed_tools={
+                *(tool.name for tool in configured_tools),
+                "recall_memory",
+                "memorize",
+                "forget_memory",
+            },
+            allowed_skills=set(),
+        ),
+    )
+    registry = ToolRegistry(configured_tools)
     registry.register(build_recall_memory_tool(memory_engine))
+    registry.register(build_memorize_tool(memorizer))
+    registry.register(build_forget_memory_tool(store))
     runtime = AgentRuntime(
         provider,
         registry,
@@ -235,7 +289,8 @@ def build_runtime_bundle(
         ConsolidationService(
             settings.operational_database,
             markdown,
-            ChatConsolidationExtractor(provider),
+            ChatConsolidationExtractor(provider, markdown),
+            recent_context=ChatRecentContextCompressor(provider),
             keep_count=settings.memory_consolidation_keep_count,
             min_new_messages=settings.memory_consolidation_min_new_messages,
         ),
@@ -243,9 +298,20 @@ def build_runtime_bundle(
             settings.operational_database,
             store,
             embedding_provider,
+            memorizer=memorizer,
+            implicit_extractor=ChatImplicitMemoryExtractor(provider),
+            display_timezone=settings.display_timezone,
         ),
         MemoryOptimizer(markdown, ChatOptimizerModel(provider)),
         operational,
+        post_response=OperationalPostResponseService(
+            settings.operational_database,
+            PostResponseMemoryWorker(
+                store,
+                retriever,
+                ChatPostResponseModel(provider),
+            ),
+        ),
     )
     executor = RuntimeJobExecutor(
         operational,

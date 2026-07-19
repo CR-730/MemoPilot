@@ -76,6 +76,29 @@ async def test_live_progress_creates_updates_and_freezes_one_process_card() -> N
 
 
 @pytest.mark.asyncio
+async def test_live_progress_never_renders_partial_citation_metadata() -> None:
+    transport = AsyncMock()
+    transport.send_card.return_value = SendReceipt(message_id="om-live")
+    progress = FeishuLiveProgress(
+        transport,
+        chat_id="oc-chat",
+        provider_uuid="live-uuid",
+        min_interval_seconds=0,
+    )
+
+    await progress.on_stream_delta(StreamDelta(thinking_delta="完成推理"))
+    await progress.on_stream_delta(StreamDelta(content_delta="用户可见答案\n§ci"))
+    await progress.on_stream_delta(StreamDelta(content_delta="ted:[mem-1]§"))
+
+    rendered = "\n".join(
+        str(call.args[1]) for call in transport.patch_card.await_args_list
+    )
+    assert "用户可见答案" in rendered
+    assert "§ci" not in rendered
+    assert "mem-1" not in rendered
+
+
+@pytest.mark.asyncio
 async def test_live_progress_disables_preview_after_repeated_failures() -> None:
     transport = AsyncMock()
     transport.send_card.side_effect = RuntimeError("card unavailable")

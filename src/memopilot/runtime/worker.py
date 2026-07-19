@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -108,6 +109,7 @@ class RuntimeJobExecutor:
             return None
         if turn.session_key != claim.session_key:
             raise ValueError("TurnInput 与 RunClaim 的会话不匹配")
+        turn = replace(turn, memory_source_ref=f"run:{claim.run_id}")
         step_sink = OperationalStepSink(
             self._repository,
             run_id=claim.run_id,
@@ -132,6 +134,8 @@ class RuntimeJobExecutor:
                 turn,
                 step_sink=step_sink,
                 progress=progress,
+                memory_assert_current=lambda: self._repository.assert_current_fence(lease),
+                memory_fenced_write=lambda: self._repository.fenced_write(lease),
             )
         except asyncio.CancelledError:
             if self._repository.has_pending_interrupt(claim.run_id):
@@ -212,6 +216,7 @@ class RuntimeJobExecutor:
                     lease=lease,
                     user_content=turn.current_user_content or turn.content,
                     assistant_content=result.reply,
+                    cited_memory_ids=result.cited_memory_ids,
                     now=self._clock(),
                     resume_snapshot_id=turn.resume_snapshot_id,
                     reject_pending_interrupt=not delivery_confirmed,

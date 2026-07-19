@@ -43,6 +43,7 @@ class MemoryOptimizer:
             return False
         original_memory = self.markdown.read("MEMORY.md")
         original_self = self.markdown.read("SELF.md")
+        original_history = self.markdown.read("HISTORY.md")
         try:
             if after_snapshot is not None:
                 await after_snapshot()
@@ -59,9 +60,14 @@ class MemoryOptimizer:
                     self.markdown.begin_optimizer_publish(
                         memory=original_memory,
                         self_text=original_self,
+                        history=original_history,
                     )
                     self.markdown.replace("MEMORY.md", memory)
                     self.markdown.replace("SELF.md", self_text)
+                    self.markdown.append(
+                        "HISTORY.md",
+                        f"[memory_optimizer] PENDING 归档:\n{pending.strip()}",
+                    )
                     self.markdown.mark_optimizer_publish_committed()
                     self.markdown.recover_optimizer_publish()
                 except BaseException:

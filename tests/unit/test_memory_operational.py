@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from memopilot.persistence.migrations import DatabaseKind, migrate_database
+from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
 from memopilot.tasks.operational import InboundCommand, OperationalRepository
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
@@ -61,7 +62,15 @@ def test_successful_turn_atomically_saves_messages_and_enqueues_consolidation(
         "queued",
     )
     assert repository.count("messages") == 2
-    assert repository.count("outbox_events") == 2
+    assert repository.count("outbox_events") == 3
+    with connect_database(repository.database) as connection:
+        post_job = connection.execute(
+            "SELECT kind, state, payload_json FROM agent_jobs "
+            "WHERE kind = 'memory.post_response'"
+        ).fetchone()
+    assert post_job is not None
+    assert (post_job["kind"], post_job["state"]) == ("memory.post_response", "queued")
+    assert json.loads(post_job["payload_json"])["turn_id"] == claim.run_id
     assert [(item.role, item.content) for item in repository.list_recent_messages(
         "feishu:chat-1", limit=10
     )] == [
@@ -90,8 +99,8 @@ def test_successful_turn_commit_is_idempotent(tmp_path: Path) -> None:
 
     assert second == type(second)(first.consolidation_job_id, first.outbox_id, False)
     assert repository.count("messages") == 2
-    assert repository.count("agent_jobs") == 2
-    assert repository.count("outbox_events") == 2
+    assert repository.count("agent_jobs") == 3
+    assert repository.count("outbox_events") == 3
 
 
 def test_failure_before_turn_commit_rolls_back_messages_and_terminal_state(

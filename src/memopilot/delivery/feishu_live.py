@@ -19,6 +19,7 @@ from memopilot.channels.feishu_cards import (
     format_tool_target,
 )
 from memopilot.runtime.contracts import FunctionCall, StreamDelta
+from memopilot.runtime.memory_citations import visible_response_prefix
 from memopilot.runtime.tools import ToolObservation
 
 logger = logging.getLogger(__name__)
@@ -92,7 +93,7 @@ class FeishuLiveProgress:
             self._thinking += delta.thinking_delta
         if self._message_id is None and not self._thinking.strip() and not self._tools:
             return
-        live_length = len(self._reply) + len(self._thinking)
+        live_length = len(visible_response_prefix(self._reply)) + len(self._thinking)
         now = self._monotonic()
         if now < self._next_at and live_length - self._last_length < _LIVE_STREAM_MIN_CHARS:
             return
@@ -160,7 +161,11 @@ class FeishuLiveProgress:
         now = self._monotonic()
         if now < self._backoff_until:
             return
-        card = build_live_card(self._thinking, self._tools, self._reply)
+        card = build_live_card(
+            self._thinking,
+            self._tools,
+            visible_response_prefix(self._reply),
+        )
         async with self._lock:
             if self._disabled:
                 return

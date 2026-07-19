@@ -6,6 +6,7 @@ import json
 from collections.abc import Iterable
 
 from memopilot.runtime.contracts import FunctionCall, StreamDelta
+from memopilot.runtime.memory_citations import visible_response_prefix
 from memopilot.runtime.react import ReActProgressObserver
 from memopilot.runtime.tools import ToolObservation
 from memopilot.tasks.operational import (
@@ -58,7 +59,7 @@ class InterruptProgressRecorder:
     def snapshot(self, *, original_message: str) -> TurnInterruptSnapshot:
         return TurnInterruptSnapshot(
             original_message=original_message,
-            partial_reply=self._reply,
+            partial_reply=visible_response_prefix(self._reply),
             partial_thinking=self._thinking,
             tools_used=tuple(self._tools),
             tool_chain=tuple(dict(item) for item in self._tool_chain),
@@ -100,7 +101,11 @@ def render_resumed_message(
     snapshot: TurnInterruptSnapshotRecord,
     user_message: str,
 ) -> str:
-    middle = snapshot.partial_reply.strip() or snapshot.partial_thinking.strip() or "暂无"
+    middle = (
+        visible_response_prefix(snapshot.partial_reply).strip()
+        or snapshot.partial_thinking.strip()
+        or "暂无"
+    )
     tools = "、".join(snapshot.tools_used) or "无"
     return (
         "[中断任务续接]\n"
