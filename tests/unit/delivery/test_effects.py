@@ -157,7 +157,7 @@ def test_targeted_stop_cancels_passive_effect_before_send(tmp_path: Path) -> Non
     assert transition is EffectTransition.CANCELLED
 
 
-def test_unknown_effect_requires_explicit_reconciliation_and_expires_after_one_hour(
+def test_unknown_effect_requires_explicit_reconciliation_without_retry_expiry(
     tmp_path: Path,
 ) -> None:
     _, effects, lease, claim, activity_version = _claimed(tmp_path)
@@ -187,14 +187,14 @@ def test_unknown_effect_requires_explicit_reconciliation_and_expires_after_one_h
         now=NOW + timedelta(minutes=59),
     )
 
-    expired = effects.begin_reconciliation(
+    late_explicit_retry = effects.begin_reconciliation(
         effect.operation_id,
         lease=lease,
         now=NOW + timedelta(hours=1, seconds=1),
     )
 
-    assert expired is EffectTransition.NEEDS_REVIEW
-    assert effects.get(effect.operation_id).state == "needs_review"  # type: ignore[union-attr]
+    assert late_explicit_retry is EffectTransition.SEND
+    assert effects.get(effect.operation_id).state == "sending"  # type: ignore[union-attr]
 
 
 def test_effects_can_be_listed_for_operator_review(tmp_path: Path) -> None:

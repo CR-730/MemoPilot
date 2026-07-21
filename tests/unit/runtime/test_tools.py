@@ -65,6 +65,16 @@ def test_registry_accepts_async_callable_object() -> None:
     ToolRegistry([_tool(handler=AsyncHandler())])
 
 
+def test_register_many_rolls_back_tools_metadata_and_index_together() -> None:
+    registry = ToolRegistry([_tool("existing")])
+
+    with pytest.raises(ValueError, match="existing"):
+        registry.register_many([_tool("new"), _tool("existing")])
+
+    assert registry.tool_names == ("existing",)
+    assert registry.search("new") == []
+
+
 async def test_tool_timeout_becomes_react_observation() -> None:
     async def never_returns(*, text: str) -> str:
         await asyncio.Event().wait()
@@ -166,3 +176,5 @@ async def test_successful_tool_result_is_serializable_observation() -> None:
     assert observation.ok is True
     assert observation.result == {"echo": "hello"}
     assert '"ok": true' in observation.content
+    assert not hasattr(observation, "side_effect_status")
+    assert not hasattr(_tool(), "side_effect_class")

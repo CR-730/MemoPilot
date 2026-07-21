@@ -109,4 +109,179 @@ def test_skill_prompt_budget_is_deterministic(tmp_path: Path) -> None:
     _write_skill(root, "b", name="b", content="BBBB")
     catalog = SkillCatalog(SkillLoader(workspace_root=root).load().skills)
 
-    assert catalog.render(("b", "a"), max_chars=24) == "# Skill: a\nAAAA\n\n# Skill"
+    rendered = catalog.render(("b", "a"), max_chars=24)
+
+    assert rendered == "# Skill: a\nAAAA"
+    assert "# Skill: b" not in rendered
+
+
+def test_only_dollar_prefixed_skill_names_activate_and_matching_is_case_insensitive(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "review", name="review", content="完整审查流程")
+    _write_skill(root, "a", name="a", content="单字母技能")
+    catalog = SkillCatalog(SkillLoader(workspace_root=root).load().skills)
+
+    assert catalog.render_mentions("普通 review 文本和 a 字母", max_chars=200) == ""
+    assert catalog.render_mentions("请执行 $REVIEW", max_chars=200) == (
+        "# Skill: review\n完整审查流程"
+    )
+
+
+def test_always_and_explicit_skill_are_deduplicated_in_stable_order(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    for name in ("zeta", "alpha"):
+        path = root / name
+        path.mkdir(parents=True)
+        (path / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name}\nalways: true\n---\n{name} 正文\n",
+            encoding="utf-8",
+        )
+    catalog = SkillCatalog(SkillLoader(workspace_root=root).load().skills)
+
+    prompt = catalog.build_turn_prompt("同时显式使用 $ZETA")
+
+    assert [block.name for block in prompt.active] == ["alpha", "zeta"]
+
+
+def test_prototype_frontmatter_defaults_and_dependency_checkers_are_supported(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "skills"
+    path = root / "research"
+    path.mkdir(parents=True)
+    (path / "SKILL.md").write_text(
+        """---
+name: research
+description: 检索资料
+metadata: '{"memopilot":{"always":true,"requires":{"bins":["rg"],"env":["TOKEN"]}}}'
+---
+只引用可核验的资料。
+""",
+        encoding="utf-8",
+    )
+
+    result = SkillLoader(
+        workspace_root=root,
+        binary_checker=lambda name: name == "rg",
+        environment={"TOKEN": "available"},
+    ).load()
+
+    assert result.diagnostics == ()
+    skill = result.skills[0]
+    assert skill.always is True
+    assert skill.background_allowed is False
+    assert skill.required_tools == ()
+    assert skill.required_bins == ("rg",)
+    assert skill.required_env == ("TOKEN",)
+    assert skill.available is True
+
+
+def test_top_level_always_and_skill_metadata_report_missing_dependencies(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "skills"
+    path = root / "writer"
+    path.mkdir(parents=True)
+    (path / "SKILL.md").write_text(
+        """---
+name: writer
+description: 写作辅助
+always: true
+metadata:
+  skill:
+    requires:
+      bins: [pandoc]
+      env: [WRITER_TOKEN]
+---
+先明确读者。
+""",
+        encoding="utf-8",
+    )
+
+    result = SkillLoader(
+        workspace_root=root,
+        binary_checker=lambda _name: False,
+        environment={},
+    ).load()
+
+    skill = result.skills[0]
+    assert skill.always is True
+    assert skill.available is False
+    assert skill.missing_bins == ("pandoc",)
+    assert skill.missing_env == ("WRITER_TOKEN",)
+
+
+def test_turn_prompt_contains_catalog_and_deduplicated_always_and_mentions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "skills"
+    always = root / "always"
+    always.mkdir(parents=True)
+    (always / "SKILL.md").write_text(
+        """---
+name: always
+description: 始终执行
+always: true
+---
+每轮都检查事实。
+""",
+        encoding="utf-8",
+    )
+    mentioned = root / "review"
+    mentioned.mkdir(parents=True)
+    (mentioned / "SKILL.md").write_text(
+        """---
+name: review
+description: 代码审查
+---
+先跑测试，再检查差异。
+""",
+        encoding="utf-8",
+    )
+    unavailable = root / "deploy"
+    unavailable.mkdir(parents=True)
+    (unavailable / "SKILL.md").write_text(
+        """---
+name: deploy
+description: 部署服务
+metadata: '{"skill":{"requires":{"env":["DEPLOY_TOKEN"]}}}'
+---
+执行部署。
+""",
+        encoding="utf-8",
+    )
+    catalog = SkillCatalog(
+        SkillLoader(workspace_root=root, environment={}).load().skills
+    )
+
+    rendered = catalog.render_turn("请用 $review review，并执行 always", max_chars=2000)
+
+    assert "# Skills Catalog" in rendered
+    assert "review | 代码审查 | workspace | available" in rendered
+    assert "deploy | 部署服务 | workspace | unavailable: ENV: DEPLOY_TOKEN" in rendered
+    assert "read_file" not in rendered
+    assert rendered.count("# Skill: always") == 1
+    assert rendered.count("# Skill: review") == 1
+    assert "# Skill: deploy" not in rendered
+
+
+def test_skill_symlink_cannot_escape_discovery_root(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text(
+        "---\nname: escaped\ndescription: 越界\n---\n不能加载。\n",
+        encoding="utf-8",
+    )
+    root.mkdir()
+    try:
+        (root / "escaped").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        return
+
+    result = SkillLoader(workspace_root=root).load()
+
+    assert result.skills == ()
+    assert [item.code for item in result.diagnostics] == ["path_outside_root"]

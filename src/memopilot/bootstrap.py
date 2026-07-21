@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
@@ -20,12 +21,10 @@ from memopilot.delivery.effects import EffectRepository
 from memopilot.delivery.feishu import FinalResponseDispatcher
 from memopilot.delivery.reconciliation import EffectReconciliationService
 from memopilot.extensions.events import EventBus
-from memopilot.extensions.mcp import McpServerClient
-from memopilot.extensions.plugins import (
-    ExtensionRegistry,
-    PluginDiagnostic,
-    PluginRuntime,
-)
+from memopilot.extensions.mcp_manage_tools import register_mcp_management_tools
+from memopilot.extensions.mcp_registry import McpServerRegistry
+from memopilot.extensions.plugin_manager import PluginManager
+from memopilot.extensions.plugins import PluginDiagnostic
 from memopilot.extensions.skills import (
     SkillCatalog,
     SkillDiagnostic,
@@ -55,6 +54,7 @@ from memopilot.persistence.migrations import (
 )
 from memopilot.runtime.engine import AgentRuntime
 from memopilot.runtime.providers import ChatProvider, OpenAICompatibleProvider
+from memopilot.runtime.tool_search import build_tool_search_tool
 from memopilot.runtime.tools import Tool, ToolRegistry
 from memopilot.runtime.worker import RuntimeJobExecutor
 from memopilot.tasks.interrupts import RedisInterruptSignal
@@ -63,6 +63,8 @@ from memopilot.tasks.operational import OperationalRepository
 from memopilot.tasks.outbox import OutboxDispatcher
 from memopilot.tasks.redis_queue import RedisTaskQueue
 from memopilot.worker.service import WorkerService
+
+_BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
 
 
 @dataclass(slots=True)
@@ -81,29 +83,20 @@ class WorkerBundle:
     transport: FeishuChannel
     redis: Redis
     runtime: RuntimeBundle
-    mcp_clients: tuple[McpServerClient, ...] = ()
-    mcp_diagnostics: list[str] = field(default_factory=list)
     _extensions_started: bool = False
+
+    @property
+    def mcp_diagnostics(self) -> list[str]:
+        return list(self.runtime.mcp_registry.diagnostics)
 
     async def start_extensions(self) -> None:
         if self._extensions_started:
             return
         self._extensions_started = True
-        for client in self.mcp_clients:
-            try:
-                self.runtime.tools.register_many(await client.as_tools())
-            except Exception as exc:
-                self.mcp_diagnostics.append(
-                    f"{client.config.server_id}: {type(exc).__name__}: {exc}"
-                )
-                await client.close()
-        self.runtime.skills.refresh_available_tools(
-            frozenset(self.runtime.tools.tool_names)
-        )
+        self.runtime.mcp_registry.start_connect_all_background()
 
     async def close(self) -> None:
-        for client in self.mcp_clients:
-            await client.close()
+        await self.runtime.close_extensions()
         await self.transport.stop()
         await self.redis.aclose()
 
@@ -128,8 +121,21 @@ class RuntimeBundle:
     runtime: AgentRuntime
     executor: RuntimeJobExecutor
     skills: SkillCatalog
+    event_bus: EventBus
+    plugin_manager: PluginManager
+    hook_ids: tuple[str, ...]
+    mcp_registry: McpServerRegistry
     plugin_diagnostics: tuple[PluginDiagnostic, ...]
     skill_diagnostics: tuple[SkillDiagnostic, ...]
+
+    async def close_extensions(self) -> None:
+        """按依赖逆序幂等拆除扩展贡献；半启动状态也可安全调用。"""
+        await self.event_bus.drain()
+        for hook_id in self.hook_ids:
+            self.tools.unregister_hook(hook_id)
+        await self.plugin_manager.unload_all()
+        await self.mcp_registry.shutdown()
+        await self.event_bus.aclose()
 
 
 def build_app(settings: MemoPilotSettings) -> AppBundle:
@@ -155,7 +161,7 @@ def build_app(settings: MemoPilotSettings) -> AppBundle:
     return AppBundle(service, redis)
 
 
-def build_worker(settings: MemoPilotSettings) -> WorkerBundle:
+async def build_worker(settings: MemoPilotSettings) -> WorkerBundle:
     settings.validate_worker_ready()
     repository = _repository(settings)
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -172,12 +178,17 @@ def build_worker(settings: MemoPilotSettings) -> WorkerBundle:
         EffectRepository(repository.database),
         transport,
     )
-    runtime_bundle = build_runtime_bundle(
-        settings,
-        chat_provider=provider,
-        final_response_dispatcher=dispatcher,
-        repository=repository,
-    )
+    try:
+        runtime_bundle = await build_runtime_bundle(
+            settings,
+            chat_provider=provider,
+            final_response_dispatcher=dispatcher,
+            repository=repository,
+        )
+    except BaseException:
+        await transport.stop()
+        await redis.aclose()
+        raise
     service = WorkerService(
         repository,
         queue,
@@ -195,7 +206,6 @@ def build_worker(settings: MemoPilotSettings) -> WorkerBundle:
         transport,
         redis,
         runtime_bundle,
-        tuple(McpServerClient(config) for config in settings.mcp_servers if config.enabled),
     )
 
 
@@ -220,7 +230,7 @@ def build_effects(settings: MemoPilotSettings) -> EffectBundle:
     return EffectBundle(service, transport, redis)
 
 
-def build_runtime_bundle(
+async def build_runtime_bundle(
     settings: MemoPilotSettings,
     *,
     chat_provider: ChatProvider | None = None,
@@ -228,7 +238,6 @@ def build_runtime_bundle(
     tools: Iterable[Tool] = (),
     final_response_dispatcher: FinalResponseDispatcher | None = None,
     repository: OperationalRepository | None = None,
-    extensions: ExtensionRegistry | None = None,
     skills: SkillCatalog | None = None,
 ) -> RuntimeBundle:
     """从类型化配置创建 Worker 使用的 Agent 与分层记忆链路。"""
@@ -266,72 +275,104 @@ def build_runtime_bundle(
         retriever,
         hypothesis_provider=ChatHypothesisProvider(provider),
     )
-    if extensions is None:
-        plugin_result = PluginRuntime().load_directory(settings.plugins_dir)
-        registered_extensions = plugin_result.registry
-        plugin_diagnostics = plugin_result.diagnostics
-    else:
-        registered_extensions = extensions
-        plugin_diagnostics = ()
-    registry = ToolRegistry(
-        (*tools, *registered_extensions.tools),
-        hooks=registered_extensions.tool_hooks,
-    )
-    registry.register(build_recall_memory_tool(memory_engine))
-    if skills is None:
-        skill_result = SkillLoader(
-            workspace_root=settings.skills_dir,
-            available_tools=frozenset(registry.tool_names),
-        ).load()
-        active_skills = SkillCatalog(skill_result.skills)
-        skill_diagnostics = skill_result.diagnostics
-    else:
-        active_skills = skills
-        skill_diagnostics = ()
-    runtime = AgentRuntime(
-        provider,
+    registry = ToolRegistry(tools)
+    registry.register(build_recall_memory_tool(memory_engine), always_on=True)
+    registry.register(build_tool_search_tool(registry), always_on=True)
+    event_bus = EventBus()
+    skill_holder: list[SkillCatalog] = []
+
+    def refresh_skill_availability() -> None:
+        if skill_holder:
+            skill_holder[0].refresh_available_tools(frozenset(registry.tool_names))
+
+    mcp_registry = McpServerRegistry(
+        settings.workspace / "mcp_servers.json",
         registry,
-        max_iterations=settings.llm_max_iterations,
+        on_tools_changed=refresh_skill_availability,
+    )
+    manager = PluginManager(
+        [settings.plugins_dir],
+        event_bus=event_bus,
+        tool_registry=registry,
+        workspace=settings.workspace,
         memory_engine=memory_engine,
-        memory_profile=markdown,
-        modules=registered_extensions.phase_modules,
-        prompt_blocks=registered_extensions.prompt_blocks,
-        event_bus=EventBus(registered_extensions.event_handlers),
-        skills=active_skills,
     )
-    memory_jobs = MemoryJobRouter(
-        ConsolidationService(
-            settings.operational_database,
-            markdown,
-            ChatConsolidationExtractor(provider),
-            keep_count=settings.memory_consolidation_keep_count,
-            min_new_messages=settings.memory_consolidation_min_new_messages,
-        ),
-        VectorizationService(
-            settings.operational_database,
-            store,
-            embedding_provider,
-        ),
-        MemoryOptimizer(markdown, ChatOptimizerModel(provider)),
-        operational,
-    )
-    executor = RuntimeJobExecutor(
-        operational,
-        runtime,
-        final_response_dispatcher=final_response_dispatcher,
-        memory_jobs=memory_jobs,
-    )
-    return RuntimeBundle(
-        repository=operational,
-        tools=registry,
-        memory_engine=memory_engine,
-        memory_jobs=memory_jobs,
-        runtime=runtime,
-        executor=executor,
-        skills=active_skills,
-        plugin_diagnostics=plugin_diagnostics,
-        skill_diagnostics=skill_diagnostics,
-    )
+    hook_ids: tuple[str, ...] = ()
+    try:
+        await mcp_registry.import_configs(settings.mcp_servers)
+        register_mcp_management_tools(registry, mcp_registry)
+        await manager.load_all()
+        registry.register_hooks(manager.tool_hooks)
+        hook_ids = tuple(hook.hook_id for hook in manager.tool_hooks)
+        if skills is None:
+            skill_result = SkillLoader(
+                builtin_root=_BUILTIN_SKILLS_DIR,
+                workspace_root=settings.skills_dir,
+                available_tools=frozenset(registry.tool_names),
+            ).load()
+            active_skills = SkillCatalog(skill_result.skills)
+            skill_diagnostics = skill_result.diagnostics
+        else:
+            active_skills = skills
+            active_skills.refresh_available_tools(frozenset(registry.tool_names))
+            skill_diagnostics = ()
+        skill_holder.append(active_skills)
+        runtime = AgentRuntime(
+            provider,
+            registry,
+            max_iterations=settings.llm_max_iterations,
+            memory_engine=memory_engine,
+            memory_profile=markdown,
+            modules=manager.phase_modules,
+            prompt_blocks=manager.prompt_blocks,
+            event_bus=event_bus,
+            skills=active_skills,
+            tool_search_enabled=settings.tool_search_enabled,
+        )
+        memory_jobs = MemoryJobRouter(
+            ConsolidationService(
+                settings.operational_database,
+                markdown,
+                ChatConsolidationExtractor(provider),
+                keep_count=settings.memory_consolidation_keep_count,
+                min_new_messages=settings.memory_consolidation_min_new_messages,
+            ),
+            VectorizationService(
+                settings.operational_database,
+                store,
+                embedding_provider,
+            ),
+            MemoryOptimizer(markdown, ChatOptimizerModel(provider)),
+            operational,
+        )
+        executor = RuntimeJobExecutor(
+            operational,
+            runtime,
+            final_response_dispatcher=final_response_dispatcher,
+            memory_jobs=memory_jobs,
+        )
+        return RuntimeBundle(
+            repository=operational,
+            tools=registry,
+            memory_engine=memory_engine,
+            memory_jobs=memory_jobs,
+            runtime=runtime,
+            executor=executor,
+            skills=active_skills,
+            event_bus=event_bus,
+            plugin_manager=manager,
+            hook_ids=hook_ids,
+            mcp_registry=mcp_registry,
+            plugin_diagnostics=tuple(manager.diagnostics),
+            skill_diagnostics=skill_diagnostics,
+        )
+    except BaseException:
+        for hook_id in hook_ids:
+            registry.unregister_hook(hook_id)
+        await manager.unload_all()
+        await mcp_registry.shutdown()
+        await event_bus.aclose()
+        raise
 
 
 def _repository(settings: MemoPilotSettings) -> OperationalRepository:

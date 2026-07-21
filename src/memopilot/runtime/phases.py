@@ -28,6 +28,15 @@ class PhaseContext:
     trace: list[tuple[LifecyclePhase, str]] = field(default_factory=list)
 
 
+@dataclass
+class PluginPhaseFrame:
+    """原型式插件 Phase 的独立可变帧。"""
+
+    input: Any
+    slots: dict[str, Any] = field(default_factory=dict)
+    output: Any = None
+
+
 class PhaseModule(Protocol):
     phase: LifecyclePhase
     slot: str
@@ -106,7 +115,7 @@ class PhasePipeline:
     def _compile(self, modules: Sequence[PhaseModule]) -> tuple[PhaseModule, ...]:
         by_slot: dict[str, PhaseModule] = {}
         registration_order: dict[str, int] = {}
-        produced_by: dict[str, str] = {}
+        produced_by: dict[tuple[LifecyclePhase, str], str] = {}
         external_slots = set(self._initial_slots)
         for slots in self._provided_slots.values():
             external_slots.update(slots)
@@ -125,13 +134,14 @@ class PhasePipeline:
                         "slot_collision",
                         (output, module.slot),
                     )
-                previous = produced_by.get(output)
+                output_key = (module.phase, output)
+                previous = produced_by.get(output_key)
                 if previous is not None:
                     raise PhaseDefinitionError(
                         "duplicate_output",
                         (output, previous, module.slot),
                     )
-                produced_by[output] = module.slot
+                produced_by[output_key] = module.slot
 
         compiled: list[PhaseModule] = []
         available = set(self._initial_slots)
@@ -165,7 +175,12 @@ class PhasePipeline:
             ready = [slot for slot, degree in indegree.items() if degree == 0]
             phase_order: list[PhaseModule] = []
             while ready:
-                ready.sort(key=registration_order.__getitem__)
+                ready.sort(
+                    key=lambda slot: (
+                        _is_builtin_slot(slot, phase),
+                        registration_order[slot],
+                    )
+                )
                 slot = ready.pop(0)
                 module = by_slot[slot]
                 phase_order.append(module)
@@ -185,10 +200,15 @@ class PhasePipeline:
         return tuple(compiled)
 
 
+def _is_builtin_slot(slot: str, phase: LifecyclePhase) -> bool:
+    return slot.startswith(f"{phase.value}.")
+
+
 __all__ = [
     "LifecyclePhase",
     "PhaseContext",
     "PhaseDefinitionError",
     "PhaseModule",
     "PhasePipeline",
+    "PluginPhaseFrame",
 ]

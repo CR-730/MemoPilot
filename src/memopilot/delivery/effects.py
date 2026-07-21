@@ -6,7 +6,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
@@ -276,15 +276,6 @@ class EffectRepository:
                 connection.execute("COMMIT")
                 return EffectTransition.CANCELLED
             if record.state != "unknown" or record.first_requested_at is None:
-                connection.execute("COMMIT")
-                return EffectTransition.NEEDS_REVIEW
-            first_requested = datetime.fromisoformat(record.first_requested_at)
-            if now > first_requested + timedelta(hours=1):
-                connection.execute(
-                    "UPDATE outbound_effects SET state = 'needs_review', updated_at = ? "
-                    "WHERE operation_id = ?",
-                    (now_text, operation_id),
-                )
                 connection.execute("COMMIT")
                 return EffectTransition.NEEDS_REVIEW
             activity = connection.execute(

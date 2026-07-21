@@ -43,7 +43,7 @@ async def _run(args: argparse.Namespace) -> None:
             await app_bundle.close()
         return
     if args.command == "worker":
-        worker_bundle = build_worker(settings)
+        worker_bundle = await build_worker(settings)
         try:
             await worker_bundle.start_extensions()
             for diagnostic in worker_bundle.mcp_diagnostics:

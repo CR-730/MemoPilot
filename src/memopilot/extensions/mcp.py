@@ -6,10 +6,12 @@ import asyncio
 import hashlib
 import os
 import re
+from collections.abc import Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, TextIO, cast
 
 from mcp import ClientSession, StdioServerParameters
@@ -27,14 +29,13 @@ class McpServerConfig:
     server_id: str
     command: tuple[str, ...]
     args: tuple[str, ...] = ()
-    env: dict[str, str] = field(default_factory=dict)
+    env: Mapping[str, str] = field(default_factory=dict)
     cwd: Path | None = None
     enabled: bool = True
     startup_timeout_seconds: float = 15.0
     call_timeout_seconds: float = 30.0
     shutdown_timeout_seconds: float = 5.0
     max_restarts: int = 3
-    tool_side_effects: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not _SERVER_ID.fullmatch(self.server_id):
@@ -55,21 +56,21 @@ class McpServerConfig:
             raise ValueError("MCP 启动和调用超时必须大于 0")
         if self.max_restarts < 0:
             raise ValueError("MCP max_restarts 不能小于 0")
-        invalid_effects = set(self.tool_side_effects.values()).difference(
-            {"none", "idempotent", "non_idempotent"}
-        )
-        if invalid_effects:
-            raise ValueError("MCP tool_side_effects 包含无效等级")
+        environment = _validated_environment_references(self.env)
+        object.__setattr__(self, "env", MappingProxyType(environment))
+
+    def environment_references(self) -> dict[str, str]:
+        """返回适合公开展示或持久化的已校验环境变量引用副本。"""
+        return _validated_environment_references(self.env)
 
     def resolved_environment(self) -> dict[str, str] | None:
-        if not self.env:
+        environment = self.environment_references()
+        if not environment:
             return None
         resolved: dict[str, str] = {}
-        for key, value in self.env.items():
+        for key, value in environment.items():
             match = _ENV_REFERENCE.fullmatch(value)
-            if match is None:
-                resolved[key] = value
-                continue
+            assert match is not None
             variable = match.group(1)
             if variable not in os.environ:
                 raise ValueError(f"MCP 环境变量未配置: {variable}")
@@ -81,16 +82,12 @@ class McpServerConfig:
             "server_id": self.server_id,
             "command": list(self.command),
             "args": list(self.args),
-            "env": {
-                key: value if _ENV_REFERENCE.fullmatch(value) else "***"
-                for key, value in sorted(self.env.items())
-            },
+            "env": dict(sorted(self.environment_references().items())),
             "cwd": str(self.cwd) if self.cwd is not None else None,
             "enabled": self.enabled,
             "startup_timeout_seconds": self.startup_timeout_seconds,
             "call_timeout_seconds": self.call_timeout_seconds,
             "shutdown_timeout_seconds": self.shutdown_timeout_seconds,
-            "tool_side_effects": dict(sorted(self.tool_side_effects.items())),
         }
 
 
@@ -113,7 +110,6 @@ class McpInvocationError(RuntimeError):
     def __init__(self, error_type: str, message: str, *, retryable: bool = True) -> None:
         self.error_type = error_type
         self.retryable = retryable
-        self.side_effect_status = "unknown"
         super().__init__(message)
 
 
@@ -148,6 +144,7 @@ class McpServerClient:
         if self._runner is None:
             loop = asyncio.get_running_loop()
             self._ready = loop.create_future()
+            self._ready.add_done_callback(_consume_future_exception)
             self._runner = asyncio.create_task(
                 self._run(),
                 name=f"mcp-{self.config.server_id}",
@@ -191,20 +188,29 @@ class McpServerClient:
         if self._closed:
             return
         self._closed = True
+        error = McpInvocationError(
+            "mcp_shutdown",
+            f"MCP Server 正在关闭: {self.config.server_id}",
+        )
+        self._settle_ready(error)
+        self._settle_active(error)
+        self._fail_pending(error)
         if self._runner is None:
             self._errlog.close()
             return
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[Any] = loop.create_future()
-        await self._queue.put(_Request("close", future))
+        runner = self._runner
+        runner.cancel()
         try:
             await asyncio.wait_for(
-                asyncio.shield(self._runner),
+                asyncio.shield(runner),
                 timeout=self.config.shutdown_timeout_seconds,
             )
-        except TimeoutError:
-            self._runner.cancel()
-            await asyncio.gather(self._runner, return_exceptions=True)
+        except (TimeoutError, asyncio.CancelledError):
+            runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        try:
+            self._settle_active(error)
+            self._fail_pending(error)
         finally:
             self._runner = None
             self._errlog.close()
@@ -230,10 +236,6 @@ class McpServerClient:
             handler=invoke,
             timeout_seconds=self.config.call_timeout_seconds + 1,
             source=f"mcp:{self.config.server_id}/{remote.name}",
-            side_effect_class=self.config.tool_side_effects.get(
-                remote.name,
-                "non_idempotent",
-            ),
         )
 
     async def _request(
@@ -244,8 +246,16 @@ class McpServerClient:
         arguments: dict[str, Any] | None = None,
     ) -> Any:
         await self.start()
+        if self._closed:
+            raise McpInvocationError(
+                "mcp_shutdown",
+                f"MCP Server 正在关闭: {self.config.server_id}",
+            )
+        if self._terminal_error is not None:
+            raise self._terminal_error
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
+        future.add_done_callback(_consume_future_exception)
         await self._queue.put(_Request(operation, future, name, arguments))
         try:
             return await asyncio.shield(future)
@@ -306,6 +316,8 @@ class McpServerClient:
                             if not request.future.done():
                                 request.future.set_exception(_map_error(exc))
                             self._active_request = None
+                            if self._exhausted(restarts, _map_error(exc)):
+                                return
                             reconnect = True
                             break
             except asyncio.CancelledError:
@@ -313,33 +325,64 @@ class McpServerClient:
                     "mcp_shutdown",
                     f"MCP Server 正在关闭: {self.config.server_id}",
                 )
-                if self._active_request is not None and not self._active_request.future.done():
-                    self._active_request.future.set_exception(error)
-                self._active_request = None
+                self._settle_ready(error)
+                self._settle_active(error)
                 self._fail_pending(error)
                 raise
             except Exception as exc:
                 mapped = _map_error(exc, startup=True)
-                if self._ready is not None and not self._ready.done():
-                    self._ready.set_exception(mapped)
+                if self._exhausted(restarts, mapped):
                     return
                 reconnect = True
             if reconnect:
                 restarts += 1
-                if restarts > self.config.max_restarts:
-                    self._terminal_error = McpInvocationError(
-                        "mcp_unavailable",
-                        f"MCP Server 重启次数超限: {self.config.server_id}",
-                    )
-                    self._fail_pending(self._terminal_error)
-                    return
                 await asyncio.sleep(min(0.05 * (2 ** (restarts - 1)), 0.5))
+
+    def _exhausted(self, restarts: int, cause: McpInvocationError) -> bool:
+        if restarts < self.config.max_restarts:
+            return False
+        error = McpInvocationError(
+            "mcp_unavailable",
+            f"MCP Server 重启次数超限: {self.config.server_id}; last_error={cause}",
+        )
+        self._terminal_error = error
+        self._settle_ready(error)
+        self._settle_active(error)
+        self._fail_pending(error)
+        return True
+
+    def _settle_ready(self, error: Exception) -> None:
+        if self._ready is not None and not self._ready.done():
+            self._ready.set_exception(error)
+
+    def _settle_active(self, error: Exception) -> None:
+        if self._active_request is not None and not self._active_request.future.done():
+            self._active_request.future.set_exception(error)
+        self._active_request = None
 
     def _fail_pending(self, error: Exception) -> None:
         while not self._queue.empty():
             request = self._queue.get_nowait()
             if not request.future.done():
                 request.future.set_exception(error)
+
+
+def _consume_future_exception(future: asyncio.Future[Any]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+def _validated_environment_references(environment: Mapping[str, str]) -> dict[str, str]:
+    try:
+        copied = dict(environment)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("MCP env 必须是字符串映射") from exc
+    for key, value in copied.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("MCP env 必须是字符串映射")
+        if _ENV_REFERENCE.fullmatch(value) is None:
+            raise ValueError("MCP 所有 env 值必须使用 ${ENV_NAME} 引用")
+    return copied
 
 
 def _map_error(exc: Exception, *, startup: bool = False) -> McpInvocationError:

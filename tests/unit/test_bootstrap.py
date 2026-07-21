@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
+
+import pytest
 
 from memopilot.app.service import AppService
 from memopilot.bootstrap import build_app, build_effects, build_runtime_bundle, build_worker
 from memopilot.config import MemoPilotSettings
-from memopilot.extensions.hooks import ToolHook, ToolHookDecision
+from memopilot.extensions.events import EventBus
 from memopilot.extensions.mcp import McpServerConfig
-from memopilot.extensions.plugins import ExtensionRegistry
 from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse, ToolSchema
-from memopilot.runtime.tools import Tool
+from memopilot.runtime.engine import TurnInput
+from memopilot.runtime.tools import ToolRegistry
 from memopilot.worker.service import WorkerService
 
 FAKE_MCP_SERVER = Path(__file__).parents[1] / "fixtures" / "fake_mcp_server.py"
@@ -27,13 +30,74 @@ class _ChatProvider:
         return ModelResponse(content="完成")
 
 
+class _CapturingChatProvider(_ChatProvider):
+    def __init__(self) -> None:
+        self.messages: list[tuple[ChatMessage, ...]] = []
+
+    async def complete(
+        self,
+        *,
+        messages: tuple[ChatMessage, ...],
+        tools: tuple[ToolSchema, ...],
+    ) -> ModelResponse:
+        del tools
+        self.messages.append(messages)
+        return ModelResponse(content="完成")
+
+
 class _Embedder:
     async def embed(self, text: str) -> list[float]:
         del text
         return [1.0, 0.0]
 
 
-def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(tmp_path: Path) -> None:
+async def test_runtime_bundle_rolls_back_extensions_when_executor_construction_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = tmp_path / "plugins" / "rollback"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.py").write_text(
+        '''
+from memopilot.extensions.decorators import on_before_turn, tool
+from memopilot.extensions.plugin_base import Plugin
+
+class RollbackPlugin(Plugin):
+    name = "rollback"
+
+    @tool("rollback_tool")
+    async def rollback_tool(self, event):
+        return "never"
+
+    @on_before_turn()
+    async def before_turn(self, event):
+        return event
+
+    async def terminate(self):
+        (self.context.workspace / "terminated.txt").write_text("yes", encoding="utf-8")
+''',
+        encoding="utf-8",
+    )
+    registries: list[ToolRegistry] = []
+    buses: list[EventBus] = []
+
+    class CapturingRegistry(ToolRegistry):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            registries.append(self)
+
+    class CapturingBus(EventBus):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            buses.append(self)
+
+    def fail_executor(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("executor failed")
+
+    monkeypatch.setattr("memopilot.bootstrap.ToolRegistry", CapturingRegistry)
+    monkeypatch.setattr("memopilot.bootstrap.EventBus", CapturingBus)
+    monkeypatch.setattr("memopilot.bootstrap.RuntimeJobExecutor", fail_executor)
     settings = MemoPilotSettings(
         workspace=tmp_path,
         embedding_base_url="https://embedding.example/v1",
@@ -42,7 +106,31 @@ def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(tmp_path: P
         _env_file=None,
     )
 
-    bundle = build_runtime_bundle(
+    with pytest.raises(RuntimeError, match="executor failed"):
+        await build_runtime_bundle(
+            settings,
+            chat_provider=_ChatProvider(),  # type: ignore[arg-type]
+            embedder=_Embedder(),  # type: ignore[arg-type]
+        )
+
+    assert (tmp_path / "terminated.txt").read_text(encoding="utf-8") == "yes"
+    assert "rollback_tool" not in registries[-1].tool_names
+    assert len(buses[-1]._handlers) == 1
+    assert buses[-1]._closed is True
+
+
+async def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(
+    tmp_path: Path,
+) -> None:
+    settings = MemoPilotSettings(
+        workspace=tmp_path,
+        embedding_base_url="https://embedding.example/v1",
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        _env_file=None,
+    )
+
+    bundle = await build_runtime_bundle(
         settings,
         chat_provider=_ChatProvider(),  # type: ignore[arg-type]
         embedder=_Embedder(),  # type: ignore[arg-type]
@@ -55,30 +143,29 @@ def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(tmp_path: P
     assert bundle.memory_jobs.repository is bundle.repository
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
+    await bundle.close_extensions()
 
 
 async def test_runtime_bundle_wires_plugin_tools_and_hooks(tmp_path: Path) -> None:
-    async def echo(value: str) -> str:
+    plugin = tmp_path / "plugins" / "rewrite"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.py").write_text(
+        '''
+from memopilot.extensions.decorators import on_tool_pre, tool
+from memopilot.extensions.plugin_base import Plugin
+
+class Rewrite(Plugin):
+    name = "rewrite"
+
+    @tool(name="plugin_echo")
+    async def echo(self, event, value: str):
         return value
 
-    async def rewrite(tool_name: str, arguments: dict[str, object]) -> ToolHookDecision:
-        del tool_name, arguments
-        return ToolHookDecision(arguments={"value": "rewritten"})
-
-    extensions = ExtensionRegistry(
-        tools=(
-            Tool(
-                "plugin_echo",
-                "echo",
-                {
-                    "type": "object",
-                    "properties": {"value": {"type": "string"}},
-                    "required": ["value"],
-                },
-                echo,
-            ),
-        ),
-        tool_hooks=(ToolHook("rewrite", before=rewrite),),
+    @on_tool_pre(tool_name="plugin_echo")
+    async def rewrite(self, event):
+        return {"value": "rewritten"}
+''',
+        encoding="utf-8",
     )
     settings = MemoPilotSettings(
         workspace=tmp_path,
@@ -88,43 +175,50 @@ async def test_runtime_bundle_wires_plugin_tools_and_hooks(tmp_path: Path) -> No
         _env_file=None,
     )
 
-    bundle = build_runtime_bundle(
+    bundle = await build_runtime_bundle(
         settings,
         chat_provider=_ChatProvider(),  # type: ignore[arg-type]
         embedder=_Embedder(),  # type: ignore[arg-type]
-        extensions=extensions,
     )
 
     observation = await bundle.tools.execute(
         FunctionCall("call-1", "plugin_echo", {"value": "original"})
     )
     assert observation.result == "rewritten"
+    await bundle.close_extensions()
+    await bundle.close_extensions()
+    assert "plugin_echo" not in bundle.tools.tool_names
+    with pytest.raises(RuntimeError, match="关闭"):
+        bundle.event_bus.enqueue("before_turn", {})
 
 
-def test_runtime_bundle_discovers_workspace_plugin_and_skill(tmp_path: Path) -> None:
+async def test_runtime_bundle_discovers_workspace_plugin_and_skill(tmp_path: Path) -> None:
     plugin = tmp_path / "plugins" / "demo"
     plugin.mkdir(parents=True)
-    (plugin / "manifest.yaml").write_text(
-        """
-plugin_id: demo
-version: 1.0.0
-api_version: 1
-entrypoint: plugin.py:register
-requires: []
-capabilities: [tools]
-""",
-        encoding="utf-8",
-    )
     (plugin / "plugin.py").write_text(
-        """
-from memopilot.runtime.tools import Tool
-async def search(query):
-    return query
-def register(context):
-    context.register_tool(Tool("search", "search", {"type": "object"}, search))
-""",
+        '''
+from memopilot.extensions.decorators import tool
+from memopilot.extensions.plugin_base import Plugin
+from memopilot.extensions.prompts import PromptBlock
+
+class Demo(Plugin):
+    name = "demo"
+
+    async def initialize(self):
+        self.context.kv_store.increment("starts")
+
+    def prompt_render_modules(self):
+        return [PromptBlock("demo.identity", "启动即生效的插件提示", priority=10)]
+
+    @tool(name="search")
+    async def search(self, event, query: str):
+        return query
+''',
         encoding="utf-8",
     )
+    broken = tmp_path / "plugins" / "broken"
+    broken.mkdir()
+    (broken / "plugin.py").write_text("raise RuntimeError('broken')\n", encoding="utf-8")
     skill = tmp_path / "skills" / "research"
     skill.mkdir(parents=True)
     (skill / "SKILL.md").write_text(
@@ -146,16 +240,25 @@ required_tools: [search]
         _env_file=None,
     )
 
-    bundle = build_runtime_bundle(
+    provider = _CapturingChatProvider()
+    bundle = await build_runtime_bundle(
         settings,
-        chat_provider=_ChatProvider(),  # type: ignore[arg-type]
+        chat_provider=provider,  # type: ignore[arg-type]
         embedder=_Embedder(),  # type: ignore[arg-type]
     )
 
     assert "search" in bundle.tools.tool_names
     assert [skill.name for skill in bundle.skills.background_candidates()] == ["research"]
-    assert bundle.plugin_diagnostics == ()
+    assert [(item.plugin_id, item.code) for item in bundle.plugin_diagnostics] == [
+        ("broken", "import_failed")
+    ]
     assert bundle.skill_diagnostics == ()
+    assert bundle.plugin_manager.get_plugin("demo").context.kv_store.get("starts") == 1
+
+    await bundle.runtime.run(TurnInput("feishu:user", "你好", system_prompt="核心"))
+    assert "启动即生效的插件提示" in (provider.messages[0][0].content or "")
+    assert "# Skill: tool-failure-recovery" in (provider.messages[0][0].content or "")
+    await bundle.close_extensions()
 
 
 async def test_builds_separate_app_and_worker_without_starting_scheduler(
@@ -174,7 +277,7 @@ async def test_builds_separate_app_and_worker_without_starting_scheduler(
     )
 
     app = build_app(settings)
-    worker = build_worker(settings)
+    worker = await build_worker(settings)
 
     assert isinstance(app.service, AppService)
     assert isinstance(worker.service, WorkerService)
@@ -240,10 +343,15 @@ required_tools: [mcp_fake__echo]
         ),
         _env_file=None,
     )
-    worker = build_worker(settings)
+    worker = await build_worker(settings)
     try:
         assert worker.runtime.skills.background_candidates() == ()
         await worker.start_extensions()
+        await worker.start_extensions()
+        for _ in range(100):
+            if "mcp_fake__echo" in worker.runtime.tools.tool_names:
+                break
+            await asyncio.sleep(0.02)
         assert "mcp_fake__echo" in worker.runtime.tools.tool_names
         assert [
             skill.name for skill in worker.runtime.skills.background_candidates()

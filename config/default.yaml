@@ -19,4 +19,5 @@ llm_max_iterations: 10
 llm_max_output_tokens: 2048
 llm_timeout_seconds: 60
 llm_thinking_enabled: false
+tool_search_enabled: true
 display_timezone: Asia/Shanghai

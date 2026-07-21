@@ -28,6 +28,7 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
     assert settings.llm_max_output_tokens == 2048
     assert settings.llm_timeout_seconds == 60
     assert settings.llm_thinking_enabled is False
+    assert settings.tool_search_enabled is True
     assert settings.memory_short_term_message_limit == 12
     assert settings.memory_consolidation_keep_count == 12
     assert settings.memory_consolidation_min_new_messages == 5
@@ -144,6 +145,8 @@ enable_thinking = true
 [agent]
 max_tokens = 4096
 max_iterations = 12
+[agent.tools]
+search_enabled = true
 [memory.embedding]
 model = "text-embedding-v3"
 api_key = "${EMBEDDING_API_KEY}"
@@ -167,6 +170,7 @@ channel_name = "feishu_work"
     assert settings.llm_thinking_enabled is True
     assert settings.llm_max_output_tokens == 4096
     assert settings.llm_max_iterations == 12
+    assert settings.tool_search_enabled is True
     assert settings.embedding_model == "text-embedding-v3"
     assert settings.embedding_api_key.get_secret_value() == "embedding-secret"
     assert settings.embedding_base_url == "https://embedding.example/v1"

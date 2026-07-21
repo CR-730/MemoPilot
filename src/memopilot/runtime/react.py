@@ -7,8 +7,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from memopilot.extensions.events import EventBus
+from memopilot.extensions.hooks import ToolExecutionRequest
 from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse, StreamDelta
 from memopilot.runtime.providers import ChatProvider
+from memopilot.runtime.tool_search import ToolDiscoveryState, ToolSearchTool
 from memopilot.runtime.tools import ToolObservation, ToolRegistry
 
 _SUMMARY_PROMPT = """[运行时收尾]
@@ -34,6 +37,20 @@ class ReActResult:
     tool_chain: tuple[ToolCallRecord, ...]
     exit_reason: str
     infrastructure_error: str | None = None
+    thinking: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BeforeStepControl:
+    extra_hints: tuple[str, ...] = ()
+    early_stop: bool = False
+    early_stop_reply: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AfterStepControl:
+    early_stop: bool = False
+    early_stop_reason: str = ""
 
 
 class ReActObserver(Protocol):
@@ -41,14 +58,14 @@ class ReActObserver(Protocol):
         self,
         iteration: int,
         messages: Sequence[ChatMessage],
-    ) -> None: ...
+    ) -> BeforeStepControl | None: ...
 
     async def after_step(
         self,
         iteration: int,
         response: ModelResponse,
         tool_records: Sequence[ToolCallRecord],
-    ) -> None: ...
+    ) -> AfterStepControl | None: ...
 
 
 class ReActProgressObserver(Protocol):
@@ -75,6 +92,12 @@ class ReActEngine:
         *,
         max_iterations: int = 10,
         observer: ReActObserver | None = None,
+        event_bus: EventBus | None = None,
+        session_key: str = "",
+        source: str = "passive",
+        request_text: str = "",
+        tool_search_enabled: bool = False,
+        preloaded_tools: Sequence[str] = (),
     ) -> None:
         if max_iterations <= 0:
             raise ValueError("max_iterations 必须大于 0")
@@ -82,6 +105,12 @@ class ReActEngine:
         self._tools = tools
         self._max_iterations = max_iterations
         self._observer = observer
+        self._event_bus = event_bus
+        self._session_key = session_key
+        self._source = source
+        self._request_text = request_text
+        self._tool_search_enabled = tool_search_enabled
+        self._preloaded_tools = tuple(preloaded_tools)
 
     async def run(
         self,
@@ -91,13 +120,44 @@ class ReActEngine:
     ) -> ReActResult:
         working = list(messages)
         records: list[ToolCallRecord] = []
-        schemas = self._tools.schemas()
+        if self._tool_search_enabled:
+            always_on = self._tools.get_always_on_names()
+            visible_order = self._tools.get_registered_order(always_on)
+            visible_order.extend(
+                name
+                for name in self._preloaded_tools
+                if self._tools.has_tool(name) and name not in always_on
+            )
+        else:
+            visible_order = list(self._tools.tool_names)
+        visible_tools = set(visible_order)
         safe_progress = _BestEffortProgress(progress) if progress is not None else None
 
         for iteration in range(1, self._max_iterations + 1):
+            sync_visible = getattr(self._observer, "set_visible_tool_names", None)
+            if callable(sync_visible):
+                sync_visible(frozenset(visible_tools))
+            control: BeforeStepControl | None = None
             if self._observer is not None:
-                await self._observer.before_step(iteration, working)
+                control = await self._observer.before_step(iteration, working)
+            if control is not None and control.extra_hints:
+                working.append(
+                    ChatMessage.system(
+                        "运行时补充提示：\n" + "\n".join(control.extra_hints)
+                    )
+                )
+            if control is not None and control.early_stop:
+                reply = control.early_stop_reply.strip() or "当前推理已安全停止。"
+                working.append(ChatMessage.assistant(content=reply))
+                return ReActResult(
+                    reply=reply,
+                    messages=tuple(working),
+                    iterations=iteration,
+                    tool_chain=tuple(records),
+                    exit_reason="early_stop",
+                )
             try:
+                schemas = self._tools.schemas(visible_order)
                 response = await self._complete(
                     messages=working,
                     tools=schemas,
@@ -128,6 +188,7 @@ class ReActEngine:
                         iterations=iteration,
                         tool_chain=tuple(records),
                         exit_reason="completed",
+                        thinking=response.thinking,
                     )
                 return await self._finalize(
                     working,
@@ -142,9 +203,28 @@ class ReActEngine:
                 records=records,
                 iteration=iteration,
                 progress=safe_progress,
+                visible_tools=visible_tools,
+                visible_order=visible_order,
             )
+            after_control: AfterStepControl | None = None
             if self._observer is not None:
-                await self._observer.after_step(iteration, response, step_records)
+                after_control = await self._observer.after_step(
+                    iteration, response, step_records
+                )
+            if after_control is not None and after_control.early_stop:
+                reason = after_control.early_stop_reason.strip() or "after_step"
+                reply = (response.content or "").strip()
+                if not reply:
+                    reply = f"已完成当前工具调用；因 {reason} 停止继续推理。"
+                working.append(ChatMessage.assistant(content=reply))
+                return ReActResult(
+                    reply=reply,
+                    messages=tuple(working),
+                    iterations=iteration,
+                    tool_chain=tuple(records),
+                    exit_reason=reason,
+                    thinking=response.thinking,
+                )
 
         return await self._finalize(
             working,
@@ -161,12 +241,82 @@ class ReActEngine:
         records: list[ToolCallRecord],
         iteration: int,
         progress: ReActProgressObserver | None,
+        visible_tools: set[str],
+        visible_order: list[str],
     ) -> tuple[ToolCallRecord, ...]:
         step_records: list[ToolCallRecord] = []
-        for call in response.tool_calls:
+        channel, _, chat_id = self._session_key.partition(":")
+        tool_batch = tuple(
+            {
+                "call_id": item.id,
+                "tool_name": item.name,
+                "arguments": dict(item.arguments),
+            }
+            for item in response.tool_calls
+        )
+        for batch_index, call in enumerate(response.tool_calls):
             if progress is not None:
                 await progress.on_tool_call_started(iteration, call)
-            observation = await self._tools.execute(call)
+            if self._event_bus is not None:
+                await self._event_bus.fanout(
+                    "before_tool_call",
+                    {
+                        "session_key": self._session_key,
+                        "channel": channel,
+                        "chat_id": chat_id,
+                        "source": self._source,
+                        "request_text": self._request_text,
+                        "iteration": iteration,
+                        "call_id": call.id,
+                        "tool_name": call.name,
+                        "arguments": dict(call.arguments),
+                        "status": "started",
+                    },
+                )
+            hidden_tool = (
+                self._tool_search_enabled
+                and self._tools.has_tool(call.name)
+                and call.name not in visible_tools
+            )
+            if call.name == "tool_search":
+                search_tool = self._tools.get_tool("tool_search")
+                owner = (
+                    getattr(search_tool.handler, "__self__", None)
+                    if search_tool is not None
+                    else None
+                )
+                if isinstance(owner, ToolSearchTool):
+                    owner.set_excluded_names(set(visible_tools))
+            blocked_reason = None
+            if hidden_tool:
+                blocked_reason = (
+                    f"工具 {call.name} 尚未加载；请先调用 "
+                    f'tool_search(query="select:{call.name}")。'
+                )
+            observation = await self._tools.execute(
+                call,
+                request=ToolExecutionRequest(
+                    call_id=call.id,
+                    tool_name=call.name,
+                    arguments=dict(call.arguments),
+                    source=self._source,
+                    session_key=self._session_key,
+                    channel=channel,
+                    chat_id=chat_id,
+                    request_text=self._request_text,
+                    tool_batch=tool_batch,
+                    tool_batch_index=batch_index,
+                ),
+                blocked_reason=blocked_reason,
+            )
+            if call.name == "tool_search" and observation.ok:
+                unlocked = ToolDiscoveryState().unlock_names_from_result(
+                    str(observation.result)
+                )
+                for name in unlocked:
+                    if self._tools.has_tool(name) and name not in visible_tools:
+                        visible_tools.add(name)
+                        visible_order.append(name)
             record = ToolCallRecord(
                 iteration=iteration,
                 call=call,
@@ -174,6 +324,27 @@ class ReActEngine:
             )
             records.append(record)
             step_records.append(record)
+            if self._event_bus is not None:
+                await self._event_bus.fanout(
+                    "after_tool_result",
+                    {
+                        "session_key": self._session_key,
+                        "channel": channel,
+                        "chat_id": chat_id,
+                        "source": self._source,
+                        "request_text": self._request_text,
+                        "iteration": iteration,
+                        "call_id": call.id,
+                        "tool_name": call.name,
+                        "arguments": dict(
+                            observation.final_arguments or call.arguments
+                        ),
+                        "status": observation.status,
+                        "result": observation.result,
+                        "error_type": observation.error_type,
+                        "error_message": observation.error_message,
+                    },
+                )
             working.append(
                 ChatMessage.tool(
                     call_id=call.id,
@@ -224,9 +395,27 @@ class ReActEngine:
     ) -> ReActResult:
         working.append(ChatMessage.system(_SUMMARY_PROMPT))
         infrastructure_error: str | None = None
+        final_thinking: str | None = None
         final_iteration = iterations + 1
+        control: BeforeStepControl | None = None
         if self._observer is not None:
-            await self._observer.before_step(final_iteration, working)
+            control = await self._observer.before_step(final_iteration, working)
+        if control is not None and control.extra_hints:
+            working.append(
+                ChatMessage.system(
+                    "运行时补充提示：\n" + "\n".join(control.extra_hints)
+                )
+            )
+        if control is not None and control.early_stop:
+            reply = control.early_stop_reply.strip() or "当前推理已安全停止。"
+            working.append(ChatMessage.assistant(content=reply))
+            return ReActResult(
+                reply=reply,
+                messages=tuple(working),
+                iterations=iterations,
+                tool_chain=tuple(records),
+                exit_reason="early_stop",
+            )
         try:
             response = await self._provider.complete(messages=working, tools=())
             reply = (response.content or "").strip()
@@ -243,6 +432,7 @@ class ReActEngine:
             if self._observer is not None:
                 await self._observer.after_step(final_iteration, failure, ())
         else:
+            final_thinking = response.thinking
             if self._observer is not None:
                 await self._observer.after_step(final_iteration, response, ())
         if not reply:
@@ -254,6 +444,7 @@ class ReActEngine:
             iterations=iterations,
             tool_chain=tuple(records),
             exit_reason="provider_error" if infrastructure_error else exit_reason,
+            thinking=final_thinking,
             infrastructure_error=infrastructure_error,
         )
 
@@ -331,6 +522,8 @@ class _BestEffortProgress:
 
 
 __all__ = [
+    "AfterStepControl",
+    "BeforeStepControl",
     "ReActEngine",
     "ReActObserver",
     "ReActProgressObserver",

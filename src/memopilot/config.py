@@ -81,6 +81,7 @@ class MemoPilotSettings(BaseSettings):
     llm_max_output_tokens: int = Field(default=2048, gt=0)
     llm_timeout_seconds: float = Field(default=60, gt=0)
     llm_thinking_enabled: bool = False
+    tool_search_enabled: bool = True
     memory_short_term_message_limit: int = Field(default=12, gt=0)
     memory_consolidation_keep_count: int = Field(default=12, ge=0)
     memory_consolidation_min_new_messages: int = Field(default=5, gt=0)
@@ -234,6 +235,7 @@ def load_settings(
     llm = _as_dict(data.get("llm"))
     main = _as_dict(llm.get("main"))
     agent = _as_dict(data.get("agent"))
+    agent_tools = _as_dict(agent.get("tools"))
     memory = _as_dict(data.get("memory"))
     embedding = _as_dict(memory.get("embedding"))
     channels = _as_dict(data.get("channels"))
@@ -246,6 +248,7 @@ def load_settings(
         "llm_thinking_enabled": bool(main.get("enable_thinking", False)),
         "llm_max_output_tokens": int(agent.get("max_tokens", 2048)),
         "llm_max_iterations": int(agent.get("max_iterations", 10)),
+        "tool_search_enabled": bool(agent_tools.get("search_enabled", True)),
         "feishu_enabled": bool(feishu.get("enabled", True)),
         "feishu_allow_from": feishu.get("allow_from", feishu.get("allowFrom", ())),
         "feishu_channel_name": feishu.get("channel_name", "feishu"),
@@ -339,10 +342,6 @@ def _parse_mcp_servers(value: Any, *, workspace: Path) -> tuple[McpServerConfig,
                 call_timeout_seconds=float(raw.get("call_timeout_s", 30)),
                 shutdown_timeout_seconds=float(raw.get("shutdown_timeout_s", 5)),
                 max_restarts=int(raw.get("max_restarts", 3)),
-                tool_side_effects={
-                    str(key): str(item)
-                    for key, item in _as_dict(raw.get("tool_side_effects")).items()
-                },
             )
         )
     return tuple(servers)
