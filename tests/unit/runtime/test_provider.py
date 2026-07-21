@@ -81,6 +81,38 @@ async def test_provider_sends_tools_and_parses_function_calls() -> None:
     assert completions.calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
 
 
+async def test_task_completion_overrides_token_budget_and_thinking_mode() -> None:
+    response = SimpleNamespace(
+        id="chat-memory",
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content='{"profile":[]}', tool_calls=None),
+            )
+        ],
+        usage=None,
+    )
+    client, completions = _client(response)
+    provider = OpenAICompatibleProvider(
+        client=client,
+        model="deepseek-chat",
+        max_output_tokens=2048,
+        extra_body={"thinking": {"type": "enabled"}},
+        preserve_reasoning_content=True,
+    )
+
+    await provider.complete_task(
+        messages=(ChatMessage.user("提取记忆"),),
+        tools=(),
+        max_output_tokens=600,
+        thinking_enabled=False,
+    )
+
+    assert completions.calls[0]["max_tokens"] == 600
+    assert completions.calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_content" not in completions.calls[0]["messages"][0]
+
+
 async def test_provider_serializes_assistant_and_tool_messages() -> None:
     response = SimpleNamespace(
         id="chat-2",

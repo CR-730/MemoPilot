@@ -67,7 +67,7 @@ flowchart LR
 当前对话
    │
    ├── 短期消息窗口 ──────────────── 当前 Turn 的直接上下文
-   ├── Markdown 长期记忆 ─────────── MEMORY / SELF / HISTORY / PENDING
+   ├── Markdown 长期记忆 ─────────── MEMORY / SELF / HISTORY / PENDING / RECENT_CONTEXT / JOURNAL
    └── SQLite 向量记忆 ───────────── event / profile / preference / procedure
                                          │
                               Vector + Keyword + RRF

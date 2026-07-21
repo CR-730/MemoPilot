@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from memopilot.bootstrap import build_app, build_effects, build_worker
+from memopilot.bootstrap import build_app, build_effects, build_scheduler, build_worker
 from memopilot.config import load_settings
 from memopilot.delivery.effects import EffectRecord
 from memopilot.delivery.reconciliation import EffectReconciliationService
@@ -52,6 +52,11 @@ async def _run(args: argparse.Namespace) -> None:
             await worker_bundle.service.run_forever()
         finally:
             await worker_bundle.close()
+        return
+    if args.command == "scheduler":
+        scheduler_bundle = build_scheduler(settings)
+        logger.info("MemoPilot Scheduler 已启动：周期性维护任务生产")
+        await scheduler_bundle.service.run_forever()
         return
     effect_bundle = build_effects(settings)
     try:
@@ -104,7 +109,7 @@ def _effect_dict(effect: EffectRecord | Any) -> dict[str, Any]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="memopilot")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("app", "worker"):
+    for name in ("app", "worker", "scheduler"):
         command = subparsers.add_parser(name)
         _add_config_arguments(command)
     effects = subparsers.add_parser("effects")

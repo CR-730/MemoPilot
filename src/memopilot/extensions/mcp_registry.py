@@ -309,6 +309,7 @@ class McpServerRegistry:
                     call_timeout_seconds=float(raw.get("call_timeout_seconds", 30)),
                     shutdown_timeout_seconds=float(raw.get("shutdown_timeout_seconds", 5)),
                     max_restarts=int(raw.get("max_restarts", 3)),
+                    model_result_max_chars=int(raw.get("model_result_max_chars", 12_000)),
                 )
             except (TypeError, ValueError) as exc:
                 diagnostics.append(f"MCP Server {name!r} 配置无效: {exc}")
@@ -350,6 +351,7 @@ def _config_to_storage(config: McpServerConfig) -> dict[str, object]:
         "call_timeout_seconds": config.call_timeout_seconds,
         "shutdown_timeout_seconds": config.shutdown_timeout_seconds,
         "max_restarts": config.max_restarts,
+        "model_result_max_chars": config.model_result_max_chars,
     }
 
 

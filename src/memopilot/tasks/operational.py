@@ -315,6 +315,183 @@ class OperationalRepository:
         finally:
             connection.close()
 
+    def enqueue_memory_optimizer(
+        self,
+        *,
+        bucket: int,
+        now: datetime,
+    ) -> EnqueueResult:
+        """为全局记忆优化创建一个时间桶唯一的 P3 Job + Outbox。"""
+        if bucket < 0:
+            raise ValueError("optimizer bucket 不能为负数")
+        session_key = "system:memory"
+        now_text = _utc_iso(now)
+        job_id = _stable_id("job", f"memory-optimize:{bucket}")
+        outbox_id = _stable_id("outbox", job_id)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = connection.execute(
+                "SELECT job_id FROM agent_jobs WHERE idempotency_key = ?",
+                (f"memory-optimize:{bucket}",),
+            ).fetchone()
+            if existing is not None:
+                connection.execute("COMMIT")
+                return EnqueueResult(str(existing["job_id"]), outbox_id, 0, False)
+            connection.execute(
+                "INSERT OR IGNORE INTO sessions("
+                "session_key, channel, chat_id, created_at, updated_at) "
+                "VALUES (?, 'system', 'memory', ?, ?)",
+                (session_key, now_text, now_text),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO session_activity(session_key, activity_version, updated_at) "
+                "VALUES (?, 0, ?)",
+                (session_key, now_text),
+            )
+            self._insert_queued_job_with_outbox(
+                connection,
+                job_id=job_id,
+                kind="memory.optimize",
+                priority=3,
+                session_key=session_key,
+                idempotency_key=f"memory-optimize:{bucket}",
+                activity_version=0,
+                payload={"bucket": bucket},
+                now_text=now_text,
+            )
+            connection.execute("COMMIT")
+            return EnqueueResult(job_id, outbox_id, 0, True)
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def requeue_failed_memory_jobs(
+        self,
+        *,
+        now: datetime,
+        max_retries: int = 2,
+    ) -> tuple[str, ...]:
+        """为可幂等恢复的失败记忆任务创建有上限、可审计的新 Job。"""
+        if max_retries < 0:
+            raise ValueError("memory max_retries 不能为负数")
+        now_text = _utc_iso(now)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        created: list[str] = []
+        try:
+            rows = connection.execute(
+                "SELECT job_id, kind, session_key, priority, state, activity_version, "
+                "payload_json FROM agent_jobs "
+                "WHERE kind IN ('memory.consolidate', 'memory.vectorize') "
+                "ORDER BY created_at, job_id"
+            ).fetchall()
+            latest: dict[str, tuple[int, sqlite3.Row, dict[str, object]]] = {}
+            for row in rows:
+                raw = json.loads(str(row["payload_json"]) or "{}")
+                payload = raw if isinstance(raw, dict) else {}
+                root = str(payload.get("_retry_root_job_id") or row["job_id"])
+                retry_count = int(payload.get("_retry_count") or 0)
+                previous = latest.get(root)
+                if previous is None or retry_count > previous[0]:
+                    latest[root] = (retry_count, row, payload)
+            for root, (retry_count, row, payload) in latest.items():
+                if str(row["state"]) != "failed" or retry_count >= max_retries:
+                    continue
+                next_retry = retry_count + 1
+                kind = str(row["kind"])
+                job_id = _stable_id("job", f"{root}:retry:{next_retry}")
+                retry_payload = dict(payload)
+                retry_payload.update(
+                    {
+                        "_retry_count": next_retry,
+                        "_retry_root_job_id": root,
+                        "job_id": job_id,
+                    }
+                )
+                self._insert_queued_job_with_outbox(
+                    connection,
+                    job_id=job_id,
+                    kind=kind,
+                    priority=int(row["priority"]),
+                    session_key=str(row["session_key"]),
+                    idempotency_key=f"retry-memory:{root}:{next_retry}",
+                    activity_version=int(row["activity_version"]),
+                    payload=retry_payload,
+                    now_text=now_text,
+                )
+                created.append(job_id)
+            connection.execute("COMMIT")
+            return tuple(created)
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _insert_queued_job_with_outbox(
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        kind: str,
+        priority: int,
+        session_key: str,
+        idempotency_key: str,
+        activity_version: int,
+        payload: Mapping[str, object],
+        now_text: str,
+    ) -> None:
+        """在调用方现有事务中同时写入 queued Job 和待发布 Outbox。"""
+        outbox_id = _stable_id("outbox", job_id)
+        connection.execute(
+            """
+            INSERT INTO agent_jobs(
+                job_id, kind, priority, session_key, idempotency_key, state,
+                activity_version, payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                kind,
+                priority,
+                session_key,
+                idempotency_key,
+                activity_version,
+                _json(payload),
+                now_text,
+                now_text,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO outbox_events(
+                outbox_id, event_type, aggregate_id, payload_json,
+                idempotency_key, state, next_attempt_at, created_at, updated_at
+            ) VALUES (?, 'agent.job.queued', ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                outbox_id,
+                job_id,
+                _json(
+                    {
+                        "activity_version": activity_version,
+                        "job_id": job_id,
+                        "kind": kind,
+                        "priority": priority,
+                        "session_key": session_key,
+                    }
+                ),
+                f"publish-job:{job_id}",
+                now_text,
+                now_text,
+                now_text,
+            ),
+        )
     def get_job(self, job_id: str) -> JobRecord | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -1498,6 +1675,7 @@ class OperationalRepository:
         user_content: str,
         assistant_content: str,
         now: datetime,
+        cited_memory_ids: tuple[str, ...] = (),
         resume_snapshot_id: str | None = None,
         reject_pending_interrupt: bool = False,
         acknowledge_pending_interrupt: bool = False,
@@ -1511,6 +1689,11 @@ class OperationalRepository:
         now_text = _utc_iso(now)
         consolidation_job_id = _stable_id("job", f"consolidate:{run_id}")
         outbox_id = _stable_id("outbox", consolidation_job_id)
+        post_response_job_id = _stable_id("job", f"post-response:{run_id}")
+        reinforce_job_id = _stable_id("job", f"memory-reinforce:{run_id}")
+        clean_cited_ids = tuple(
+            dict.fromkeys(value.strip() for value in cited_memory_ids if value.strip())
+        )
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -1630,54 +1813,71 @@ class OperationalRepository:
                     ),
                 )
 
-            payload_json = _json(
-                {
+            self._insert_queued_job_with_outbox(
+                connection,
+                job_id=consolidation_job_id,
+                kind="memory.consolidate",
+                priority=3,
+                session_key=lease.session_key,
+                idempotency_key=f"consolidate:{run_id}",
+                activity_version=int(run["activity_version"]),
+                payload={
                     "trigger_run_id": run_id,
                     "last_message_id": messages[-1][0],
-                }
+                },
+                now_text=now_text,
             )
-            connection.execute(
-                """
-                INSERT INTO agent_jobs(
-                    job_id, kind, priority, session_key, idempotency_key, state,
-                    activity_version, payload_json, created_at, updated_at
-                ) VALUES (?, 'memory.consolidate', 3, ?, ?, 'queued', ?, ?, ?, ?)
-                """,
-                (
-                    consolidation_job_id,
-                    lease.session_key,
-                    f"consolidate:{run_id}",
-                    int(run["activity_version"]),
-                    payload_json,
-                    now_text,
-                    now_text,
-                ),
+            self._insert_queued_job_with_outbox(
+                connection,
+                job_id=post_response_job_id,
+                kind="memory.post_response",
+                priority=3,
+                session_key=lease.session_key,
+                idempotency_key=f"post-response:{run_id}",
+                activity_version=int(run["activity_version"]),
+                payload={"turn_id": run_id},
+                now_text=now_text,
             )
-            connection.execute(
-                """
-                INSERT INTO outbox_events(
-                    outbox_id, event_type, aggregate_id, payload_json,
-                    idempotency_key, state, next_attempt_at, created_at, updated_at
-                ) VALUES (?, 'agent.job.queued', ?, ?, ?, 'pending', ?, ?, ?)
-                """,
-                (
-                    outbox_id,
-                    consolidation_job_id,
-                    _json(
-                        {
-                            "activity_version": int(run["activity_version"]),
-                            "job_id": consolidation_job_id,
-                            "kind": "memory.consolidate",
-                            "priority": 3,
-                            "session_key": lease.session_key,
-                        }
+            if clean_cited_ids:
+                step_index_row = connection.execute(
+                    "SELECT COALESCE(MAX(step_index), -1) + 1 FROM steps WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                assert step_index_row is not None
+                step_index = int(step_index_row[0])
+                connection.execute(
+                    """
+                    INSERT INTO steps(
+                        step_id, run_id, step_index, phase, step_type, state,
+                        observation_json, owner_id, fencing_epoch, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'after_reasoning', 'memory_citation', 'succeeded',
+                              ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _stable_id("step", f"{run_id}:{step_index}"),
+                        run_id,
+                        step_index,
+                        _json({"cited_memory_ids": list(clean_cited_ids)}),
+                        lease.owner_id,
+                        lease.epoch,
+                        now_text,
+                        now_text,
                     ),
-                    f"publish-job:{consolidation_job_id}",
-                    now_text,
-                    now_text,
-                    now_text,
-                ),
-            )
+                )
+                self._insert_queued_job_with_outbox(
+                    connection,
+                    job_id=reinforce_job_id,
+                    kind="memory.reinforce",
+                    priority=3,
+                    session_key=lease.session_key,
+                    idempotency_key=f"memory-reinforce:{run_id}",
+                    activity_version=int(run["activity_version"]),
+                    payload={
+                        "usage_ref": f"run:{run_id}",
+                        "item_ids": list(clean_cited_ids),
+                    },
+                    now_text=now_text,
+                )
             connection.execute(
                 """
                 UPDATE runs

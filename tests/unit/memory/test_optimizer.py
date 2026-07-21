@@ -37,6 +37,10 @@ async def test_optimizer_snapshot_preserves_new_appends_and_commits(tmp_path: Pa
 
     assert result is True
     assert "已合并旧事实" in markdown.read("MEMORY.md")
+    history = markdown.read("HISTORY.md")
+    assert "[memory_optimizer] PENDING 归档" in history
+    assert "- 旧事实" in history
+    assert "- 新事实" not in history
     assert markdown.read("PENDING.md").strip() == "- 新事实"
     assert not markdown.snapshot_path.exists()
 

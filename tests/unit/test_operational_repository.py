@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -245,6 +246,45 @@ def test_confirmed_reply_commits_turn_and_acknowledges_late_interrupt(
         ("user", "你好"),
         ("assistant", "你好呀"),
     ]
+
+
+def test_commit_persists_cited_ids_and_enqueues_idempotent_reinforcement(tmp_path: Path) -> None:
+    repository = make_repository(tmp_path)
+    accepted = repository.accept_inbound(make_command())
+    epoch = repository.allocate_fence("feishu:chat-1", owner_id="worker-a", now=NOW)
+    lease = SessionLease(
+        session_key="feishu:chat-1",
+        owner_id="worker-a",
+        epoch=epoch,
+        redis_key="lease",
+        redis_value=f"worker-a|epoch|{epoch}",
+    )
+    claim = repository.claim_job(accepted.job_id, lease=lease, now=NOW)
+    assert claim is not None
+
+    repository.commit_successful_turn(
+        claim.run_id,
+        lease=lease,
+        user_content="我喜欢什么？",
+        assistant_content="你喜欢中文回答。",
+        cited_memory_ids=("m1", "m2", "m1"),
+        now=NOW,
+    )
+
+    with connect_database(repository.database) as connection:
+        citation = connection.execute(
+            "SELECT observation_json FROM steps "
+            "WHERE run_id = ? AND step_type = 'memory_citation'",
+            (claim.run_id,),
+        ).fetchone()
+        job = connection.execute(
+            "SELECT kind, payload_json FROM agent_jobs "
+            "WHERE kind = 'memory.reinforce'",
+        ).fetchone()
+    assert citation is not None
+    assert json.loads(citation["observation_json"])["cited_memory_ids"] == ["m1", "m2"]
+    assert job is not None and job["kind"] == "memory.reinforce"
+    assert json.loads(job["payload_json"])["item_ids"] == ["m1", "m2"]
 
 
 def test_unsent_reply_rejects_late_interrupt_without_partial_memory_commit(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -149,6 +150,47 @@ async def test_official_stdio_client_lists_calls_and_maps_tools(
         )
         assert observation.ok is True
         assert observation.result["structured"] == {"text": "hello"}
+    finally:
+        await client.close()
+
+
+async def test_model_facing_result_respects_configured_character_budget() -> None:
+    client = McpServerClient(_config(model_result_max_chars=320))
+    try:
+        registry = ToolRegistry(await client.as_tools())
+        observation = await registry.execute(
+            FunctionCall("c1", "mcp_fake__echo", {"text": "x" * 2_000})
+        )
+
+        serialized = json.dumps(observation.result, ensure_ascii=False)
+        assert observation.ok is True
+        assert len(serialized) <= 320
+        assert "truncated" in serialized
+        assert "x" * 500 not in serialized
+    finally:
+        await client.close()
+
+
+async def test_model_facing_result_omits_binary_payload_data() -> None:
+    client = McpServerClient(_config(model_result_max_chars=320))
+    try:
+        registry = ToolRegistry(await client.as_tools())
+        observation = await registry.execute(
+            FunctionCall("c1", "mcp_fake__image_payload", {})
+        )
+
+        serialized = json.dumps(observation.result, ensure_ascii=False)
+        assert observation.ok is True
+        assert len(serialized) <= 320
+        assert "sensitive-base64-payload" not in serialized
+        assert observation.result["content"] == [
+            {
+                "type": "image",
+                "mimeType": "image/png",
+                "encoded_chars": 2_400,
+                "omitted": True,
+            }
+        ]
     finally:
         await client.close()
 

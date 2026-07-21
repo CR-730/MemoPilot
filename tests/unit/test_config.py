@@ -33,6 +33,19 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
     assert settings.memory_consolidation_keep_count == 12
     assert settings.memory_consolidation_min_new_messages == 5
     assert settings.memory_score_threshold == 0.45
+    assert settings.memory_hotness_alpha == 0.2
+    assert settings.memory_hotness_half_life_days == 14
+    assert settings.memory_embed_timeout_seconds == 5
+    assert settings.memory_score_thresholds == {
+        "procedure": 0.58,
+        "preference": 0.52,
+        "event": 0.45,
+        "profile": 0.5,
+    }
+    assert settings.memory_procedure_guard_enabled is True
+    assert settings.memory_inject_max_forced == 3
+    assert settings.memory_inject_max_procedure_preference == 4
+    assert settings.memory_inject_max_event_profile == 2
 
 
 def test_environment_overrides_dotenv_and_yaml(
@@ -267,3 +280,19 @@ call_timeout_s = 4
     assert server.args == ("server.py",)
     assert server.startup_timeout_seconds == 3
     assert server.call_timeout_seconds == 4
+
+
+def test_toml_loader_does_not_shadow_env_for_omitted_memory_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEMOPILOT_MEMORY_OPTIMIZER_ENABLED", "false")
+    monkeypatch.setenv("MEMOPILOT_MEMORY_OPTIMIZER_INTERVAL_SECONDS", "3600")
+    config = tmp_path / "config.toml"
+    config.write_text("[llm.main]\nmodel = 'deepseek-chat'\n", encoding="utf-8")
+
+    settings = load_settings(config, workspace=tmp_path / "workspace")
+
+    assert settings.memory_optimizer_enabled is False
+    assert settings.memory_optimizer_interval_seconds == 3600

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 from collections.abc import Mapping
@@ -36,6 +37,7 @@ class McpServerConfig:
     call_timeout_seconds: float = 30.0
     shutdown_timeout_seconds: float = 5.0
     max_restarts: int = 3
+    model_result_max_chars: int = 12_000
 
     def __post_init__(self) -> None:
         if not _SERVER_ID.fullmatch(self.server_id):
@@ -56,6 +58,8 @@ class McpServerConfig:
             raise ValueError("MCP 启动和调用超时必须大于 0")
         if self.max_restarts < 0:
             raise ValueError("MCP max_restarts 不能小于 0")
+        if self.model_result_max_chars < 128:
+            raise ValueError("MCP model_result_max_chars 不能小于 128")
         environment = _validated_environment_references(self.env)
         object.__setattr__(self, "env", MappingProxyType(environment))
 
@@ -88,6 +92,7 @@ class McpServerConfig:
             "startup_timeout_seconds": self.startup_timeout_seconds,
             "call_timeout_seconds": self.call_timeout_seconds,
             "shutdown_timeout_seconds": self.shutdown_timeout_seconds,
+            "model_result_max_chars": self.model_result_max_chars,
         }
 
 
@@ -224,10 +229,10 @@ class McpServerClient:
                     result.error_message or "MCP Tool 执行失败",
                     retryable=False,
                 )
-            return {
-                "content": result.content,
-                "structured": result.structured,
-            }
+            return _model_safe_result(
+                result,
+                max_chars=self.config.model_result_max_chars,
+            )
 
         return Tool(
             name=_tool_alias(self.config.server_id, remote.name),
@@ -406,6 +411,45 @@ def _tool_alias(server_id: str, remote_name: str) -> str:
         return safe
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
     return f"{safe[:55]}_{digest}"
+
+
+def _model_safe_result(result: McpCallResult, *, max_chars: int) -> dict[str, Any]:
+    content = [_model_safe_content(item) for item in result.content]
+    payload: dict[str, Any] = {
+        "content": content,
+        "structured": result.structured,
+    }
+    serialized = json.dumps(payload, ensure_ascii=False)
+    if len(serialized) <= max_chars:
+        return payload
+
+    bounded: dict[str, Any] = {
+        "content": [],
+        "structured": None,
+        "truncated": True,
+        "preview": "",
+    }
+    overhead = len(json.dumps(bounded, ensure_ascii=False))
+    bounded["preview"] = serialized[: max(0, max_chars - overhead)]
+    while len(json.dumps(bounded, ensure_ascii=False)) > max_chars:
+        bounded["preview"] = bounded["preview"][:-1]
+    return bounded
+
+
+def _model_safe_content(item: dict[str, Any]) -> dict[str, Any]:
+    if item.get("type") == "text":
+        return {"type": "text", "text": str(item.get("text", ""))}
+
+    summary: dict[str, Any] = {"type": str(item.get("type", "unknown"))}
+    for key in ("mimeType", "name", "uri"):
+        value = item.get(key)
+        if isinstance(value, str):
+            summary[key] = value
+    data = item.get("data")
+    if isinstance(data, str):
+        summary["encoded_chars"] = len(data)
+    summary["omitted"] = True
+    return summary
 
 
 __all__ = [

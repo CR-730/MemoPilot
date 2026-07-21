@@ -7,7 +7,9 @@ import json
 import os
 from pathlib import Path
 
-_ALLOWED_FILES = frozenset({"MEMORY.md", "SELF.md", "HISTORY.md", "PENDING.md", "CONTEXT.md"})
+_ALLOWED_FILES = frozenset(
+    {"MEMORY.md", "SELF.md", "HISTORY.md", "PENDING.md", "RECENT_CONTEXT.md"}
+)
 
 
 class MarkdownMemoryStore:
@@ -49,10 +51,59 @@ class MarkdownMemoryStore:
         if self.contains_artifact(name, consolidation_id, content_hash):
             return
         marker = self._marker(consolidation_id, content_hash)
+        if name == "RECENT_CONTEXT.md":
+            lines = content.strip().splitlines()
+            rendered = (
+                f"{lines[0]}\n{marker}\n" + "\n".join(lines[1:])
+                if lines
+                else marker
+            )
+            self.replace(name, rendered)
+            return
+        if name.startswith("journal/"):
+            self.append_journal(
+                Path(name).stem,
+                content,
+                consolidation_id=consolidation_id,
+                content_hash=content_hash,
+            )
+            return
         self.append(name, f"{marker}\n{content.strip()}")
 
     def contains_artifact(self, name: str, consolidation_id: str, content_hash: str) -> bool:
-        return self._marker(consolidation_id, content_hash) in self.read(name)
+        if name.startswith("journal/"):
+            content = self.read_journal(Path(name).stem)
+        else:
+            content = self.read(name)
+        return self._marker(consolidation_id, content_hash) in content
+
+    @property
+    def journal_dir(self) -> Path:
+        path = self.root / "journal"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def read_journal(self, date: str) -> str:
+        path = self._journal_path(date)
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def append_journal(
+        self,
+        date: str,
+        content: str,
+        *,
+        consolidation_id: str,
+        content_hash: str,
+    ) -> bool:
+        path = self._journal_path(date)
+        marker = self._marker(consolidation_id, content_hash)
+        current = path.read_text(encoding="utf-8") if path.exists() else f"# {date}\n"
+        if marker in current:
+            return False
+        value = content.strip()
+        merged = current.rstrip() + f"\n\n{marker}\n{value}\n"
+        self._atomic_replace(path, merged)
+        return True
 
     def begin_pending_snapshot(self) -> str:
         if self.snapshot_path.exists():
@@ -78,7 +129,13 @@ class MarkdownMemoryStore:
         self.snapshot_path.unlink(missing_ok=True)
         return True
 
-    def begin_optimizer_publish(self, *, memory: str, self_text: str) -> None:
+    def begin_optimizer_publish(
+        self,
+        *,
+        memory: str,
+        self_text: str,
+        history: str | None = None,
+    ) -> None:
         if self.optimizer_publish_path.exists():
             raise RuntimeError("Optimizer 发布清单已存在，必须先恢复")
         payload = {
@@ -86,6 +143,8 @@ class MarkdownMemoryStore:
             "memory": memory,
             "self_text": self_text,
         }
+        if history is not None:
+            payload["history"] = history
         self._atomic_replace(
             self.optimizer_publish_path,
             json.dumps(payload, ensure_ascii=False, sort_keys=True),
@@ -107,6 +166,8 @@ class MarkdownMemoryStore:
         if state == "writing":
             self.replace("MEMORY.md", str(payload.get("memory") or ""))
             self.replace("SELF.md", str(payload.get("self_text") or ""))
+            if "history" in payload:
+                self.replace("HISTORY.md", str(payload.get("history") or ""))
             self.rollback_pending_snapshot()
         elif state == "committed":
             self.commit_pending_snapshot()
@@ -125,6 +186,17 @@ class MarkdownMemoryStore:
         if name not in _ALLOWED_FILES:
             raise ValueError(f"不支持的记忆文件: {name}")
         return self.root / name
+
+    def _journal_path(self, date: str) -> Path:
+        try:
+            from datetime import date as date_type
+
+            parsed = date_type.fromisoformat(date)
+        except ValueError:
+            raise ValueError(f"无效的日记日期: {date}") from None
+        if parsed.isoformat() != date:
+            raise ValueError(f"无效的日记日期: {date}")
+        return self.journal_dir / f"{date}.md"
 
     @staticmethod
     def content_hash(content: str) -> str:

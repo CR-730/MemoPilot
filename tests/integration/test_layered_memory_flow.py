@@ -72,6 +72,17 @@ class _NeverRuntime:
         raise AssertionError("记忆 Job 不应进入 Agent Runtime")
 
 
+class _PostResponse:
+    async def run(
+        self,
+        *,
+        turn_id: str,
+        session_key: str,
+        **kwargs: Any,
+    ) -> tuple[str, ...]:
+        return ()
+
+
 @pytest.mark.asyncio
 async def test_turn_to_async_archive_vector_and_next_turn_recall(
     tmp_path: Path,
@@ -119,6 +130,7 @@ async def test_turn_to_async_archive_vector_and_next_turn_recall(
         VectorizationService(operational, store, embedder),
         MemoryOptimizer(markdown, _OptimizerModel()),
         repository,
+        post_response=_PostResponse(),  # type: ignore[arg-type]
     )
     queue = RedisTaskQueue(memory_redis)
     await queue.ensure_consumer_groups()
@@ -140,6 +152,8 @@ async def test_turn_to_async_archive_vector_and_next_turn_recall(
     # 原 Agent Job 的旧 Outbox 会先被清理，随后真正异步执行 Consolidation。
     assert await dispatcher.dispatch_one(now=NOW) is True
     assert await dispatcher.dispatch_one(now=NOW) is True
+    assert await dispatcher.dispatch_one(now=NOW) is True
+    assert await worker.run_once() is True
     assert await worker.run_once() is True
     assert await worker.run_once() is True
     # Consolidation 提交后才产生 vectorize Outbox。

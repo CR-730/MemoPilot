@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Protocol, cast
 from uuid import NAMESPACE_URL, uuid5
@@ -19,6 +20,17 @@ from memopilot.tasks.operational import FenceToken, OperationalRepository
 
 class ConsolidationExtractor(Protocol):
     async def extract(self, conversation: str) -> dict[str, object]: ...
+
+
+class RecentContextCompressor(Protocol):
+    async def compress(
+        self,
+        *,
+        old_context: str,
+        conversation: str,
+        recent_turns: str,
+        compression_until: str,
+    ) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +48,7 @@ class ConsolidationService:
         markdown: MarkdownMemoryStore,
         extractor: ConsolidationExtractor,
         *,
+        recent_context: RecentContextCompressor | None = None,
         keep_count: int = 12,
         min_new_messages: int = 5,
         failpoint: Callable[[str], None] | None = None,
@@ -43,6 +56,7 @@ class ConsolidationService:
         self.database = database
         self.markdown = markdown
         self.extractor = extractor
+        self.recent_context = recent_context
         self.keep_count = max(0, keep_count)
         self.min_new_messages = max(1, min_new_messages)
         self.failpoint = failpoint
@@ -61,8 +75,19 @@ class ConsolidationService:
         if manifest is None:
             window = self._select_window(session_key)
             if window is None:
+                self._refresh_recent_turns(session_key)
                 return None
             output = await self.extractor.extract(_format_conversation(window))
+            if self.recent_context is not None:
+                output = dict(output)
+                artifacts = _validated_artifacts(output.get("artifacts"))
+                artifacts["RECENT_CONTEXT.md"] = await self.recent_context.compress(
+                    old_context=self.markdown.read("RECENT_CONTEXT.md"),
+                    conversation=_format_conversation(window),
+                    recent_turns=self._recent_turns(session_key),
+                    compression_until=str(window[-1]["created_at"]),
+                )
+                output["artifacts"] = artifacts
             guard()
             manifest = self._create_manifest(session_key, window, output)
         result = self._write_and_commit(
@@ -101,13 +126,51 @@ class ConsolidationService:
             ).fetchone()
         return cast(sqlite3.Row | None, row)
 
+    def _recent_turns(self, session_key: str) -> str:
+        recent_count = max(1, self.keep_count // 2)
+        with connect_database(self.database) as connection:
+            rows = connection.execute(
+                "SELECT role, content FROM messages WHERE session_key = ? "
+                "ORDER BY session_position DESC LIMIT ?",
+                (session_key, recent_count),
+            ).fetchall()
+        lines: list[str] = []
+        for row in reversed(rows):
+            role = str(row["role"])
+            content = str(row["content"]).strip()
+            if role == "user" and content:
+                lines.append(f"[user] {content}")
+            elif role == "assistant" and content:
+                lines.append(f"[a-preview] {content[:60]}")
+        return "\n".join(lines)
+
+    def _refresh_recent_turns(self, session_key: str) -> None:
+        current = self.markdown.read("RECENT_CONTEXT.md")
+        self.markdown.replace(
+            "RECENT_CONTEXT.md",
+            _replace_recent_turns_block(current, self._recent_turns(session_key)),
+        )
+
     def _create_manifest(
         self,
         session_key: str,
         window: list[sqlite3.Row],
         output: dict[str, object],
     ) -> sqlite3.Row:
+        history_entries = _normalize_history_entries(output.get("history_entries"))
+        pending_items = _format_pending_items(output.get("pending_items"))
         artifacts = _validated_artifacts(output.get("artifacts"))
+        if history_entries:
+            artifacts["HISTORY.md"] = "\n".join(
+                str(entry["summary"]) for entry in history_entries
+            )
+        if pending_items:
+            artifacts["PENDING.md"] = pending_items
+        artifacts.update(
+            _journal_artifacts_from_history_entries(
+                [str(entry["summary"]) for entry in history_entries]
+            )
+        )
         first = window[0]
         last = window[-1]
         consolidation_id = str(
@@ -119,6 +182,11 @@ class ConsolidationService:
         hashes = {name: self.markdown.content_hash(content) for name, content in artifacts.items()}
         states = {name: "pending" for name in artifacts}
         persisted_output = dict(output)
+        persisted_output["_conversation"] = _format_conversation(window)
+        if history_entries:
+            persisted_output["history_entries"] = history_entries
+        if pending_items:
+            persisted_output["pending_items"] = pending_items.splitlines()
         persisted_output["artifacts"] = artifacts
         persisted_output["_window"] = {
             "first_position": int(first["session_position"]),
@@ -272,7 +340,7 @@ class ConsolidationService:
             connection.execute(
                 "INSERT OR IGNORE INTO outbox_events("
                 "outbox_id, event_type, aggregate_id, payload_json, idempotency_key, state, "
-                "next_attempt_at, created_at, updated_at) VALUES (?, 'job.ready', ?, ?, ?, "
+                "next_attempt_at, created_at, updated_at) VALUES (?, 'agent.job.queued', ?, ?, ?, "
                 "'pending', ?, ?, ?)",
                 (
                     outbox_id,
@@ -312,12 +380,86 @@ def _format_conversation(rows: list[sqlite3.Row]) -> str:
 def _validated_artifacts(value: object) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
-    allowed = {"HISTORY.md", "PENDING.md", "CONTEXT.md"}
+    allowed = {"HISTORY.md", "PENDING.md", "RECENT_CONTEXT.md"}
     result = {str(name): str(content).strip() for name, content in value.items() if content}
-    unsupported = set(result) - allowed
+    unsupported = {
+        name
+        for name in result
+        if name not in allowed and not re.fullmatch(r"journal/\d{4}-\d{2}-\d{2}\.md", name)
+    }
     if unsupported:
         raise ValueError(f"Consolidation 返回了不支持的文件: {sorted(unsupported)}")
+    for name in result:
+        if name.startswith("journal/"):
+            try:
+                date.fromisoformat(Path(name).stem)
+            except ValueError:
+                raise ValueError(f"Consolidation journal 日期无效: {name}") from None
     return result
+
+
+def _journal_artifacts_from_history_entries(entries: list[str]) -> dict[str, str]:
+    by_date: dict[str, list[str]] = {}
+    for entry in entries:
+        match = re.match(r"^\[(\d{4}-\d{2}-\d{2})(?:\s+\d{2}:\d{2})?]", entry)
+        if match is None:
+            continue
+        try:
+            day = date.fromisoformat(match.group(1)).isoformat()
+        except ValueError:
+            raise ValueError(f"history_entry 日期无效: {match.group(1)}") from None
+        by_date.setdefault(day, []).append(entry)
+    return {
+        f"journal/{day}.md": "\n".join(summaries)
+        for day, summaries in by_date.items()
+    }
+
+
+def _normalize_history_entries(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if isinstance(raw, str):
+            summary = raw.strip()
+            weight = 0
+        elif isinstance(raw, dict):
+            summary = str(raw.get("summary") or "").strip()
+            raw_weight = raw.get("emotional_weight", 0)
+            try:
+                weight = max(0, min(10, int(raw_weight)))
+            except (TypeError, ValueError):
+                weight = 0
+        else:
+            continue
+        if not summary or summary in seen:
+            continue
+        seen.add(summary)
+        result.append({"summary": summary, "emotional_weight": weight})
+    return result
+
+
+def _format_pending_items(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if not isinstance(value, list):
+        return ""
+    return "\n".join(str(item).strip() for item in value if str(item).strip())
+
+
+def _replace_recent_turns_block(old_context: str, recent_turns: str) -> str:
+    marker = "\n## Recent Turns\n"
+    block = (
+        "## Recent Turns\n<!-- a-preview = assistant reply preview only -->\n"
+        + (recent_turns.strip() or "- none")
+    )
+    current = old_context.strip()
+    if marker in current:
+        return current.split(marker, 1)[0].rstrip() + "\n\n" + block
+    if current:
+        return current + "\n\n" + block
+    return "# Recent Context\n\n## Compression\n- none\n\n" + block
 
 
 def _json_object(value: object) -> dict[str, object]:

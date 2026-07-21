@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 mcp = FastMCP("memopilot-test")
 active_calls = 0
@@ -33,6 +33,19 @@ def fail() -> CallToolResult:
     return CallToolResult(
         isError=True,
         content=[TextContent(type="text", text="remote rejected")],
+    )
+
+
+@mcp.tool()
+def image_payload() -> CallToolResult:
+    return CallToolResult(
+        content=[
+            ImageContent(
+                type="image",
+                data="sensitive-base64-payload" * 100,
+                mimeType="image/png",
+            )
+        ],
     )
 
 

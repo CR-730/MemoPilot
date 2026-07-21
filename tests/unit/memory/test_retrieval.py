@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -69,6 +70,41 @@ async def test_retriever_uses_aux_queries_only_for_vector_lane_and_rrf_for_fusio
     assert hits[0]["rrf_score"] == pytest.approx(1 / 63 + 0.5 / 61)
 
 
+@pytest.mark.asyncio
+async def test_vector_store_failure_still_returns_keyword_lane() -> None:
+    class _BrokenVectorStore(_Store):
+        def search_vectors(self, vector: list[float], **kwargs: Any) -> list[dict[str, Any]]:
+            raise RuntimeError("sqlite-vec unavailable")
+
+    store = _BrokenVectorStore()
+    hits = await MemoryRetriever(
+        store,  # type: ignore[arg-type]
+        _Embedder(),
+        score_threshold=0.0,
+    ).retrieve("原始问题", limit=3)
+
+    assert [item["item_id"] for item in hits] == ["b"]
+    assert store.keyword_queries == ["原始问题"]
+
+
+@pytest.mark.asyncio
+async def test_rrf_preserves_relevance_score_for_injection_threshold() -> None:
+    retriever = MemoryRetriever(
+        _Store(),  # type: ignore[arg-type]
+        _Embedder(),
+        score_threshold=0.45,
+    )
+
+    hits = await retriever.retrieve("原始问题", limit=3)
+    preference = next(item for item in hits if item["item_id"] == "b")
+    block, injected = retriever.build_injection_block(hits)
+
+    assert preference["score"] == pytest.approx(0.8)
+    assert preference["rrf_score"] > 0
+    assert "b" in injected
+    assert "[b]" in block
+
+
 def test_injection_applies_sections_thresholds_line_and_total_budget() -> None:
     retriever = MemoryRetriever(
         _Store(),  # type: ignore[arg-type]
@@ -94,6 +130,110 @@ def test_injection_applies_sections_thresholds_line_and_total_budget() -> None:
     assert "p2" not in block and "e2" not in block and "low" not in block
     assert all(len(line) <= 60 for line in block.splitlines() if line.startswith("- "))
     assert len(block) <= 260
+
+
+def test_low_score_procedure_with_required_tool_is_always_forced() -> None:
+    retriever = MemoryRetriever(
+        _Store(),  # type: ignore[arg-type]
+        _Embedder(),
+        score_thresholds={"procedure": 0.58},
+    )
+    item = _item("proc-1", "procedure", 0.2, "发送邮件前必须确认")
+    item["extra_json"] = {
+        "tool_requirement": "send_email",
+        "trigger_tags": {
+            "scope": "tool_triggered",
+            "tools": ["send_email"],
+            "skills": [],
+            "keywords": [],
+        },
+    }
+
+    unrelated, unrelated_ids = retriever.build_injection_block([item])
+    matched, matched_ids = retriever.build_injection_block([item])
+
+    assert "强制记忆约束" in unrelated
+    assert unrelated_ids == ("proc-1",)
+    assert "强制记忆约束" in matched
+    assert "必须调用工具：send_email" in matched
+    assert matched_ids == ("proc-1",)
+
+
+def test_absolute_threshold_does_not_add_unapproved_relative_score_floor() -> None:
+    retriever = MemoryRetriever(
+        _Store(),  # type: ignore[arg-type]
+        _Embedder(),
+        score_thresholds={"preference": 0.8},
+        inject_max_procedure_preference=4,
+    )
+    items = [
+        _item("best", "preference", 0.9, "偏好中文"),
+        _item("valid", "preference", 0.81, "偏好简洁"),
+    ]
+
+    block, injected = retriever.build_injection_block(items)
+
+    assert injected == ("best", "valid")
+    assert "偏好简洁" in block
+
+
+def test_injection_keeps_prototype_confidence_time_and_evidence_metadata() -> None:
+    retriever = MemoryRetriever(
+        _Store(),  # type: ignore[arg-type]
+        _Embedder(),
+        score_thresholds={"preference": 0.45},
+    )
+    item = _item("pref-1", "preference", 0.5, "用户不确定是否喜欢悬疑游戏")
+    item["happened_at"] = "2026-07-01T12:00:00+00:00"
+    item["source_ref"] = "consolidation:con-1#implicit"
+
+    block, injected = retriever.build_injection_block([item])
+
+    assert injected == ("pref-1",)
+    assert "有印象，不确定" in block
+    assert "发生于: 2026-07-01 12:00" in block
+    assert "距今约" in block
+    assert "证据: consolidation:con-1#implicit" in block
+    assert "低置信线索: 不能单独证明历史细节" in block
+
+
+def test_procedure_injection_includes_steps_and_tool_constraints() -> None:
+    retriever = MemoryRetriever(
+        _Store(),  # type: ignore[arg-type]
+        _Embedder(),
+        inject_line_max=240,
+    )
+    item = _item("proc-1", "procedure", 0.9, "发送邮件前先展示草稿")
+    item["extra_json"] = {
+        "steps": ["生成草稿", "等待确认", "发送邮件"],
+        "rule_schema": {
+            "required_tools": ["send_email"],
+            "forbidden_tools": ["shell"],
+        },
+    }
+
+    block, injected = retriever.build_injection_block([item])
+
+    assert injected == ("proc-1",)
+    assert "生成草稿 → 等待确认 → 发送邮件" in block
+    assert "必须使用：send_email" in block
+    assert "禁止使用：shell" in block
+
+
+def test_high_hotness_cannot_bypass_per_type_semantic_threshold() -> None:
+    retriever = MemoryRetriever(
+        _Store(),  # type: ignore[arg-type]
+        _Embedder(),
+        score_thresholds={"preference": 0.52},
+    )
+    item = _item("pref-low-semantic", "preference", 0.95, "高频但相关性不足")
+    item["semantic_score"] = 0.49
+    item["hotness"] = 0.99
+
+    block, injected = retriever.build_injection_block([item])
+
+    assert block == ""
+    assert injected == ()
 
 
 class _Hypotheses:
@@ -144,3 +284,77 @@ async def test_answer_falls_back_to_raw_query_when_hypothesis_generation_fails()
     assert embedder.calls == ["原始问题"]
     assert result.trace["aux_queries"] == []
     assert len(result.records) == 2
+
+
+@pytest.mark.asyncio
+async def test_retriever_falls_back_to_keyword_when_embedding_fails() -> None:
+    class BrokenEmbedder:
+        async def embed(self, text: str) -> list[float]:
+            raise RuntimeError("embedding unavailable")
+
+    store = _Store()
+    retriever = MemoryRetriever(store, BrokenEmbedder(), score_threshold=0.0)  # type: ignore[arg-type]
+
+    hits = await retriever.retrieve("原始问题", limit=3)
+
+    assert [item["item_id"] for item in hits] == ["b"]
+    assert store.vector_queries == []
+    assert store.keyword_queries == ["原始问题"]
+
+
+@pytest.mark.asyncio
+async def test_retriever_keeps_successful_queries_when_one_embedding_times_out() -> None:
+    class PartialEmbedder:
+        async def embed(self, text: str) -> list[float]:
+            if text == "超时假设":
+                await asyncio.Event().wait()
+            return [1.0, 0.0]
+
+    store = _Store()
+    retriever = MemoryRetriever(  # type: ignore[arg-type]
+        store,
+        PartialEmbedder(),
+        score_threshold=0.0,
+        embed_timeout_seconds=0.01,
+    )
+
+    hits = await retriever.retrieve(
+        "原始问题",
+        aux_queries=("超时假设",),
+        limit=3,
+    )
+
+    assert [item["item_id"] for item in hits] == ["b", "a"]
+    assert len(store.vector_queries) == 1
+
+
+@pytest.mark.asyncio
+async def test_engine_passes_session_scope_to_both_retrieval_lanes() -> None:
+    class ScopeStore(_Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scopes: list[tuple[str, str]] = []
+
+        def search_vectors(self, vector: list[float], **kwargs: Any) -> list[dict[str, Any]]:
+            self.scopes.append((kwargs["scope_channel"], kwargs["scope_chat_id"]))
+            return super().search_vectors(vector, **kwargs)
+
+        def search_keywords(self, query: str, **kwargs: Any) -> list[dict[str, Any]]:
+            self.scopes.append((kwargs["scope_channel"], kwargs["scope_chat_id"]))
+            return super().search_keywords(query, **kwargs)
+
+    store = ScopeStore()
+    engine = LayeredMemoryEngine(
+        MemoryRetriever(store, _Embedder(), score_threshold=0.0),  # type: ignore[arg-type]
+    )
+
+    await engine.query(
+        MemoryQuery(
+            text="原始问题",
+            intent="context",
+            session_key="feishu:chat-1",
+            limit=2,
+        )
+    )
+
+    assert store.scopes == [("feishu", "chat-1"), ("feishu", "chat-1")]

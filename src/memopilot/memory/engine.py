@@ -27,6 +27,7 @@ class LayeredMemoryEngine:
 
     async def query(self, request: MemoryQuery) -> MemoryQueryResult:
         limit = max(1, min(request.limit, 200))
+        scope_channel, _, scope_chat_id = request.session_key.partition(":")
         if request.intent == "timeline":
             if request.time_start is None or request.time_end is None:
                 return MemoryQueryResult(trace={"intent": "timeline", "missing_time": True})
@@ -34,6 +35,8 @@ class LayeredMemoryEngine:
                 time_start=request.time_start,
                 time_end=request.time_end,
                 limit=limit,
+                scope_channel=scope_channel,
+                scope_chat_id=scope_chat_id,
             )
             return self._result(request.intent, hits, aux_queries=())
 
@@ -62,8 +65,14 @@ class LayeredMemoryEngine:
             limit=limit,
             time_start=request.time_start,
             time_end=request.time_end,
+            scope_channel=scope_channel,
+            scope_chat_id=scope_chat_id,
         )
-        return self._result(request.intent, hits, aux_queries=aux_queries)
+        return self._result(
+            request.intent,
+            hits,
+            aux_queries=aux_queries,
+        )
 
     def _result(
         self,
@@ -96,7 +105,13 @@ class LayeredMemoryEngine:
         return MemoryQueryResult(
             text_block=text_block,
             records=records,
-            trace={"intent": intent, "aux_queries": list(aux_queries), "hit_count": len(records)},
+            trace={
+                "intent": intent,
+                "aux_queries": list(aux_queries),
+                "hit_count": len(records),
+                "candidate_ids": [record.id for record in records if record.id],
+                "injected_ids": list(injected_ids),
+            },
         )
 
 

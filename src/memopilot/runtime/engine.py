@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from typing import Any, Protocol, cast
@@ -31,7 +32,12 @@ from memopilot.extensions.prompts import (
 )
 from memopilot.extensions.skills import ActiveSkillBlock, SkillCatalog
 from memopilot.memory.contracts import MemoryQuery, MemoryQueryEngine
+from memopilot.memory.tool_context import (
+    bind_memory_tool_context,
+    reset_memory_tool_context,
+)
 from memopilot.runtime.contracts import ChatMessage, ModelResponse
+from memopilot.runtime.memory_citations import CITATION_PROTOCOL, extract_cited_ids
 from memopilot.runtime.phases import (
     LifecyclePhase,
     PhaseContext,
@@ -64,6 +70,7 @@ class TurnInput:
     prompt_scope: str = "passive"
     media: tuple[str, ...] = ()
     outbound_metadata: Mapping[str, object] = field(default_factory=dict)
+    memory_source_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,7 @@ class TurnResult:
     trace: tuple[RuntimeTraceEvent, ...]
     media: tuple[str, ...] = ()
     outbound_metadata: Mapping[str, object] = field(default_factory=dict)
+    cited_memory_ids: tuple[str, ...] = ()
 
 
 PhaseHandler = Callable[[PhaseContext], Awaitable[Mapping[str, Any]]]
@@ -159,7 +167,7 @@ class AgentRuntime:
                         LifecyclePhase.BEFORE_REASONING,
                         "before_reasoning.memory_prerecall",
                         ("reasoning.input",),
-                        ("memory.context",),
+                        ("memory.context", "memory.trace"),
                         self._memory_prerecall,
                     ),
                 ),
@@ -194,16 +202,19 @@ class AgentRuntime:
         turn = context.slots["reasoning.input"]
         if not isinstance(turn, TurnInput):
             raise TypeError("reasoning.input 必须是 TurnInput")
-        parts: list[str] = []
+        sections: dict[str, str] = {}
+        memory_trace: dict[str, object] = {}
         if self._memory_profile is not None:
-            for name, title in (
-                ("MEMORY.md", "用户长期记忆"),
-                ("SELF.md", "助手自我认知"),
-                ("CONTEXT.md", "近期上下文"),
+            for name, key, title in (
+                ("MEMORY.md", "memory", "用户长期记忆"),
+                ("SELF.md", "self", "助手自我认知"),
+                ("RECENT_CONTEXT.md", "recent", "近期上下文"),
             ):
                 content = self._memory_profile.read(name).strip()
+                if name == "RECENT_CONTEXT.md":
+                    content = _without_recent_turns(content)
                 if content:
-                    parts.append(f"## {title}\n{content}")
+                    sections[key] = f"## {title}\n{content}"
         if self._memory_engine is not None:
             result = await self._memory_engine.query(
                 MemoryQuery(
@@ -213,9 +224,26 @@ class AgentRuntime:
                 )
             )
             if result.text_block.strip():
-                parts.append(result.text_block.strip())
-        context_block = "\n\n".join(parts)
-        return {"memory.context": context_block[: self._memory_markdown_max_chars]}
+                sections["retrieval"] = result.text_block.strip()
+            memory_trace = dict(result.trace)
+        selected = _fit_memory_sections(sections, self._memory_markdown_max_chars)
+        context_block = "\n\n".join(
+            selected[key]
+            for key in ("memory", "self", "recent", "retrieval")
+            if selected.get(key)
+        )
+        injected = memory_trace.get("injected_ids")
+        if isinstance(injected, list):
+            retrieval_text = selected.get("retrieval", "")
+            memory_trace["injected_ids"] = [
+                str(item_id)
+                for item_id in injected
+                if f"[{item_id}]" in retrieval_text
+            ]
+        return {
+            "memory.context": context_block,
+            "memory.trace": memory_trace,
+        }
 
     async def run(
         self,
@@ -223,6 +251,8 @@ class AgentRuntime:
         *,
         step_sink: RuntimeStepSink | None = None,
         progress: ReActProgressObserver | None = None,
+        memory_assert_current: Callable[[], None] | None = None,
+        memory_fenced_write: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> TurnResult:
         state = _turn_state(turn)
         context = PhaseContext(
@@ -269,6 +299,15 @@ class AgentRuntime:
             )
             if deferred_hint:
                 before_reasoning_ctx.extra_hints.append(deferred_hint)
+        memory_trace = context.slots.get("memory.trace")
+        if isinstance(memory_trace, dict) and memory_trace:
+            await execution.record_event(
+                RuntimeTraceEvent(
+                    phase=LifecyclePhase.BEFORE_REASONING,
+                    step_type="memory_recall",
+                    observation=memory_trace,
+                )
+            )
         await execution.run_phase(LifecyclePhase.PROMPT_RENDER)
         prompt_messages = context.slots["prompt.messages"]
         if not isinstance(prompt_messages, tuple):
@@ -277,18 +316,27 @@ class AgentRuntime:
         if not isinstance(effective_turn, TurnInput):
             raise RuntimeError("BeforeTurn 未保留 TurnInput")
 
-        react = await ReActEngine(
-            self._provider,
-            self._tools,
-            max_iterations=self._max_iterations,
-            observer=execution,
-            event_bus=self._event_bus,
-            session_key=effective_turn.session_key,
-            source=effective_turn.prompt_scope,
-            request_text=effective_turn.content,
-            tool_search_enabled=self._tool_search_enabled,
-            preloaded_tools=preloaded_tools,
-        ).run(prompt_messages, progress=progress)
+        tool_context_token = bind_memory_tool_context(
+            effective_turn.session_key,
+            source_ref=effective_turn.memory_source_ref,
+            assert_current=memory_assert_current,
+            fenced_write=memory_fenced_write,
+        )
+        try:
+            react = await ReActEngine(
+                self._provider,
+                self._tools,
+                max_iterations=self._max_iterations,
+                observer=execution,
+                event_bus=self._event_bus,
+                session_key=effective_turn.session_key,
+                source=effective_turn.prompt_scope,
+                request_text=effective_turn.content,
+                tool_search_enabled=self._tool_search_enabled,
+                preloaded_tools=preloaded_tools,
+            ).run(prompt_messages, progress=progress)
+        finally:
+            reset_memory_tool_context(tool_context_token)
         if self._tool_search_enabled:
             self._tool_discovery.update(
                 effective_turn.session_key,
@@ -299,6 +347,16 @@ class AgentRuntime:
                 ],
                 self._tools.get_always_on_names(),
             )
+        cleaned_reply, cited_memory_ids = extract_cited_ids(react.reply)
+        allowed_memory_ids = _allowed_memory_ids(context, react)
+        cited_memory_ids = tuple(
+            item_id for item_id in cited_memory_ids if item_id in allowed_memory_ids
+        )
+        if cleaned_reply != react.reply:
+            messages = list(react.messages)
+            if messages and messages[-1].role == "assistant":
+                messages[-1] = replace(messages[-1], content=cleaned_reply)
+            react = replace(react, reply=cleaned_reply, messages=tuple(messages))
         context.slots["reasoning.result"] = react
         context.slots["after_reasoning.input"] = AfterReasoningInput(
             cast(BeforeTurnInput, context.slots["before_turn.input"]),
@@ -324,6 +382,7 @@ class AgentRuntime:
                     context.slots["reasoning:ctx"],
                 ).outbound_metadata
             ),
+            cited_memory_ids=cited_memory_ids,
         )
 
 
@@ -653,6 +712,9 @@ class _RuntimeExecution(ReActObserver):
         if self._sink is not None:
             await self._sink.record(event)
 
+    async def record_event(self, event: RuntimeTraceEvent) -> None:
+        await self._record(event)
+
 
 async def _before_turn(context: PhaseContext) -> Mapping[str, Any]:
     turn = context.slots["turn.input"]
@@ -751,7 +813,12 @@ async def _prompt_render(
     memory_prompt = ""
     memory_context = context.slots.get("memory.context")
     if isinstance(memory_context, str) and memory_context.strip():
-        memory_prompt = "以下是与当前问题相关的长期记忆：\n" + memory_context.strip()
+        memory_prompt = (
+            "以下是与当前问题相关的长期记忆：\n"
+            + memory_context.strip()
+            + "\n\n"
+            + CITATION_PROTOCOL
+        )
     active_prompt = ""
     skill_catalog = ""
     if skills is not None:
@@ -1168,6 +1235,50 @@ def _replace_react_reply(result: ReActResult, reply: str) -> ReActResult:
     else:
         messages.append(ChatMessage.assistant(content=reply))
     return replace(result, reply=reply, messages=tuple(messages))
+
+
+def _allowed_memory_ids(context: PhaseContext, react: ReActResult) -> set[str]:
+    allowed: set[str] = set()
+    trace = context.slots.get("memory.trace")
+    if isinstance(trace, dict):
+        values = trace.get("injected_ids")
+        if isinstance(values, list):
+            allowed.update(str(value) for value in values if str(value).strip())
+    for record in react.tool_chain:
+        if record.call.name != "recall_memory" or not record.observation.ok:
+            continue
+        result = record.observation.result
+        if not isinstance(result, dict):
+            continue
+        values = result.get("cited_item_ids")
+        if isinstance(values, list):
+            allowed.update(str(value) for value in values if str(value).strip())
+    return allowed
+
+
+def _fit_memory_sections(sections: Mapping[str, str], budget: int) -> dict[str, str]:
+    """先保留本轮检索和近期上下文，再用剩余预算填长期 Markdown。"""
+    selected: dict[str, str] = {}
+    remaining = budget
+    for key in ("retrieval", "recent", "self", "memory"):
+        value = sections.get(key, "").strip()
+        if not value or remaining <= 0:
+            continue
+        separator_cost = 2 if selected else 0
+        if remaining <= separator_cost:
+            break
+        kept = value[: remaining - separator_cost].rstrip()
+        if kept:
+            selected[key] = kept
+            remaining -= len(kept) + separator_cost
+    return selected
+
+
+def _without_recent_turns(content: str) -> str:
+    marker = "\n## Recent Turns\n"
+    if marker not in content:
+        return content.strip()
+    return content.split(marker, 1)[0].rstrip()
 
 
 __all__ = [
