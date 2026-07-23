@@ -48,14 +48,18 @@ EXPECTED_TABLES = {
         "memory_fts",
         "memory_usages",
     },
-    DatabaseKind.WAKE: {
+    DatabaseKind.PROACTIVE: {
         "source_events",
-        "source_cursors",
+        "source_event_history",
         "pending_acknowledgements",
-        "content_scores",
         "hazard_snapshots",
-        "wake_decisions",
+        "proactive_decisions",
         "drift_history",
+        "hazard_state",
+        "context_states",
+        "context_reevaluation_state",
+        "drift_state",
+        "proactive_observations",
     },
 }
 
@@ -70,7 +74,7 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
     expected_version = {
         DatabaseKind.OPERATIONAL: 5,
         DatabaseKind.MEMORY: 3,
-        DatabaseKind.WAKE: 1,
+        DatabaseKind.PROACTIVE: 7,
     }[kind]
     assert report.to_version == expected_version
     assert report.backup_path is None
@@ -89,11 +93,7 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
 
 def test_operational_v1_upgrades_to_v5_without_losing_existing_rows(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
-    v1_sql = (
-        files("memopilot.persistence.schema")
-        .joinpath("operational_v1.sql")
-        .read_text("utf-8")
-    )
+    v1_sql = files("memopilot.persistence.schema").joinpath("operational_v1.sql").read_text("utf-8")
     with sqlite3.connect(database) as connection:
         connection.executescript(v1_sql)
         connection.execute("PRAGMA user_version = 1")
@@ -117,12 +117,10 @@ def test_operational_v1_upgrades_to_v5_without_losing_existing_rows(tmp_path: Pa
             for row in connection.execute("PRAGMA table_info(outbound_effects)").fetchall()
         }
         session_columns = {
-            str(row[1])
-            for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+            str(row[1]) for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
         }
         message_columns = {
-            str(row[1])
-            for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+            str(row[1]) for row in connection.execute("PRAGMA table_info(messages)").fetchall()
         }
     assert session is not None and session[0] == "chat-1"
     assert {
@@ -134,6 +132,55 @@ def test_operational_v1_upgrades_to_v5_without_losing_existing_rows(tmp_path: Pa
     } <= effect_columns
     assert "last_consolidated_position" in session_columns
     assert "session_position" in message_columns
+
+
+def test_proactive_v1_upgrades_to_v7_without_losing_reservoir_rows(tmp_path: Path) -> None:
+    database = tmp_path / "proactive.db"
+    v1_sql = files("memopilot.persistence.schema").joinpath("proactive_v1.sql").read_text("utf-8")
+    with sqlite3.connect(database) as connection:
+        connection.executescript(v1_sql)
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute(
+            """
+            INSERT INTO source_events(
+                reservoir_id, source_id, source_event_id, session_key, kind,
+                occurred_at, payload_json, fetched_at
+            ) VALUES ('r1', 'news', 'e1', 'feishu:c1', 'content', 'now', '{}', 'now')
+            """
+        )
+
+    report = migrate_database(database, DatabaseKind.PROACTIVE)
+
+    assert report.from_version == 1
+    assert report.to_version == 7
+    assert report.applied_versions == (2, 3, 4, 5, 6, 7)
+    with connect_database(database) as connection:
+        event = connection.execute(
+            "SELECT source_event_id FROM source_events WHERE reservoir_id = 'r1'"
+        ).fetchone()
+        state_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'hazard_state'"
+        ).fetchone()
+        decision_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(proactive_decisions)").fetchall()
+        }
+        ack_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(pending_acknowledgements)").fetchall()
+        }
+        content_scores = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'content_scores'"
+        ).fetchone()
+        history_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'source_event_history'"
+        ).fetchone()
+    assert event is not None and event[0] == "e1"
+    assert state_table is not None
+    assert "decision_payload_json" in decision_columns
+    assert "ttl_hours" in ack_columns
+    assert content_scores is None
+    assert history_table is not None
 
 
 def test_operational_v4_upgrades_to_v5_without_losing_existing_rows(tmp_path: Path) -> None:
@@ -219,12 +266,12 @@ def test_migration_backs_up_existing_database_before_upgrade(tmp_path: Path) -> 
 
 
 def test_database_newer_than_supported_schema_is_rejected(tmp_path: Path) -> None:
-    database = tmp_path / "wake.db"
+    database = tmp_path / "proactive.db"
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA user_version = 99")
 
     with pytest.raises(UnsupportedDatabaseVersionError, match="99"):
-        migrate_database(database, DatabaseKind.WAKE)
+        migrate_database(database, DatabaseKind.PROACTIVE)
 
 
 def test_failed_migration_rolls_back_schema_and_version(tmp_path: Path) -> None:

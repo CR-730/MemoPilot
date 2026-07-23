@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 class DatabaseKind(StrEnum):
     OPERATIONAL = "operational"
     MEMORY = "memory2"
-    WAKE = "wake"
+    PROACTIVE = "proactive"
 
 
 class MigrationError(RuntimeError):
@@ -115,10 +115,10 @@ def migrate_database(
 
         pending = tuple(item for item in selected if item.version > current_version)
         backup_path = (
-            _backup_database(connection, database, current_version)
-            if existed and pending
-            else None
+            _backup_database(connection, database, current_version) if existed and pending else None
         )
+        if kind is DatabaseKind.PROACTIVE and current_version == 1:
+            _normalize_legacy_wake_v1(connection)
         applied: list[int] = []
         for migration in pending:
             _apply_migration(connection, migration)
@@ -136,7 +136,7 @@ def migrate_database(
 
 
 def migrate_all_databases(settings: MemoPilotSettings) -> tuple[MigrationReport, ...]:
-    """按固定名称初始化 operational、memory2 与 wake 三个数据库。"""
+    """按固定名称初始化 operational、memory2 与 proactive 三个数据库。"""
     timeout = settings.sqlite_busy_timeout_seconds
     return (
         migrate_database(
@@ -149,11 +149,40 @@ def migrate_all_databases(settings: MemoPilotSettings) -> tuple[MigrationReport,
             DatabaseKind.MEMORY,
             busy_timeout_seconds=timeout,
         ),
-        migrate_database(
-            settings.wake_database,
-            DatabaseKind.WAKE,
+        _migrate_proactive_database(settings),
+    )
+
+
+def _migrate_proactive_database(settings: MemoPilotSettings) -> MigrationReport:
+    target = settings.proactive_database
+    legacy = settings.data_dir / "wake.db"
+    timeout = settings.sqlite_busy_timeout_seconds
+    if target.exists() and legacy.exists():
+        raise MigrationError("同时发现 proactive.db 与旧 wake.db，拒绝自动选择以免遗弃主动任务数据")
+    if target.exists() or not legacy.exists():
+        return migrate_database(
+            target,
+            DatabaseKind.PROACTIVE,
             busy_timeout_seconds=timeout,
-        ),
+        )
+    report = migrate_database(
+        legacy,
+        DatabaseKind.PROACTIVE,
+        busy_timeout_seconds=timeout,
+    )
+    connection = connect_database(legacy, busy_timeout_seconds=timeout)
+    try:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        connection.close()
+    legacy.replace(target)
+    return MigrationReport(
+        database=target,
+        kind=report.kind,
+        from_version=report.from_version,
+        to_version=report.to_version,
+        applied_versions=report.applied_versions,
+        backup_path=report.backup_path,
     )
 
 
@@ -162,7 +191,7 @@ def _load_migrations(kind: DatabaseKind) -> tuple[Migration, ...]:
     versions = {
         DatabaseKind.OPERATIONAL: (1, 2, 3, 4, 5),
         DatabaseKind.MEMORY: (1, 2, 3),
-        DatabaseKind.WAKE: (1,),
+        DatabaseKind.PROACTIVE: (1, 2, 3, 4, 5, 6, 7),
     }[kind]
     return tuple(
         Migration(
@@ -180,17 +209,46 @@ def _validate_migration_sequence(migrations: Sequence[Migration]) -> None:
         raise ValueError("迁移版本必须从正整数开始并严格递增且不重复")
 
 
+def _normalize_legacy_wake_v1(connection: sqlite3.Connection) -> None:
+    legacy_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'wake_decisions'"
+    ).fetchone()
+    if legacy_table is None:
+        return
+
+    def normalize_once() -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("DROP INDEX IF EXISTS ix_wake_decisions_session")
+            connection.execute("ALTER TABLE wake_decisions RENAME TO proactive_decisions")
+            connection.execute(
+                "CREATE INDEX ix_proactive_decisions_session "
+                "ON proactive_decisions(session_key, decided_at)"
+            )
+            connection.execute("DROP TABLE IF EXISTS source_cursors")
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+
+    try:
+        execute_with_busy_retry(normalize_once)
+    except Exception as exc:
+        raise MigrationError(f"旧 wake v1 schema 规范化失败: {exc}") from exc
+
+
 def _backup_database(
     connection: sqlite3.Connection,
     database: Path,
     current_version: int,
 ) -> Path:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    backup_path = database.with_name(
-        f"{database.name}.bak-v{current_version}-{timestamp}"
-    )
-    with sqlite3.connect(backup_path) as backup:
+    backup_path = database.with_name(f"{database.name}.bak-v{current_version}-{timestamp}")
+    backup = sqlite3.connect(backup_path)
+    try:
         connection.backup(backup)
+    finally:
+        backup.close()
     return backup_path
 
 

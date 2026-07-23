@@ -14,12 +14,6 @@ CREATE TABLE source_events (
 CREATE INDEX ix_source_events_pending
     ON source_events(session_key, kind, consumed_at, occurred_at);
 
-CREATE TABLE source_cursors (
-    source_id TEXT PRIMARY KEY,
-    cursor_value TEXT,
-    updated_at TEXT NOT NULL
-);
-
 CREATE TABLE pending_acknowledgements (
     acknowledgement_id TEXT PRIMARY KEY,
     source_id TEXT NOT NULL,
@@ -65,7 +59,7 @@ CREATE TABLE hazard_snapshots (
 CREATE INDEX ix_hazard_snapshots_session
     ON hazard_snapshots(session_key, calculated_at);
 
-CREATE TABLE wake_decisions (
+CREATE TABLE proactive_decisions (
     decision_id TEXT PRIMARY KEY,
     session_key TEXT NOT NULL,
     trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('alert', 'context', 'content')),
@@ -78,7 +72,7 @@ CREATE TABLE wake_decisions (
     decided_at TEXT NOT NULL,
     committed_at TEXT
 );
-CREATE INDEX ix_wake_decisions_session ON wake_decisions(session_key, decided_at);
+CREATE INDEX ix_proactive_decisions_session ON proactive_decisions(session_key, decided_at);
 
 CREATE TABLE drift_history (
     drift_id TEXT PRIMARY KEY,
