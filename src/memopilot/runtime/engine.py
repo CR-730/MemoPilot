@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from functools import partial
 from typing import Any, Protocol, cast
 
@@ -56,6 +57,10 @@ from memopilot.runtime.react import (
 )
 from memopilot.runtime.tool_search import ToolDiscoveryState, format_deferred_tools_hint
 from memopilot.runtime.tools import ToolRegistry
+from memopilot.scheduling.tool_context import (
+    bind_schedule_tool_context,
+    reset_schedule_tool_context,
+)
 
 
 @dataclass(frozen=True)
@@ -71,6 +76,8 @@ class TurnInput:
     media: tuple[str, ...] = ()
     outbound_metadata: Mapping[str, object] = field(default_factory=dict)
     memory_source_ref: str = ""
+    received_at: datetime | None = None
+    allowed_tool_risks: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -249,8 +256,10 @@ class AgentRuntime:
         self,
         turn: TurnInput,
         *,
+        tools: ToolRegistry | None = None,
         step_sink: RuntimeStepSink | None = None,
         progress: ReActProgressObserver | None = None,
+        execution_assert_current: Callable[[], None] | None = None,
         memory_assert_current: Callable[[], None] | None = None,
         memory_fenced_write: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> TurnResult:
@@ -261,12 +270,13 @@ class AgentRuntime:
                 "before_turn.input": state,
             }
         )
+        active_tools = tools or self._tools
         execution = _RuntimeExecution(
             self._pipeline,
             context,
             step_sink,
             event_bus=self._event_bus,
-            tools=self._tools,
+            tools=active_tools,
         )
         await execution.run_phase(LifecyclePhase.BEFORE_TURN)
         before_turn_ctx = cast(BeforeTurnCtx, context.slots["session:ctx"])
@@ -288,14 +298,28 @@ class AgentRuntime:
                 exit_reason="before_reasoning_abort",
                 execution=execution,
             )
-        preloaded_tools = self._tool_discovery.get_preloaded_ordered(
-            before_reasoning_ctx.session_key
+        policy_turn = cast(TurnInput, context.slots["turn.input"])
+        blocked_tool_names = {
+            name
+            for name in active_tools.tool_names
+            if policy_turn.allowed_tool_risks is not None
+            and (document := active_tools.get_document(name)) is not None
+            and document.risk not in policy_turn.allowed_tool_risks
+        }
+        preloaded_tools = tuple(
+            name
+            for name in self._tool_discovery.get_preloaded_ordered(
+                before_reasoning_ctx.session_key
+            )
+            if name not in blocked_tool_names
         )
         if self._tool_search_enabled:
-            visible = self._tools.get_always_on_names() | set(preloaded_tools)
+            visible = (
+                active_tools.get_always_on_names() | set(preloaded_tools)
+            ) - blocked_tool_names
             before_reasoning_ctx.visible_tool_names = frozenset(visible)
             deferred_hint = format_deferred_tools_hint(
-                self._tools.get_deferred_names(visible)
+                active_tools.get_deferred_names(visible | blocked_tool_names)
             )
             if deferred_hint:
                 before_reasoning_ctx.extra_hints.append(deferred_hint)
@@ -322,10 +346,19 @@ class AgentRuntime:
             assert_current=memory_assert_current,
             fenced_write=memory_fenced_write,
         )
+        schedule_context_token = (
+            bind_schedule_tool_context(
+                effective_turn.session_key,
+                received_at=effective_turn.received_at,
+                assert_current=memory_assert_current,
+            )
+            if effective_turn.received_at is not None
+            else None
+        )
         try:
             react = await ReActEngine(
                 self._provider,
-                self._tools,
+                active_tools,
                 max_iterations=self._max_iterations,
                 observer=execution,
                 event_bus=self._event_bus,
@@ -334,8 +367,12 @@ class AgentRuntime:
                 request_text=effective_turn.content,
                 tool_search_enabled=self._tool_search_enabled,
                 preloaded_tools=preloaded_tools,
+                assert_current=execution_assert_current,
+                excluded_tool_names=blocked_tool_names,
             ).run(prompt_messages, progress=progress)
         finally:
+            if schedule_context_token is not None:
+                reset_schedule_tool_context(schedule_context_token)
             reset_memory_tool_context(tool_context_token)
         if self._tool_search_enabled:
             self._tool_discovery.update(
@@ -705,6 +742,19 @@ class _RuntimeExecution(ReActObserver):
             )
         await self.run_phase(LifecyclePhase.AFTER_STEP)
         ctx = cast(AfterStepCtx, self._context.slots["step:ctx"])
+        successful_tools = {
+            record.call.name
+            for record in tool_records
+            if record.observation.ok
+        }
+        if "message_push" in successful_tools:
+            self.set_visible_tool_names(
+                frozenset({"write_file", "edit_file", "finish_drift"})
+            )
+        elif "mount_server" in successful_tools:
+            self.set_visible_tool_names(frozenset(self._tools.tool_names))
+        if "finish_drift" in successful_tools:
+            return AfterStepControl(True, "finish_drift")
         return AfterStepControl(ctx.early_stop, ctx.early_stop_reason)
 
     async def _record(self, event: RuntimeTraceEvent) -> None:

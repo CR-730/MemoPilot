@@ -8,16 +8,26 @@ import os
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from memopilot.extensions.mcp import McpServerClient, McpServerConfig
+from memopilot.extensions.mcp import (
+    McpCallResult,
+    McpInvocationError,
+    McpServerClient,
+    McpServerConfig,
+)
 from memopilot.runtime.tools import Tool, ToolRegistry
+
+if TYPE_CHECKING:
+    from memopilot.proactive.mcp_sources import McpCaller
 
 
 class McpClient(Protocol):
     config: McpServerConfig
 
     async def as_tools(self) -> tuple[Tool, ...]: ...
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpCallResult: ...
 
     async def close(self) -> None: ...
 
@@ -53,6 +63,32 @@ class McpServerRegistry:
     @property
     def diagnostics(self) -> tuple[str, ...]:
         return tuple(self._diagnostics)
+
+    @property
+    def server_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._configs))
+
+    @property
+    def connected_server_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._clients))
+
+    def tool_names_for_server(self, server_id: str) -> tuple[str, ...]:
+        return self._server_tools.get(server_id, ())
+
+    def caller(self, server_id: str) -> McpCaller:
+        """返回只允许按 server_id 转发工具调用的受控视图。"""
+        return _RegistryMcpCaller(self, server_id)
+
+    async def _call_connected(
+        self, server_id: str, name: str, arguments: dict[str, Any]
+    ) -> McpCallResult:
+        client = self._clients.get(server_id)
+        if client is None:
+            raise McpInvocationError(
+                "mcp_unavailable",
+                f"MCP Server 尚未连接或当前不可用: {server_id}",
+            )
+        return await client.call_tool(name, arguments)
 
     async def import_configs(
         self,
@@ -361,6 +397,17 @@ class McpToolConflictError(RuntimeError):
 
 class McpRegistryClosedError(RuntimeError):
     """连接尚未发布时 Registry 已进入永久关闭状态。"""
+
+
+class _RegistryMcpCaller:
+    __slots__ = ("_registry", "_server_id")
+
+    def __init__(self, registry: McpServerRegistry, server_id: str) -> None:
+        self._registry = registry
+        self._server_id = server_id
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpCallResult:
+        return await self._registry._call_connected(self._server_id, name, arguments)
 
 
 def _resolve_cwd(cwd: str | None) -> Path | None:

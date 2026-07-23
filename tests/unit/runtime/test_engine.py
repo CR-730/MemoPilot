@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
+from datetime import UTC, datetime
+
+import pytest
 
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.hooks import HookContext, HookOutcome, ToolHook
@@ -22,6 +26,7 @@ from memopilot.runtime.phases import LifecyclePhase
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tool_search import ToolSearchTool
 from memopilot.runtime.tools import Tool, ToolRegistry
+from memopilot.scheduling.tool_context import current_schedule_tool_context
 
 
 class _Provider(ChatProvider):
@@ -56,6 +61,186 @@ def _tools() -> ToolRegistry:
             )
         ]
     )
+
+
+async def test_schedule_context_is_bound_during_react_and_cleaned_afterwards() -> None:
+    received_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+    observed = []
+
+    async def inspect_context() -> str:
+        observed.append(current_schedule_tool_context())
+        return "ok"
+
+    tools = ToolRegistry(
+        [
+            Tool(
+                name="inspect_schedule_context",
+                description="inspect",
+                parameters={"type": "object", "properties": {}},
+                handler=inspect_context,
+            )
+        ]
+    )
+    provider = _Provider(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(
+                    FunctionCall(id="context", name="inspect_schedule_context", arguments={}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(content="完成", tool_calls=(), finish_reason="stop"),
+        ]
+    )
+
+    await AgentRuntime(provider, tools).run(
+        TurnInput("feishu:chat-1", "30秒后提醒", received_at=received_at),
+        memory_assert_current=lambda: None,
+    )
+
+    assert observed[0] is not None
+    assert observed[0].session_key == "feishu:chat-1"
+    assert observed[0].received_at == received_at
+    assert callable(observed[0].assert_current)
+    assert current_schedule_tool_context() is None
+
+
+async def test_background_risk_policy_hides_and_blocks_external_side_effect_tools() -> None:
+    executed: list[str] = []
+
+    async def send_email() -> str:
+        executed.append("sent")
+        return "sent"
+
+    tools = ToolRegistry()
+    tools.register(
+        Tool(
+            name="send_email",
+            description="发送邮件",
+            parameters={"type": "object", "properties": {}},
+            handler=send_email,
+        ),
+        risk="external-side-effect",
+    )
+    provider = _Provider(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(FunctionCall("mail", "send_email", {}),),
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(content="未执行外部副作用", tool_calls=(), finish_reason="stop"),
+        ]
+    )
+
+    result = await AgentRuntime(provider, tools).run(
+        TurnInput(
+            "feishu:chat-1",
+            "后台任务",
+            allowed_tool_risks=frozenset({"read-only", "write"}),
+        )
+    )
+
+    assert executed == []
+    assert result.react.tool_chain[0].observation.error_type == "tool_not_allowed"
+
+
+async def test_schedule_context_is_cleaned_when_react_is_cancelled() -> None:
+    class CancelledProvider(ChatProvider):
+        async def complete(self, **kwargs):
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await AgentRuntime(CancelledProvider(), ToolRegistry()).run(
+            TurnInput("feishu:chat-1", "提醒", received_at=datetime.now(UTC))
+        )
+
+    assert current_schedule_tool_context() is None
+
+
+async def test_execution_guard_rejects_stale_turn_before_tool_handler() -> None:
+    calls = {"provider": 0, "handler": 0, "guard": 0}
+
+    class Provider(ChatProvider):
+        async def complete(self, **kwargs):
+            calls["provider"] += 1
+            return ModelResponse(
+                content=None,
+                tool_calls=(FunctionCall(id="c1", name="write", arguments={}),),
+                finish_reason="tool_calls",
+            )
+
+    async def handler() -> str:
+        calls["handler"] += 1
+        return "不应执行"
+
+    def assert_current() -> None:
+        calls["guard"] += 1
+        if calls["guard"] == 2:
+            raise RuntimeError("activity_version 已变化")
+
+    tools = ToolRegistry(
+        [
+            Tool(
+                name="write",
+                description="write",
+                parameters={"type": "object", "properties": {}},
+                handler=handler,
+            )
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="activity_version"):
+        await AgentRuntime(Provider(), tools).run(
+            TurnInput("feishu:chat-1", "执行"),
+            execution_assert_current=assert_current,
+        )
+
+    assert calls == {"provider": 1, "handler": 0, "guard": 2}
+
+
+async def test_execution_guard_rechecks_before_next_model_iteration() -> None:
+    stale = False
+    provider_calls = 0
+
+    class Provider(ChatProvider):
+        async def complete(self, **kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            return ModelResponse(
+                content=None,
+                tool_calls=(FunctionCall(id="c1", name="write", arguments={}),),
+                finish_reason="tool_calls",
+            )
+
+    async def handler() -> str:
+        nonlocal stale
+        stale = True
+        return "完成"
+
+    def assert_current() -> None:
+        if stale:
+            raise RuntimeError("activity_version 已变化")
+
+    tools = ToolRegistry(
+        [
+            Tool(
+                name="write",
+                description="write",
+                parameters={"type": "object", "properties": {}},
+                handler=handler,
+            )
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="activity_version"):
+        await AgentRuntime(Provider(), tools).run(
+            TurnInput("feishu:chat-1", "执行"),
+            execution_assert_current=assert_current,
+        )
+
+    assert provider_calls == 1
 
 
 async def test_runtime_traces_outer_phases_around_each_react_step() -> None:

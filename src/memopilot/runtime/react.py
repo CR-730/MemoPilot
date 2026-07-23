@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -98,6 +98,8 @@ class ReActEngine:
         request_text: str = "",
         tool_search_enabled: bool = False,
         preloaded_tools: Sequence[str] = (),
+        assert_current: Callable[[], None] | None = None,
+        excluded_tool_names: Iterable[str] = (),
     ) -> None:
         if max_iterations <= 0:
             raise ValueError("max_iterations 必须大于 0")
@@ -111,6 +113,8 @@ class ReActEngine:
         self._request_text = request_text
         self._tool_search_enabled = tool_search_enabled
         self._preloaded_tools = tuple(preloaded_tools)
+        self._assert_current = assert_current
+        self._excluded_tool_names = frozenset(excluded_tool_names)
 
     async def run(
         self,
@@ -126,10 +130,19 @@ class ReActEngine:
             visible_order.extend(
                 name
                 for name in self._preloaded_tools
-                if self._tools.has_tool(name) and name not in always_on
+                if self._tools.has_tool(name)
+                and name not in always_on
+                and name not in self._excluded_tool_names
             )
         else:
-            visible_order = list(self._tools.tool_names)
+            visible_order = [
+                name
+                for name in self._tools.tool_names
+                if name not in self._excluded_tool_names
+            ]
+        visible_order = [
+            name for name in visible_order if name not in self._excluded_tool_names
+        ]
         visible_tools = set(visible_order)
         safe_progress = _BestEffortProgress(progress) if progress is not None else None
 
@@ -156,6 +169,8 @@ class ReActEngine:
                     tool_chain=tuple(records),
                     exit_reason="early_stop",
                 )
+            if self._assert_current is not None:
+                self._assert_current()
             try:
                 schemas = self._tools.schemas(visible_order)
                 response = await self._complete(
@@ -255,6 +270,8 @@ class ReActEngine:
             for item in response.tool_calls
         )
         for batch_index, call in enumerate(response.tool_calls):
+            if self._assert_current is not None:
+                self._assert_current()
             if progress is not None:
                 await progress.on_tool_call_started(iteration, call)
             if self._event_bus is not None:
@@ -273,6 +290,7 @@ class ReActEngine:
                         "status": "started",
                     },
                 )
+            disallowed_tool = call.name in self._excluded_tool_names
             hidden_tool = (
                 self._tool_search_enabled
                 and self._tools.has_tool(call.name)
@@ -286,9 +304,13 @@ class ReActEngine:
                     else None
                 )
                 if isinstance(owner, ToolSearchTool):
-                    owner.set_excluded_names(set(visible_tools))
+                    owner.set_excluded_names(
+                        set(visible_tools) | set(self._excluded_tool_names)
+                    )
             blocked_reason = None
-            if hidden_tool:
+            if disallowed_tool:
+                blocked_reason = f"工具 {call.name} 不允许在当前后台任务中执行。"
+            elif hidden_tool:
                 blocked_reason = (
                     f"工具 {call.name} 尚未加载；请先调用 "
                     f'tool_search(query="select:{call.name}")。'
@@ -308,13 +330,20 @@ class ReActEngine:
                     tool_batch_index=batch_index,
                 ),
                 blocked_reason=blocked_reason,
+                blocked_error_type=(
+                    "tool_not_allowed" if disallowed_tool else "tool_not_loaded"
+                ),
             )
             if call.name == "tool_search" and observation.ok:
                 unlocked = ToolDiscoveryState().unlock_names_from_result(
                     str(observation.result)
                 )
                 for name in unlocked:
-                    if self._tools.has_tool(name) and name not in visible_tools:
+                    if (
+                        self._tools.has_tool(name)
+                        and name not in visible_tools
+                        and name not in self._excluded_tool_names
+                    ):
                         visible_tools.add(name)
                         visible_order.append(name)
             record = ToolCallRecord(

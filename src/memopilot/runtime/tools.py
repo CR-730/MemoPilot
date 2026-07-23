@@ -203,6 +203,22 @@ class ToolRegistry:
             self._search_backend.rebuild(previous_documents.values())
             raise
 
+    def register_existing(self, other: ToolRegistry, names: Iterable[str]) -> None:
+        """把共享注册表中的工具复制到临时注册表，不改变共享注册表。"""
+        for name in names:
+            tool = other.get_tool(name)
+            document = other.get_document(name)
+            if tool is None or document is None:
+                continue
+            self.register(
+                tool,
+                risk=document.risk,
+                always_on=document.always_on,
+                search_hint=document.search_hint,
+                source_type=document.source_type,
+                source_name=document.source_name,
+            )
+
     def unregister(self, tool_name: str) -> None:
         self._tools.pop(tool_name, None)
         self._metadata.pop(tool_name, None)
@@ -320,6 +336,7 @@ class ToolRegistry:
         *,
         request: ToolExecutionRequest | None = None,
         blocked_reason: str | None = None,
+        blocked_error_type: str = "tool_not_loaded",
     ) -> ToolObservation:
         execution_request = request or ToolExecutionRequest(
             call_id=call.id,
@@ -423,7 +440,7 @@ class ToolRegistry:
         if blocked_reason is not None:
             return self._failure(
                 call,
-                "tool_not_loaded",
+                blocked_error_type,
                 blocked_reason,
                 original_arguments=original_arguments,
                 final_arguments=final_arguments,

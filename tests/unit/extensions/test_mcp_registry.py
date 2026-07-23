@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from memopilot.extensions.mcp import McpServerConfig
+from memopilot.extensions.mcp import McpCallResult, McpInvocationError, McpServerConfig
 from memopilot.extensions.mcp_manage_tools import (
     build_mcp_management_tools,
     register_mcp_management_tools,
@@ -32,6 +32,7 @@ class FakeClient:
         self.tool_name = tool_name
         self.wait = wait
         self.closed = False
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def as_tools(self) -> tuple[Tool, ...]:
         if self.wait is not None:
@@ -55,6 +56,10 @@ class FakeClient:
     async def close(self) -> None:
         self.closed = True
 
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpCallResult:
+        self.calls.append((name, arguments))
+        return McpCallResult(structured={"name": name, "arguments": arguments})
+
 
 def _config(server_id: str, **overrides: Any) -> McpServerConfig:
     values: dict[str, Any] = {
@@ -64,6 +69,44 @@ def _config(server_id: str, **overrides: Any) -> McpServerConfig:
     }
     values.update(overrides)
     return McpServerConfig(**values)
+
+
+async def test_registry_exposes_controlled_caller_for_connected_server(
+    tmp_path: Path,
+) -> None:
+    clients: list[FakeClient] = []
+
+    def factory(config: McpServerConfig) -> FakeClient:
+        client = FakeClient(config)
+        clients.append(client)
+        return client
+
+    registry = McpServerRegistry(
+        tmp_path / "mcp.json", ToolRegistry(), client_factory=factory
+    )
+    await registry.add("feeds", ["python"], args=["feeds.py"])
+
+    result = await registry.caller("feeds").call_tool("fetch_events", {"limit": 10})
+
+    assert result.structured == {
+        "name": "fetch_events",
+        "arguments": {"limit": 10},
+    }
+    assert clients[0].calls == [("fetch_events", {"limit": 10})]
+
+
+async def test_registry_caller_reports_configured_but_unconnected_server(
+    tmp_path: Path,
+) -> None:
+    registry = McpServerRegistry(tmp_path / "mcp.json", ToolRegistry())
+    await registry.import_configs((_config("feeds"),))
+
+    assert registry.server_ids == ("feeds",)
+
+    with pytest.raises(McpInvocationError) as exc_info:
+        await registry.caller("feeds").call_tool("fetch_events", {})
+
+    assert exc_info.value.error_type == "mcp_unavailable"
 
 
 async def test_import_configs_is_offline_idempotent_and_keeps_existing_file(
