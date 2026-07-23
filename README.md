@@ -27,7 +27,7 @@
 |---|---|
 | Agent Runtime | 外层 Phase DAG + 内层 ReAct / Function Calling，每一步均可追踪 |
 | 分层记忆 | 短期消息、Markdown 长期记忆、SQLite + sqlite-vec 向量检索 |
-| 主动唤醒 | `alert / context / content` 事件流、Reservoir、可解释 Hazard、LLM 最终决策 |
+| 主动唤醒 | `Alert > Content > Context-fallback` 的统一 AgentTick、Reservoir 与 Drift |
 | 定时任务 | 支持 `at / after / every` 与 `instant / agent` 两种执行模式 |
 | 扩展机制 | Python 插件、PromptBlock、ToolHook、Skills 与 MCP stdio |
 | 任务协调 | Redis Streams P0–P3、会话租约、持久化 fencing epoch 与用户消息抢占 |
@@ -48,7 +48,7 @@ flowchart LR
     X --> T["Tools · Plugins · Skills · MCP"]
     X --> M[("分层记忆\nMarkdown · SQLite · Vector")]
     S["Scheduler"] --> O
-    W --> K[("wake.db\nReservoir · Hazard · ACK")]
+    W --> K[("proactive.db\nReservoir · Decision · ACK")]
     X --> F
 ```
 
@@ -119,6 +119,34 @@ cp .env.example .env
 对话模型与 Embedding Provider 独立配置。任何 API Key、飞书 Secret、用户数据、SQLite 数据库和上传文件都不会进入 Git。
 
 非敏感默认值位于 `config/default.yaml`，实际优先级为环境变量 > `.env` > YAML 默认值。启动核心服务前会一次性检查模型、Embedding、飞书 owner 白名单和 workspace 路径；已有向量库还会校验 Provider、模型与向量维度，避免静默混用不兼容向量。
+
+主动唤醒默认关闭。启用时，在 `workspace/proactive_sources.json` 中把已经配置的 stdio MCP Server 映射为主动信息源；密钥仍只写环境变量引用：
+
+```json
+{
+  "sources": [
+    {
+      "id": "personal-feed",
+      "server": "feed",
+      "channel": "content",
+      "get_tool": "fetch_events",
+      "ack_tool": "ack_event"
+    }
+  ]
+}
+```
+
+固定 Tick 先并行采集 Alert、Content 与 Context，形成一份静态快照，再交给同一个 AgentTick ReAct 按 `Alert > Content > Context-fallback` 决策：同 Tick 的 Alert 合并发送；无 Alert 时逐条判断最多 5 条 Content；Context 只作为背景，或在策略明确放行时充当末级兜底。正文会提前并发抓取，但模型默认只看到元数据，需要时再通过工具读取。被引用、感兴趣但未引用、明确丢弃的内容分别以 168、24、720 小时 ACK；发送前还会执行来源级与语义级去重。没有可推送内容且超过最短间隔时，Drift 会把一个 P3 后台任务排入队列，由模型从可用 Skills 中选择任务并通过 ReAct 执行。
+
+系统由三个可独立部署的常驻进程组成。App 只负责飞书入站，Scheduler 生成固定 Tick、用户定时任务和记忆维护 Job，Worker 按 P0–P3 优先级执行：
+
+```bash
+uv run memopilot app --config config.toml
+uv run memopilot scheduler --config config.toml
+uv run memopilot worker --config config.toml
+```
+
+`schedule` 工具支持 `at / after / every`；`instant` 到时直接发送固定文本，不调用模型，`agent` 到时重新运行 Agent。用户新消息会抢占正在执行的 Proactive/Drift；定时任务则原子延期并重新排队，避免为了及时回复而丢失任务。
 
 ## 仓库结构
 

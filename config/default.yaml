@@ -5,9 +5,10 @@ chat_base_url: https://api.deepseek.com
 chat_model: deepseek-v4-flash
 redis_url: redis://localhost:6379/0
 
-wake_tick_seconds: 300
-content_half_life_hours: 6
-proactive_cooldown_hours: 2
+proactive_enabled: false
+proactive_tick_seconds: 300
+drift_enabled: true
+drift_min_interval_hours: 3
 lease_ttl_seconds: 30
 lease_heartbeat_seconds: 10
 reclaim_idle_seconds: 60

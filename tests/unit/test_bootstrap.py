@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
 import pytest
 
 from memopilot.app.service import AppService
-from memopilot.bootstrap import build_app, build_effects, build_runtime_bundle, build_worker
+from memopilot.bootstrap import (
+    build_app,
+    build_effects,
+    build_runtime_bundle,
+    build_scheduler,
+    build_worker,
+)
 from memopilot.config import MemoPilotSettings
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.mcp import McpServerConfig
 from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse, ToolSchema
 from memopilot.runtime.engine import TurnInput
 from memopilot.runtime.tools import ToolRegistry
+from memopilot.scheduling.runner import SchedulerProcess, SystemScheduler
 from memopilot.worker.service import WorkerService
 
 FAKE_MCP_SERVER = Path(__file__).parents[1] / "fixtures" / "fake_mcp_server.py"
@@ -138,12 +146,95 @@ async def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(
 
     tool_names = {schema["function"]["name"] for schema in bundle.tools.schemas()}
     assert "recall_memory" in tool_names
+    assert {"schedule", "list_schedules", "cancel_schedule"} <= tool_names
     assert bundle.runtime is not None
     assert bundle.executor is not None
+    assert bundle.executor._system_jobs is not None
     assert bundle.memory_jobs.repository is bundle.repository
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
+    assert "主动推送" in (settings.workspace / "PROACTIVE_CONTEXT.md").read_text(
+        encoding="utf-8"
+    )
     await bundle.close_extensions()
+
+
+async def test_proactive_source_can_reference_server_from_manual_mcp_json(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "mcp_servers.json").write_text(
+        json.dumps(
+            {"servers": {"feeds": {"command": ["python"], "args": ["server.py"]}}}
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "proactive_sources.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "id": "news",
+                        "server": "feeds",
+                        "channel": "content",
+                        "get_tool": "fetch_events",
+                        "ack_tool": "ack_event",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = MemoPilotSettings(
+        workspace=workspace,
+        embedding_base_url="https://embedding.example/v1",
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        _env_file=None,
+    )
+
+    bundle = await build_runtime_bundle(
+        settings,
+        chat_provider=_ChatProvider(),  # type: ignore[arg-type]
+        embedder=_Embedder(),  # type: ignore[arg-type]
+    )
+
+    assert bundle.mcp_registry.server_ids == ("feeds",)
+    await bundle.close_extensions()
+
+
+async def test_runtime_rejects_proactive_source_with_truly_missing_mcp_server(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "proactive_sources.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "id": "news",
+                        "server": "missing",
+                        "channel": "content",
+                        "get_tool": "fetch_events",
+                        "ack_tool": "ack_event",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = MemoPilotSettings(
+        workspace=tmp_path,
+        embedding_base_url="https://embedding.example/v1",
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        _env_file=None,
+    )
+
+    with pytest.raises(ValueError, match="missing"):
+        await build_runtime_bundle(
+            settings,
+            chat_provider=_ChatProvider(),  # type: ignore[arg-type]
+            embedder=_Embedder(),  # type: ignore[arg-type]
+        )
 
 
 async def test_runtime_bundle_wires_plugin_tools_and_hooks(tmp_path: Path) -> None:
@@ -285,6 +376,8 @@ async def test_builds_separate_app_and_worker_without_starting_scheduler(
         schema["function"]["name"] for schema in worker.runtime.tools.schemas()
     }
     assert worker.runtime.memory_jobs.repository is worker.runtime.repository
+    assert worker.runtime.executor._system_jobs is not None
+    assert worker.runtime.executor._system_jobs.proactive_handler is not None
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
     assert not hasattr(app, "scheduler")
@@ -305,6 +398,19 @@ async def test_effects_process_does_not_require_model_credentials(tmp_path: Path
 
     assert effects.service is not None
     await effects.close()
+
+
+async def test_scheduler_builds_system_tick_and_outbox_process_without_model_credentials(
+    tmp_path: Path,
+) -> None:
+    settings = MemoPilotSettings(workspace=tmp_path / "workspace", _env_file=None)
+
+    bundle = build_scheduler(settings)
+
+    assert isinstance(bundle.service, SchedulerProcess)
+    assert isinstance(bundle.service.scheduler, SystemScheduler)
+    assert bundle.service.scheduler.proactive_tick_seconds == 300
+    await bundle.close()
 
 
 async def test_worker_starts_local_mcp_tools_without_blocking_core_runtime(

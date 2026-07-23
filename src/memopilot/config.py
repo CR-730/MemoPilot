@@ -66,9 +66,10 @@ class MemoPilotSettings(BaseSettings):
     feishu_enabled: bool = True
     feishu_receive_mode: str = "ws"
 
-    wake_tick_seconds: int = Field(default=300, gt=0)
-    content_half_life_hours: float = Field(default=6, gt=0)
-    proactive_cooldown_hours: float = Field(default=2, ge=0)
+    proactive_enabled: bool = False
+    proactive_tick_seconds: int = Field(default=300, ge=300, le=300)
+    drift_enabled: bool = True
+    drift_min_interval_hours: float = Field(default=3, ge=0)
     lease_ttl_seconds: int = Field(default=30, gt=0)
     lease_heartbeat_seconds: int = Field(default=10, gt=0)
     reclaim_idle_seconds: int = Field(default=60, gt=0)
@@ -168,6 +169,12 @@ class MemoPilotSettings(BaseSettings):
         return self
 
     @property
+    def proactive_diagnostics(self) -> tuple[str, ...]:
+        if self.proactive_enabled and not (self.workspace / "proactive_sources.json").exists():
+            return ("主动唤醒已启用但未配置 Proactive Source；当前只可运行纯 Drift。",)
+        return ()
+
+    @property
     def operational_database(self) -> Path:
         return self.data_dir / "operational.db"
 
@@ -176,8 +183,8 @@ class MemoPilotSettings(BaseSettings):
         return self.data_dir / "memory2.db"
 
     @property
-    def wake_database(self) -> Path:
-        return self.data_dir / "wake.db"
+    def proactive_database(self) -> Path:
+        return self.data_dir / "proactive.db"
 
     def validate_runtime_ready(self) -> None:
         """聚合报告启动核心链路缺少的配置。"""
@@ -258,6 +265,7 @@ def load_settings(
     feishu = _as_dict(channels.get("feishu"))
     redis = _as_dict(data.get("redis"))
     raw_mcp = _as_dict(raw_data.get("mcp"))
+    proactive = _as_dict(data.get("proactive"))
     values: dict[str, Any] = {}
     explicit_fields = (
         (main, "model", "chat_model"),
@@ -288,6 +296,10 @@ def load_settings(
             "optimizer_interval_seconds",
             "memory_optimizer_interval_seconds",
         ),
+        (proactive, "enabled", "proactive_enabled"),
+        (proactive, "tick_seconds", "proactive_tick_seconds"),
+        (proactive, "drift_enabled", "drift_enabled"),
+        (proactive, "drift_min_interval_hours", "drift_min_interval_hours"),
     )
     for source, source_key, field_name in explicit_fields:
         if source_key in source:

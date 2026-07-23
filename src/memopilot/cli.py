@@ -1,4 +1,4 @@
-"""MemoPilot 阶段 3 本地进程与 Effect 操作命令。"""
+"""MemoPilot 三进程入口与 Effect 人工核对命令。"""
 
 from __future__ import annotations
 
@@ -55,8 +55,11 @@ async def _run(args: argparse.Namespace) -> None:
         return
     if args.command == "scheduler":
         scheduler_bundle = build_scheduler(settings)
-        logger.info("MemoPilot Scheduler 已启动：周期性维护任务生产")
-        await scheduler_bundle.service.run_forever()
+        try:
+            logger.info("MemoPilot Scheduler 已启动：主动唤醒、定时任务与周期维护")
+            await scheduler_bundle.service.run_forever()
+        finally:
+            await scheduler_bundle.close()
         return
     effect_bundle = build_effects(settings)
     try:

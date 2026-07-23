@@ -14,9 +14,10 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
 
     assert settings.chat_base_url == "https://api.deepseek.com"
     assert settings.chat_model == "deepseek-v4-flash"
-    assert settings.wake_tick_seconds == 300
-    assert settings.content_half_life_hours == 6
-    assert settings.proactive_cooldown_hours == 2
+    assert settings.proactive_tick_seconds == 300
+    assert settings.proactive_enabled is False
+    assert settings.drift_enabled is True
+    assert settings.drift_min_interval_hours == 3
     assert settings.lease_ttl_seconds == 30
     assert settings.lease_heartbeat_seconds == 10
     assert settings.reclaim_idle_seconds == 60
@@ -55,20 +56,20 @@ def test_environment_overrides_dotenv_and_yaml(
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "default.yaml").write_text(
-        "wake_tick_seconds: 900\nredis_url: redis://yaml:6379/0\n",
+        "proactive_tick_seconds: 900\nredis_url: redis://yaml:6379/0\n",
         encoding="utf-8",
     )
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "MEMOPILOT_WAKE_TICK_SECONDS=600\nMEMOPILOT_REDIS_URL=redis://dotenv:6379/0\n",
+        "MEMOPILOT_PROACTIVE_TICK_SECONDS=600\nMEMOPILOT_REDIS_URL=redis://dotenv:6379/0\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("MEMOPILOT_WAKE_TICK_SECONDS", "300")
+    monkeypatch.setenv("MEMOPILOT_PROACTIVE_TICK_SECONDS", "300")
 
     settings = MemoPilotSettings(_env_file=env_file)
 
-    assert settings.wake_tick_seconds == 300
+    assert settings.proactive_tick_seconds == 300
     assert settings.redis_url == "redis://dotenv:6379/0"
 
 
@@ -92,7 +93,7 @@ def test_workspace_paths_are_resolved_inside_workspace(tmp_path: Path) -> None:
     assert settings.workspace == workspace.resolve()
     assert settings.operational_database == workspace.resolve() / "data" / "operational.db"
     assert settings.memory_database == workspace.resolve() / "data" / "memory2.db"
-    assert settings.wake_database == workspace.resolve() / "data" / "wake.db"
+    assert settings.proactive_database == workspace.resolve() / "data" / "proactive.db"
 
 
 def test_path_outside_workspace_is_rejected(tmp_path: Path) -> None:
@@ -296,3 +297,67 @@ def test_toml_loader_does_not_shadow_env_for_omitted_memory_values(
 
     assert settings.memory_optimizer_enabled is False
     assert settings.memory_optimizer_interval_seconds == 3600
+
+
+def test_toml_loader_parses_proactive_settings(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        """
+[[mcp.servers]]
+server_id = "feeds"
+command = ["python"]
+args = ["feeds.py"]
+
+[proactive]
+enabled = true
+tick_seconds = 300
+drift_enabled = false
+drift_min_interval_hours = 4
+
+""",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config, workspace=tmp_path / "workspace")
+
+    assert settings.proactive_enabled is True
+    assert settings.proactive_tick_seconds == 300
+    assert settings.drift_enabled is False
+    assert settings.drift_min_interval_hours == 4
+def test_proactive_enabled_without_sources_supports_drift_with_diagnostic(tmp_path: Path) -> None:
+    settings = MemoPilotSettings(
+        workspace=tmp_path,
+        proactive_enabled=True,
+        _env_file=None,
+    )
+
+    assert settings.proactive_diagnostics == (
+        "主动唤醒已启用但未配置 Proactive Source；当前只可运行纯 Drift。",
+    )
+
+
+def test_fixed_proactive_tick_rejects_environment_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MEMOPILOT_PROACTIVE_TICK_SECONDS", "600")
+    config = tmp_path / "config.toml"
+    config.write_text("[proactive]\nenabled = true\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="300"):
+        load_settings(config, workspace=tmp_path / "workspace")
+
+
+def test_toml_mcp_server_rejects_literal_environment_secret(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        """
+[[mcp.servers]]
+server_id = "feeds"
+command = ["python"]
+env = { TOKEN = "literal-secret" }
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"\$\{ENV_NAME\}"):
+        load_settings(config, workspace=tmp_path / "workspace")
