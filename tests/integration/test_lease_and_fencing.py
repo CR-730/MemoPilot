@@ -103,6 +103,39 @@ async def test_stale_worker_cannot_renew_release_or_write_after_takeover(
 
 
 @pytest.mark.asyncio
+async def test_combined_guard_rejects_changed_session_activity(
+    tmp_path: Path,
+    redis_client: Redis,
+) -> None:
+    repository, _ = make_repository(tmp_path)
+    leases = SessionLeaseManager(redis_client, repository, ttl=timedelta(seconds=30))
+    lease = await leases.acquire("feishu:chat-1", owner_id="worker-a", now=NOW)
+    assert lease is not None
+
+    repository.assert_current_fence_and_activity(
+        lease,
+        expected_activity_version=1,
+    )
+    repository.accept_inbound(
+        InboundCommand(
+            event_id="event-2",
+            message_id="message-2",
+            session_key="feishu:chat-1",
+            channel="feishu",
+            chat_id="chat-1",
+            payload={"text": "新消息"},
+            received_at=NOW + timedelta(seconds=1),
+        )
+    )
+
+    with pytest.raises(LostLeaseError, match="activity_version"):
+        repository.assert_current_fence_and_activity(
+            lease,
+            expected_activity_version=1,
+        )
+
+
+@pytest.mark.asyncio
 async def test_duplicate_delivery_reuses_run_and_recovery_creates_new_attempt(
     tmp_path: Path,
     redis_client: Redis,

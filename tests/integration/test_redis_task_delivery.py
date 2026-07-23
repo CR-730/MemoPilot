@@ -174,7 +174,7 @@ async def test_consumer_reads_highest_available_priority_first(redis_client: Red
     queue = RedisTaskQueue(redis_client)
     await queue.ensure_consumer_groups()
     await queue.publish(PublishedJob("job-p3", "drift.run", 3, "feishu:chat", "{}"))
-    await queue.publish(PublishedJob("job-p2", "wake.tick", 2, "feishu:chat", "{}"))
+    await queue.publish(PublishedJob("job-p2", "proactive.tick", 2, "feishu:chat", "{}"))
     await queue.publish(PublishedJob("job-p1", "schedule.run", 1, "feishu:chat", "{}"))
     await queue.publish(PublishedJob("job-p0", "agent.turn", 0, "feishu:chat", "{}"))
 

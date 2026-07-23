@@ -111,6 +111,7 @@ class FinalResponseDispatcher:
         claim: RunClaim,
         lease: FenceToken,
         text: str,
+        operation_id: str | None = None,
     ) -> DeliveryResult:
         job = self._operational.get_job(claim.job_id)
         if job is None:
@@ -123,7 +124,7 @@ class FinalResponseDispatcher:
         cancel_on_activity = job.kind != "agent.turn"
         effect = self._effects.create(
             EffectRequest(
-                operation_id=f"{claim.run_id}:final-text",
+                operation_id=operation_id or f"{claim.run_id}:final-text",
                 run_id=claim.run_id,
                 session_key=claim.session_key,
                 channel="feishu",

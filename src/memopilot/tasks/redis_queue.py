@@ -122,6 +122,13 @@ class RedisTaskQueue:
             pipeline.srem(self.queued_job_ids_key, message.job_id)
             await pipeline.execute()
 
+    async def acknowledge_requeued(self, message: QueueMessage) -> None:
+        """移除当前投递，但保留同业务 Job 的 Redis 镜像标记。"""
+        async with self.redis.pipeline(transaction=True) as pipeline:
+            pipeline.xack(message.stream, self.group, message.message_id)
+            pipeline.xdel(message.stream, message.message_id)
+            await pipeline.execute()
+
     async def missing_mirrors(self, job_ids: tuple[str, ...]) -> tuple[str, ...]:
         if not job_ids:
             return ()

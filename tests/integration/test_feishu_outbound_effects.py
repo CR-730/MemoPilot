@@ -12,7 +12,7 @@ import pytest
 
 from memopilot.channels.contracts import SendReceipt
 from memopilot.channels.feishu import FeishuApiError
-from memopilot.delivery.effects import EffectRepository, EffectTransition
+from memopilot.delivery.effects import EffectRepository, EffectRequest, EffectTransition
 from memopilot.delivery.feishu import FinalResponseDispatcher
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
 from memopilot.runtime.contracts import ChatMessage, ModelResponse, StreamDelta, ToolSchema
@@ -95,6 +95,86 @@ async def test_job_succeeds_only_after_feishu_confirms_message(tmp_path: Path) -
         "完整回复",
         provider_uuid=effect.provider_uuid,
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_can_reuse_proactive_decision_operation_id(tmp_path: Path) -> None:
+    repository, effects, lease, claim = _claimed(tmp_path)
+    transport = AsyncMock()
+    transport.send.return_value = SendReceipt(message_id="om_proactive")
+    dispatcher = FinalResponseDispatcher(repository, effects, transport, clock=lambda: NOW)
+
+    result = await dispatcher.dispatch(
+        claim=claim,
+        lease=lease,
+        text="主动消息",
+        operation_id="proactive-effect-stable",
+    )
+
+    assert result.effect.operation_id == "proactive-effect-stable"
+    assert effects.get("proactive-effect-stable") is not None
+
+
+def test_pending_effect_can_move_from_failed_run_before_remote_request(tmp_path: Path) -> None:
+    repository, effects, old_lease, old_claim = _claimed(tmp_path)
+    old_job = repository.get_job(old_claim.job_id)
+    assert old_job is not None
+    effects.create(
+        EffectRequest(
+            operation_id="proactive-effect-pending",
+            run_id=old_claim.run_id,
+            session_key=old_claim.session_key,
+            channel="feishu",
+            chat_id="chat-1",
+            text="主动提醒",
+            expected_activity_version=old_job.activity_version,
+            lease=old_lease,
+            now=NOW,
+        )
+    )
+    repository.finish_job(old_claim.run_id, lease=old_lease, outcome="failed", now=NOW)
+    accepted = repository.accept_inbound(
+        InboundCommand(
+            event_id="event-2",
+            message_id="message-2",
+            session_key="feishu:chat-1",
+            channel="feishu",
+            chat_id="chat-1",
+            payload={"text": "继续", "chat_id": "chat-1"},
+            received_at=NOW + timedelta(seconds=1),
+        )
+    )
+    epoch = repository.allocate_fence(
+        "feishu:chat-1", owner_id="worker-b", now=NOW + timedelta(seconds=1)
+    )
+    new_lease = SessionLease(
+        session_key="feishu:chat-1",
+        owner_id="worker-b",
+        epoch=epoch,
+        redis_key="lease",
+        redis_value=f"worker-b|epoch|{epoch}",
+    )
+    new_claim = repository.claim_job(
+        accepted.job_id,
+        lease=new_lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert new_claim is not None
+    new_job = repository.get_job(new_claim.job_id)
+    assert new_job is not None
+
+    adopted = effects.adopt_pending(
+        "proactive-effect-pending",
+        run_id=new_claim.run_id,
+        expected_activity_version=new_job.activity_version,
+        lease=new_lease,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    effect = effects.get("proactive-effect-pending")
+    assert adopted is True
+    assert effect is not None and effect.run_id == new_claim.run_id
+    assert effect.first_requested_at is None
 
 
 @pytest.mark.asyncio

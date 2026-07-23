@@ -231,6 +231,82 @@ class EffectRepository:
         finally:
             connection.close()
 
+    def adopt_pending(
+        self,
+        operation_id: str,
+        *,
+        run_id: str,
+        expected_activity_version: int,
+        lease: FenceToken,
+        now: datetime,
+    ) -> bool:
+        """接管确定尚未发起远端请求、且原 Run 已失败的 Effect。"""
+        now_text = _utc_iso(now)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_current_run(connection, run_id, lease)
+            row = connection.execute(
+                """
+                SELECT e.run_id, e.session_key, e.state, e.first_requested_at,
+                       e.cancel_on_activity, r.state AS old_run_state
+                FROM outbound_effects AS e
+                JOIN runs AS r ON r.run_id = e.run_id
+                WHERE e.operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(operation_id)
+            if str(row["run_id"]) == run_id:
+                connection.execute("COMMIT")
+                return True
+            safe = (
+                str(row["session_key"]) == lease.session_key
+                and str(row["state"]) == "pending"
+                and row["first_requested_at"] is None
+                and str(row["old_run_state"]) in {"failed", "cancelled"}
+            )
+            if not safe:
+                connection.execute("COMMIT")
+                return False
+            if bool(row["cancel_on_activity"]):
+                activity = connection.execute(
+                    "SELECT activity_version FROM session_activity WHERE session_key = ?",
+                    (lease.session_key,),
+                ).fetchone()
+                if (
+                    activity is None
+                    or int(activity["activity_version"]) != expected_activity_version
+                ):
+                    connection.execute("COMMIT")
+                    return False
+            changed = connection.execute(
+                """
+                UPDATE outbound_effects
+                SET run_id = ?, expected_activity_version = ?, owner_id = ?,
+                    fencing_epoch = ?, updated_at = ?
+                WHERE operation_id = ? AND state = 'pending'
+                  AND first_requested_at IS NULL
+                """,
+                (
+                    run_id,
+                    expected_activity_version,
+                    lease.owner_id,
+                    lease.epoch,
+                    now_text,
+                    operation_id,
+                ),
+            ).rowcount
+            connection.execute("COMMIT")
+            return changed == 1
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
     def mark_confirmed(
         self,
         operation_id: str,

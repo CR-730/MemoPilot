@@ -11,7 +11,11 @@ from datetime import UTC, datetime, timedelta
 from memopilot.runtime.contracts import ChatMessage
 from memopilot.runtime.engine import TurnInput
 from memopilot.runtime.interrupts import render_resumed_message
-from memopilot.runtime.worker import RuntimeJobExecutor, TurnInterrupted
+from memopilot.runtime.worker import (
+    RuntimeJobExecutor,
+    ScheduleJobRequeued,
+    TurnInterrupted,
+)
 from memopilot.tasks.interrupts import InterruptSignalPort
 from memopilot.tasks.lease import SessionLease, SessionLeaseManager
 from memopilot.tasks.operational import LostLeaseError, OperationalRepository, RunClaim
@@ -124,10 +128,13 @@ class WorkerService:
                 return True
             turn = self._turn_input(message, claim)
             try:
-                await self._execute_with_heartbeat(claim, lease, turn)
+                requeued = await self._execute_with_heartbeat(claim, lease, turn)
             except Exception:
                 await self._ack_if_terminal(message)
                 raise
+            if requeued:
+                await self._queue.acknowledge_requeued(message)
+                return True
             await self._ack_if_terminal(message)
             return True
         finally:
@@ -162,7 +169,36 @@ class WorkerService:
         claim: RunClaim,
         lease: SessionLease,
         turn: TurnInput,
-    ) -> None:
+    ) -> bool:
+        job = self._repository.get_job(claim.job_id)
+        if job is None:
+            raise KeyError(claim.job_id)
+        preemptible_kind = job.kind if job.kind in {
+            "proactive.tick",
+            "schedule.run",
+            "drift.run",
+        } else None
+        interrupt_pending = await self._interrupt_is_pending(claim.run_id)
+        if preemptible_kind is not None and not interrupt_pending:
+            current_activity = self._repository.get_activity_version(claim.session_key)
+            if (
+                current_activity is not None
+                and current_activity != job.activity_version
+            ):
+                if preemptible_kind == "schedule.run":
+                    outcome = self._repository.requeue_preempted_schedule(
+                        claim.run_id,
+                        lease=lease,
+                        now=self._clock(),
+                    )
+                    return outcome == "requeued"
+                self._repository.finish_job(
+                    claim.run_id,
+                    lease=lease,
+                    outcome="cancelled",
+                    now=self._clock(),
+                )
+                return False
         execution = asyncio.create_task(
             self._executor.execute(
                 claim=claim,
@@ -183,15 +219,12 @@ class WorkerService:
                     timeout=timeout,
                 )
                 if done:
-                    await execution
-                    return
-                redis_pending = False
-                if self._interrupt_signal is not None:
                     try:
-                        redis_pending = await self._interrupt_signal.pending(claim.run_id)
-                    except Exception:
-                        redis_pending = False
-                if redis_pending or self._repository.has_pending_interrupt(claim.run_id):
+                        await execution
+                    except ScheduleJobRequeued:
+                        return True
+                    return False
+                if await self._interrupt_is_pending(claim.run_id):
                     execution.cancel()
                     try:
                         await execution
@@ -202,7 +235,31 @@ class WorkerService:
                             await self._interrupt_signal.clear(claim.run_id)
                         except Exception:
                             pass
-                    return
+                    return False
+                if preemptible_kind is not None:
+                    current_activity = self._repository.get_activity_version(
+                        claim.session_key
+                    )
+                    if (
+                        current_activity is not None
+                        and current_activity != job.activity_version
+                    ):
+                        execution.cancel()
+                        await asyncio.gather(execution, return_exceptions=True)
+                        if preemptible_kind == "schedule.run":
+                            outcome = self._repository.requeue_preempted_schedule(
+                                claim.run_id,
+                                lease=lease,
+                                now=self._clock(),
+                            )
+                            return outcome == "requeued"
+                        self._repository.finish_job(
+                            claim.run_id,
+                            lease=lease,
+                            outcome="cancelled",
+                            now=self._clock(),
+                        )
+                        return False
                 if self._monotonic() < next_heartbeat:
                     continue
                 if not await self._leases.renew(lease, now=self._clock()):
@@ -221,12 +278,31 @@ class WorkerService:
                 await asyncio.gather(execution, return_exceptions=True)
             raise
 
+    async def _interrupt_is_pending(self, run_id: str) -> bool:
+        redis_pending = False
+        if self._interrupt_signal is not None:
+            try:
+                redis_pending = await self._interrupt_signal.pending(run_id)
+            except Exception:
+                redis_pending = False
+        return redis_pending or self._repository.has_pending_interrupt(run_id)
+
     def _turn_input(self, message: QueueMessage, claim: RunClaim) -> TurnInput:
         job = self._repository.get_job(message.job_id)
         if job is None:
             raise KeyError(message.job_id)
-        if job.kind.startswith("memory."):
-            return TurnInput(session_key=claim.session_key, content="")
+        created_at = datetime.fromisoformat(job.created_at)
+        if job.kind.startswith("memory.") or job.kind in {
+            "proactive.tick",
+            "schedule.run",
+            "drift.run",
+        }:
+            return TurnInput(
+                session_key=claim.session_key,
+                content="",
+                prompt_scope="system",
+                received_at=created_at,
+            )
         payload = json.loads(job.payload_json)
         content = str(payload.get("text") or "")
         records = self._repository.list_recent_messages(
@@ -253,6 +329,7 @@ class WorkerService:
                 history=tuple(history),
                 current_user_content=content,
                 interrupt_original_message=content,
+                received_at=created_at,
             )
         return TurnInput(
             session_key=claim.session_key,
@@ -261,6 +338,7 @@ class WorkerService:
             current_user_content=content,
             resume_snapshot_id=snapshot.snapshot_id,
             interrupt_original_message=snapshot.original_message,
+            received_at=created_at,
         )
 
     async def _ack_if_terminal(self, message: QueueMessage) -> None:

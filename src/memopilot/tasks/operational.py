@@ -25,6 +25,10 @@ class PendingInterruptError(RuntimeError):
     """Run 收尾事务检测到尚未处理的定向中断。"""
 
 
+class MultiplePrivateSessionsError(RuntimeError):
+    """单用户版本检测到多个飞书私聊目标。"""
+
+
 class FenceToken(Protocol):
     @property
     def session_key(self) -> str: ...
@@ -97,6 +101,14 @@ class SessionIdentityRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class PrivateSessionTarget:
+    session_key: str
+    channel: str
+    chat_id: str
+    activity_version: int
+
+
+@dataclass(frozen=True, slots=True)
 class JobRecord:
     job_id: str
     kind: str
@@ -105,6 +117,7 @@ class JobRecord:
     state: str
     activity_version: int
     payload_json: str
+    created_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +200,102 @@ class OperationalRepository:
     def __init__(self, database: Path, *, busy_timeout_seconds: float = 5) -> None:
         self.database = Path(database)
         self.busy_timeout_seconds = busy_timeout_seconds
+
+    def enqueue_system_job(
+        self,
+        *,
+        kind: str,
+        priority: int,
+        session_key: str,
+        idempotency_key: str,
+        activity_version: int,
+        payload: Mapping[str, object],
+        now: datetime,
+        failpoint: Failpoint | None = None,
+    ) -> EnqueueResult:
+        """幂等且原子地创建系统 Job 与待发布 Outbox。"""
+        if not kind.strip():
+            raise ValueError("系统 Job kind 不能为空")
+        if priority not in range(4):
+            raise ValueError("系统 Job priority 必须在 0 到 3 之间")
+        if not idempotency_key.strip():
+            raise ValueError("系统 Job idempotency_key 不能为空")
+        if activity_version < 0:
+            raise ValueError("activity_version 不能为负数")
+        now_text = _utc_iso(now)
+        job_id = _stable_id("job", f"system:{idempotency_key}")
+        outbox_id = _stable_id("outbox", job_id)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = connection.execute(
+                "SELECT job_id, activity_version FROM agent_jobs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                existing_job_id = str(existing["job_id"])
+                outbox = connection.execute(
+                    "SELECT outbox_id FROM outbox_events "
+                    "WHERE aggregate_id = ? AND event_type = 'agent.job.queued'",
+                    (existing_job_id,),
+                ).fetchone()
+                if outbox is None:
+                    raise RuntimeError("幂等系统 Job 缺少对应 Outbox")
+                connection.execute("COMMIT")
+                return EnqueueResult(
+                    existing_job_id,
+                    str(outbox["outbox_id"]),
+                    int(existing["activity_version"]),
+                    False,
+                )
+            self._insert_queued_job_with_outbox(
+                connection,
+                job_id=job_id,
+                kind=kind,
+                priority=priority,
+                session_key=session_key,
+                idempotency_key=idempotency_key,
+                activity_version=activity_version,
+                payload=payload,
+                now_text=now_text,
+            )
+            if failpoint is not None:
+                failpoint("before_commit")
+            connection.execute("COMMIT")
+            return EnqueueResult(job_id, outbox_id, activity_version, True)
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def get_single_private_session(self) -> PrivateSessionTarget | None:
+        """返回唯一飞书私聊目标；多目标时拒绝隐式共享 Source 状态。"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT sessions.session_key, sessions.channel, sessions.chat_id,
+                       COALESCE(session_activity.activity_version, 0) AS activity_version
+                FROM sessions
+                LEFT JOIN session_activity USING(session_key)
+                WHERE sessions.channel = 'feishu'
+                ORDER BY sessions.created_at, sessions.session_key
+                """
+            ).fetchall()
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise MultiplePrivateSessionsError(
+                "MemoPilot 当前只支持一个飞书私聊，检测到多个会话目标"
+            )
+        row = rows[0]
+        return PrivateSessionTarget(
+            session_key=str(row["session_key"]),
+            channel=str(row["channel"]),
+            chat_id=str(row["chat_id"]),
+            activity_version=int(row["activity_version"]),
+        )
 
     def accept_inbound(
         self,
@@ -497,7 +606,7 @@ class OperationalRepository:
             row = connection.execute(
                 """
                 SELECT job_id, kind, priority, session_key, state,
-                       activity_version, payload_json
+                       activity_version, payload_json, created_at
                 FROM agent_jobs WHERE job_id = ?
                 """,
                 (job_id,),
@@ -512,7 +621,225 @@ class OperationalRepository:
             state=str(row["state"]),
             activity_version=int(row["activity_version"]),
             payload_json=str(row["payload_json"]),
+            created_at=str(row["created_at"]),
         )
+
+    def transition_scheduled_execution(
+        self,
+        execution_id: str,
+        *,
+        job_id: str,
+        lease: FenceToken,
+        outcome: str,
+        now: datetime,
+    ) -> str:
+        """在当前 fencing token 下推进定时执行状态。"""
+        allowed = {
+            "running",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "needs_review",
+        }
+        if outcome not in allowed:
+            raise ValueError(f"不支持的定时执行状态: {outcome}")
+        now_text = _utc_iso(now)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.require_current_fence(connection, lease)
+            row = connection.execute(
+                """
+                SELECT scheduled_executions.state
+                FROM scheduled_executions
+                JOIN agent_jobs ON agent_jobs.job_id = scheduled_executions.job_id
+                WHERE scheduled_executions.execution_id = ?
+                  AND scheduled_executions.job_id = ?
+                  AND agent_jobs.session_key = ?
+                """,
+                (execution_id, job_id, lease.session_key),
+            ).fetchone()
+            if row is None:
+                raise KeyError(execution_id)
+            current = str(row["state"])
+            terminal = {"succeeded", "failed", "cancelled", "needs_review"}
+            if current in terminal:
+                if outcome == "running" or current == outcome:
+                    connection.execute("COMMIT")
+                    return current
+                raise RuntimeError(
+                    f"定时执行 {execution_id} 已终结为 {current}，不能改为 {outcome}"
+                )
+            if current not in {"queued", "running"}:
+                raise RuntimeError(f"定时执行 {execution_id} 当前状态不可推进: {current}")
+            connection.execute(
+                "UPDATE scheduled_executions SET state = ?, updated_at = ? "
+                "WHERE execution_id = ?",
+                (outcome, now_text, execution_id),
+            )
+            connection.execute("COMMIT")
+            return outcome
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def requeue_preempted_schedule(
+        self,
+        run_id: str,
+        *,
+        lease: FenceToken,
+        now: datetime,
+    ) -> Literal["requeued", "succeeded", "needs_review"]:
+        """P0 抢占 P1 后，按副作用事实原子延期或收敛当前 Schedule Job。"""
+        now_text = _utc_iso(now)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.require_current_fence(connection, lease)
+            row = connection.execute(
+                """
+                SELECT r.job_id, j.kind, j.priority, j.payload_json,
+                       j.activity_version AS expected_activity_version,
+                       a.activity_version AS current_activity_version,
+                       ra.attempt_no
+                FROM runs AS r
+                JOIN agent_jobs AS j ON j.job_id = r.job_id
+                JOIN session_activity AS a ON a.session_key = j.session_key
+                JOIN run_attempts AS ra ON ra.run_id = r.run_id
+                  AND ra.finished_at IS NULL
+                WHERE r.run_id = ? AND r.state = 'running' AND j.state = 'running'
+                  AND r.owner_id = ? AND r.fencing_epoch = ?
+                  AND j.session_key = ?
+                """,
+                (run_id, lease.owner_id, lease.epoch, lease.session_key),
+            ).fetchone()
+            if row is None:
+                raise LostLeaseError("Schedule Run 已不属于当前 lease")
+            if str(row["kind"]) != "schedule.run":
+                raise ValueError("只有 schedule.run 可以在 P0 抢占后延期")
+            current_activity = int(row["current_activity_version"])
+            if current_activity == int(row["expected_activity_version"]):
+                raise RuntimeError("会话活动版本未变化，不能执行抢占延期")
+            effect = connection.execute(
+                """
+                SELECT state FROM outbound_effects
+                WHERE run_id = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            effect_state = None if effect is None else str(effect["state"])
+            job_id = str(row["job_id"])
+            if effect_state == "confirmed":
+                target: Literal["succeeded", "needs_review"] = "succeeded"
+            elif effect_state in {"sending", "unknown", "needs_review"}:
+                target = "needs_review"
+            else:
+                target = "needs_review"
+                execution = connection.execute(
+                    "SELECT execution_id FROM scheduled_executions WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if execution is None:
+                    raise RuntimeError("schedule.run 缺少 scheduled_execution")
+                if effect_state in {"pending", "cancelled"}:
+                    connection.execute(
+                        "DELETE FROM outbound_effects WHERE run_id = ? AND state IN "
+                        "('pending', 'cancelled')",
+                        (run_id,),
+                    )
+                connection.execute(
+                    "UPDATE scheduled_executions SET state = 'queued', updated_at = ? "
+                    "WHERE execution_id = ? AND state IN ('running', 'cancelled')",
+                    (now_text, execution["execution_id"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE agent_jobs
+                    SET state = 'queued', activity_version = ?, heartbeat_at = NULL,
+                        updated_at = ?, finished_at = NULL
+                    WHERE job_id = ? AND state = 'running'
+                    """,
+                    (current_activity, now_text, job_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET state = 'recovering', owner_id = NULL, fencing_epoch = NULL,
+                        heartbeat_at = NULL, finished_at = NULL, updated_at = ?
+                    WHERE run_id = ? AND state = 'running'
+                    """,
+                    (now_text, run_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE run_attempts
+                    SET outcome = 'cancelled', heartbeat_at = ?, finished_at = ?
+                    WHERE run_id = ? AND finished_at IS NULL
+                    """,
+                    (now_text, now_text, run_id),
+                )
+                identity = (
+                    f"preempt:{run_id}:{int(row['attempt_no'])}:{current_activity}"
+                )
+                outbox_id = _stable_id("outbox", identity)
+                connection.execute(
+                    """
+                    INSERT INTO outbox_events(
+                        outbox_id, event_type, aggregate_id, payload_json,
+                        idempotency_key, state, next_attempt_at, created_at, updated_at
+                    ) VALUES (?, 'agent.job.queued', ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (
+                        outbox_id,
+                        job_id,
+                        _json(
+                            {
+                                "activity_version": current_activity,
+                                "job_id": job_id,
+                                "kind": "schedule.run",
+                                "priority": int(row["priority"]),
+                                "session_key": lease.session_key,
+                            }
+                        ),
+                        f"republish-job:{identity}",
+                        now_text,
+                        now_text,
+                        now_text,
+                    ),
+                )
+                connection.execute("COMMIT")
+                return "requeued"
+            connection.execute(
+                "UPDATE scheduled_executions SET state = ?, updated_at = ? WHERE job_id = ?",
+                (target, now_text, job_id),
+            )
+            connection.execute(
+                "UPDATE agent_jobs SET state = ?, heartbeat_at = ?, finished_at = ?, "
+                "updated_at = ? WHERE job_id = ? AND state = 'running'",
+                (target, now_text, now_text, now_text, job_id),
+            )
+            connection.execute(
+                "UPDATE runs SET state = ?, heartbeat_at = ?, finished_at = ?, "
+                "updated_at = ? WHERE run_id = ? AND state = 'running'",
+                (target, now_text, now_text, now_text, run_id),
+            )
+            connection.execute(
+                "UPDATE run_attempts SET outcome = ?, heartbeat_at = ?, finished_at = ? "
+                "WHERE run_id = ? AND finished_at IS NULL",
+                (target, now_text, now_text, run_id),
+            )
+            connection.execute("COMMIT")
+            return target
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
 
     def get_activity_version(self, session_key: str) -> int | None:
         with self._connect() as connection:
@@ -521,6 +848,16 @@ class OperationalRepository:
                 (session_key,),
             ).fetchone()
         return None if row is None else int(row["activity_version"])
+
+    def get_last_user_at(self, session_key: str) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT last_user_at FROM session_activity WHERE session_key = ?",
+                (session_key,),
+            ).fetchone()
+        if row is None or row["last_user_at"] is None:
+            return None
+        return datetime.fromisoformat(str(row["last_user_at"])).astimezone(UTC)
 
     def remember_session_identities(
         self,
@@ -1919,6 +2256,7 @@ class OperationalRepository:
         session_key: str,
         *,
         limit: int,
+        before: datetime | None = None,
     ) -> tuple[MessageRecord, ...]:
         if limit < 1:
             return ()
@@ -1932,12 +2270,18 @@ class OperationalRepository:
                            session_position, created_at
                     FROM messages
                     WHERE session_key = ? AND session_position IS NOT NULL
+                      AND (? IS NULL OR julianday(created_at) <= julianday(?))
                     ORDER BY session_position DESC
                     LIMIT ?
                 )
                 ORDER BY session_position
                 """,
-                (session_key, limit),
+                (
+                    session_key,
+                    None if before is None else _utc_iso(before),
+                    None if before is None else _utc_iso(before),
+                    limit,
+                ),
             ).fetchall()
         return tuple(
             MessageRecord(
@@ -2066,6 +2410,11 @@ class OperationalRepository:
                 and row["run_state"] == outcome
                 and row["job_state"] == outcome
             ):
+                connection.execute(
+                    "UPDATE scheduled_executions SET state = ?, updated_at = ? "
+                    "WHERE job_id = ? AND state = 'needs_review'",
+                    (outcome, now_text, row["job_id"]),
+                )
                 connection.execute("COMMIT")
                 return
             if row["effect_state"] not in {"sending", "unknown", "needs_review"}:
@@ -2118,6 +2467,11 @@ class OperationalRepository:
                 """,
                 (outcome, now_text, now_text, now_text, row["job_id"]),
             )
+            connection.execute(
+                "UPDATE scheduled_executions SET state = ?, updated_at = ? "
+                "WHERE job_id = ? AND state = 'needs_review'",
+                (outcome, now_text, row["job_id"]),
+            )
             connection.execute("COMMIT")
         except Exception:
             if connection.in_transaction:
@@ -2144,6 +2498,26 @@ class OperationalRepository:
         """在跨库或文件写入前确认当前 Worker 仍持有写权限。"""
         with self._connect() as connection:
             self.require_current_fence(connection, lease)
+
+    def assert_current_fence_and_activity(
+        self,
+        lease: FenceToken,
+        *,
+        expected_activity_version: int,
+    ) -> None:
+        """确认 Worker 提交权与系统任务所依据的用户活动快照均未失效。"""
+        with self._connect() as connection:
+            self.require_current_fence(connection, lease)
+            row = connection.execute(
+                "SELECT activity_version FROM session_activity WHERE session_key = ?",
+                (lease.session_key,),
+            ).fetchone()
+            current = None if row is None else int(row["activity_version"])
+            if current != expected_activity_version:
+                raise LostLeaseError(
+                    f"会话 {lease.session_key} 的 activity_version 已变化: "
+                    f"expected={expected_activity_version}, current={current}"
+                )
 
     @contextmanager
     def fenced_write(self, lease: FenceToken) -> Iterator[None]:
@@ -2255,8 +2629,10 @@ __all__ = [
     "JobRecord",
     "LostLeaseError",
     "MessageRecord",
+    "MultiplePrivateSessionsError",
     "OperationalRepository",
     "PendingInterruptError",
+    "PrivateSessionTarget",
     "OutboxRecord",
     "RunClaim",
     "SessionIdentityRecord",

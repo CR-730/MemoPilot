@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -37,8 +37,31 @@ class MemoryJobExecutor(Protocol):
     ) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class SystemJobResult:
+    outcome: str
+    turn_result: TurnResult | None = None
+
+
+class SystemJobExecutor(Protocol):
+    async def execute(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, object],
+        claim: RunClaim,
+        lease: FenceToken,
+        turn: TurnInput,
+        now: datetime,
+    ) -> SystemJobResult: ...
+
+
 class TurnInterrupted(RuntimeError):
     """当前 Run 已按用户 `/stop` 请求安全中断并保存快照。"""
+
+
+class ScheduleJobRequeued(RuntimeError):
+    """P1 Schedule 已因新用户活动安全延期，当前 Redis 投递应被 ACK。"""
 
 
 class RuntimeJobExecutor:
@@ -49,12 +72,14 @@ class RuntimeJobExecutor:
         *,
         final_response_dispatcher: FinalResponseDispatcher | None = None,
         memory_jobs: MemoryJobExecutor | None = None,
+        system_jobs: SystemJobExecutor | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._repository = repository
         self._runtime = runtime
         self._final_response_dispatcher = final_response_dispatcher
         self._memory_jobs = memory_jobs
+        self._system_jobs = system_jobs
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def execute(
@@ -107,6 +132,58 @@ class RuntimeJobExecutor:
                     pass
                 raise
             return None
+        if job.kind in {"proactive.tick", "schedule.run", "drift.run"}:
+            if self._system_jobs is None:
+                raise RuntimeError(f"未配置系统任务执行器: {job.kind}")
+            payload = json.loads(job.payload_json)
+            if not isinstance(payload, dict):
+                raise ValueError("系统任务 payload 必须是 JSON 对象")
+            try:
+                self._repository.assert_current_fence(lease)
+                system_result = await self._system_jobs.execute(
+                    kind=job.kind,
+                    payload={str(key): value for key, value in payload.items()},
+                    claim=claim,
+                    lease=lease,
+                    turn=turn,
+                    now=now,
+                )
+                if job.kind == "schedule.run" and system_result.outcome == "cancelled":
+                    current_activity = self._repository.get_activity_version(
+                        claim.session_key
+                    )
+                    if (
+                        current_activity is not None
+                        and current_activity != job.activity_version
+                    ):
+                        preemption = self._repository.requeue_preempted_schedule(
+                            claim.run_id,
+                            lease=lease,
+                            now=self._clock(),
+                        )
+                        if preemption == "requeued":
+                            raise ScheduleJobRequeued(claim.job_id)
+                        return system_result.turn_result
+                self._repository.finish_job(
+                    claim.run_id,
+                    lease=lease,
+                    outcome=system_result.outcome,
+                    now=self._clock(),
+                )
+                return system_result.turn_result
+            except ScheduleJobRequeued:
+                raise
+            except Exception:
+                try:
+                    self._repository.finish_job(
+                        claim.run_id,
+                        lease=lease,
+                        outcome="failed",
+                        now=self._clock(),
+                    )
+                except LostLeaseError:
+                    pass
+                raise
         if turn.session_key != claim.session_key:
             raise ValueError("TurnInput 与 RunClaim 的会话不匹配")
         turn = replace(turn, memory_source_ref=f"run:{claim.run_id}")
@@ -245,4 +322,11 @@ class RuntimeJobExecutor:
         return result
 
 
-__all__ = ["MemoryJobExecutor", "RuntimeJobExecutor", "TurnInterrupted"]
+__all__ = [
+    "MemoryJobExecutor",
+    "RuntimeJobExecutor",
+    "ScheduleJobRequeued",
+    "SystemJobExecutor",
+    "SystemJobResult",
+    "TurnInterrupted",
+]

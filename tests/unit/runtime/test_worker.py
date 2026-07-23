@@ -8,7 +8,11 @@ import pytest
 
 from memopilot.runtime.engine import TurnInput, TurnResult
 from memopilot.runtime.react import ReActResult
-from memopilot.runtime.worker import RuntimeJobExecutor
+from memopilot.runtime.worker import (
+    RuntimeJobExecutor,
+    ScheduleJobRequeued,
+    SystemJobResult,
+)
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
@@ -133,3 +137,105 @@ async def test_memory_job_bypasses_agent_runtime_and_finishes_normally() -> None
     ]
     assert repository.commits == []
     assert repository.finishes == ["succeeded"]
+
+
+class _SystemRepository(_Repository):
+    def __init__(self, kind: str) -> None:
+        super().__init__()
+        self.kind = kind
+        self.fence_checks = 0
+
+    def get_job(self, job_id: str):
+        return SimpleNamespace(
+            job_id=job_id,
+            kind=self.kind,
+            payload_json='{"value":1}',
+            activity_version=1,
+        )
+
+    def assert_current_fence(self, lease: Any) -> None:
+        self.fence_checks += 1
+
+
+class _SystemJobs:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def execute(self, *, kind: str, **kwargs: Any) -> SystemJobResult:
+        self.calls.append(kind)
+        return SystemJobResult(outcome="succeeded")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["proactive.tick", "schedule.run", "drift.run"])
+async def test_system_jobs_bypass_passive_turn_commit(kind: str) -> None:
+    repository = _SystemRepository(kind)
+    system_jobs = _SystemJobs()
+    executor = RuntimeJobExecutor(
+        repository,  # type: ignore[arg-type]
+        _Runtime(),
+        system_jobs=system_jobs,
+    )
+    claim = SimpleNamespace(
+        job_id="job-system",
+        run_id="run-system",
+        session_key="feishu:chat-1",
+        owner_id="worker-1",
+        fencing_epoch=1,
+    )
+    lease = SimpleNamespace(session_key="feishu:chat-1", owner_id="worker-1", epoch=1)
+
+    result = await executor.execute(
+        claim=claim,
+        lease=lease,
+        turn=TurnInput("feishu:chat-1", "", received_at=NOW),
+        now=NOW,
+    )
+
+    assert result is None
+    assert system_jobs.calls == [kind]
+    assert repository.commits == []
+    assert repository.finishes == ["succeeded"]
+    assert repository.fence_checks >= 1
+
+
+@pytest.mark.asyncio
+async def test_schedule_cancelled_by_new_activity_is_requeued_not_finished() -> None:
+    repository = _SystemRepository("schedule.run")
+    repository.requeued = False
+    repository.get_activity_version = lambda session_key: 2
+
+    def requeue(*args: Any, **kwargs: Any) -> str:
+        repository.requeued = True
+        return "requeued"
+
+    repository.requeue_preempted_schedule = requeue
+
+    class CancelledSystemJobs(_SystemJobs):
+        async def execute(self, *, kind: str, **kwargs: Any) -> SystemJobResult:
+            return SystemJobResult(outcome="cancelled")
+
+    executor = RuntimeJobExecutor(
+        repository,  # type: ignore[arg-type]
+        _Runtime(),
+        system_jobs=CancelledSystemJobs(),
+    )
+    claim = SimpleNamespace(
+        job_id="job-system",
+        run_id="run-system",
+        session_key="feishu:chat-1",
+        owner_id="worker-1",
+        fencing_epoch=1,
+    )
+    lease = SimpleNamespace(session_key="feishu:chat-1", owner_id="worker-1", epoch=1)
+
+    with pytest.raises(ScheduleJobRequeued):
+        await executor.execute(
+            claim=claim,
+            lease=lease,
+            turn=TurnInput("feishu:chat-1", "", received_at=NOW),
+            now=NOW,
+        )
+
+    assert repository.requeued is True
+    assert repository.finishes == []

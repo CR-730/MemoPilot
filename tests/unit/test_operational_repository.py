@@ -58,6 +58,8 @@ def test_inbound_transaction_creates_one_job_and_outbox(tmp_path: Path) -> None:
     assert job is not None
     assert job.priority == 0
     assert job.state == "queued"
+    assert repository.get_last_user_at("feishu:chat-1") == NOW
+    assert repository.get_last_user_at("feishu:missing") is None
 
 
 @pytest.mark.parametrize(
