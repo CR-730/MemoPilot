@@ -49,6 +49,17 @@ async def test_run_all_starts_services_in_one_async_process(
         async def close(self) -> None:
             events.append("worker.close")
 
+    class FakeRedisRuntime:
+        managed = True
+
+        @classmethod
+        async def ensure(cls, _redis_url: str) -> FakeRedisRuntime:
+            events.append("redis.ensure")
+            return cls()
+
+        async def close(self) -> None:
+            events.append("redis.close")
+
     monkeypatch.setattr(cli, "build_app", lambda settings: FakeAppBundle())
     monkeypatch.setattr(cli, "build_scheduler", lambda settings: FakeSchedulerBundle())
 
@@ -56,10 +67,14 @@ async def test_run_all_starts_services_in_one_async_process(
         return FakeWorkerBundle()
 
     monkeypatch.setattr(cli, "build_worker", build_worker)
+    monkeypatch.setattr(cli, "RedisRuntime", FakeRedisRuntime)
 
-    await cli.run_all(SimpleNamespace(feishu_allow_from=()))
+    await cli.run_all(
+        SimpleNamespace(feishu_allow_from=(), redis_url="redis://localhost:6379/0")
+    )
 
     assert events == [
+        "redis.ensure",
         "worker.extensions",
         "app.start",
         "scheduler.run",
@@ -67,4 +82,5 @@ async def test_run_all_starts_services_in_one_async_process(
         "worker.close",
         "scheduler.close",
         "app.close",
+        "redis.close",
     ]

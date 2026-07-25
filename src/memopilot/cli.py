@@ -10,6 +10,7 @@ from typing import Any
 
 from memopilot.bootstrap import build_app, build_scheduler, build_worker
 from memopilot.config import load_settings
+from memopilot.redis_runtime import RedisRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +36,17 @@ async def _run(args: argparse.Namespace) -> None:
 
 async def run_all(settings: Any) -> None:
     """在同一个 asyncio 事件循环中运行全部常驻服务。"""
+    redis_runtime: RedisRuntime | None = None
     app_bundle: Any = None
     scheduler_bundle: Any = None
     worker_bundle: Any = None
     service_tasks: list[asyncio.Task[None]] = []
     try:
+        redis_runtime = await RedisRuntime.ensure(settings.redis_url)
+        if redis_runtime.managed:
+            logger.info("本地 Redis 未运行，已由 MemoPilot 自动启动")
+        else:
+            logger.info("检测到可用 Redis，直接复用现有服务")
         app_bundle = build_app(settings)
         scheduler_bundle = build_scheduler(settings)
         if hasattr(app_bundle, "console"):
@@ -79,6 +86,8 @@ async def run_all(settings: Any) -> None:
             await scheduler_bundle.close()
         if app_bundle is not None:
             await app_bundle.close()
+        if redis_runtime is not None:
+            await redis_runtime.close()
 
 
 def _parser() -> argparse.ArgumentParser:

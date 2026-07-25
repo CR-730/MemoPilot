@@ -98,7 +98,7 @@ Streams / Lease / Priority)]
 
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/)
-- Redis 7.2 或更高版本（运行并发任务链路时需要）
+- Redis 7.2 或更高版本（`main.py` 会复用已有服务，未运行时自动启动本机 Redis）
 
 ```bash
 git clone https://github.com/CR-730/MemoPilot.git
@@ -140,6 +140,8 @@ MCP 第一版使用 stdio。将服务器定义放在 `workspace/mcp_servers.json
 ```bash
 uv run main.py
 ```
+
+启动入口会先检查配置中的 Redis。对于本机地址，它会优先复用已有服务；连接失败时自动查找并启动 `redis-server`，退出时只关闭本次启动的子进程。可以通过 `MEMOPILOT_REDIS_SERVER` 指定可执行文件路径。远程 Redis 只做连接检查，不会启动本地替代服务。
 
 启动后可在另一个终端使用原型同款纯文本 CLI：
 
