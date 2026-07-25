@@ -84,6 +84,15 @@ def test_content_tools_match_old_prototype_contract() -> None:
     )
 
 
+def test_agent_tick_prompt_keeps_prototype_identity_and_decision_contract() -> None:
+    from memopilot.proactive.content_turn import _CONTENT_SYSTEM_PROMPT
+
+    assert "你是 MemoPilot" in _CONTENT_SYSTEM_PROMPT
+    assert "Alert > Content > Context-fallback" in _CONTENT_SYSTEM_PROMPT
+    assert "mark_interesting" in _CONTENT_SYSTEM_PROMPT
+    assert "message_push + finish_turn" in _CONTENT_SYSTEM_PROMPT
+
+
 @pytest.mark.asyncio
 async def test_agent_tick_batches_every_alert_and_skips_content_classification() -> None:
     provider = _Provider(

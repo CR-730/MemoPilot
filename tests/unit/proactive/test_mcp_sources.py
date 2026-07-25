@@ -129,6 +129,40 @@ def test_load_proactive_sources_from_workspace_json(tmp_path: Path) -> None:
     assert sources[0].ack_tool == "ack_news"
 
 
+def test_load_prototype_sources_without_id_derives_stable_channel_id(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "proactive_sources.json"
+    path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "server": "mi-fitness",
+                        "channel": "content",
+                        "get_tool": "get_proactive_events",
+                        "ack_tool": "acknowledge_events",
+                    },
+                    {
+                        "server": "mi-fitness",
+                        "channel": "alert",
+                        "get_tool": "get_proactive_events",
+                        "ack_tool": "acknowledge_events",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sources = load_proactive_sources(path)
+
+    assert [source.source_id for source in sources] == [
+        "mi-fitness:content",
+        "mi-fitness:alert",
+    ]
+
+
 async def test_gateway_reads_configs_directly_and_isolates_one_failed_source(
     tmp_path: Path,
 ) -> None:

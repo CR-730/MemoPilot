@@ -224,10 +224,17 @@ def stable_ack_operation_id(source_id: str, event_id: str) -> str:
 def _parse_source(raw: object) -> ProactiveSourceConfig:
     if not isinstance(raw, Mapping):
         raise ValueError("proactive_sources.json 的每个 source 必须是对象")
+    server = str(raw.get("server") or raw.get("server_id") or "").strip()
+    channel = str(raw.get("channel") or "").strip()
+    source_id = str(raw.get("id") or raw.get("source_id") or "").strip()
+    if not source_id and server and channel:
+        # 兼容旧原型：同一 MCP Server 可以按 alert/content/context
+        # 配置多条来源，因此不能只用 server 作为唯一键。
+        source_id = f"{server}:{channel}"
     return ProactiveSourceConfig(
-        source_id=str(raw.get("id") or raw.get("source_id") or ""),
-        server=str(raw.get("server") or raw.get("server_id") or ""),
-        channel=str(raw.get("channel") or ""),  # type: ignore[arg-type]
+        source_id=source_id,
+        server=server,
+        channel=channel,  # type: ignore[arg-type]
         get_tool=str(raw.get("get_tool") or raw.get("fetch_tool") or ""),
         ack_tool=str(raw.get("ack_tool") or ""),
         fetch_timeout_seconds=float(raw.get("fetch_timeout_seconds", 30)),

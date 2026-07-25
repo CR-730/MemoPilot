@@ -9,6 +9,12 @@ from memopilot.proactive.drift import DRIFT_SYSTEM_PROMPT, DriftSkillSelector
 from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse, ToolSchema
 
 
+def test_drift_prompt_keeps_prototype_identity_and_mcp_mount_contract() -> None:
+    assert "你是 MemoPilot" in DRIFT_SYSTEM_PROMPT
+    assert "每次进入 Drift 都先重新比较所有可用 skill" in DRIFT_SYSTEM_PROMPT
+    assert "mount_server" in DRIFT_SYSTEM_PROMPT
+
+
 def _skill(name: str, *, background: bool = True, available: bool = True) -> SkillDefinition:
     return SkillDefinition(
         name=name,
@@ -86,6 +92,6 @@ async def test_selector_requires_exactly_one_selection_call() -> None:
 
 
 def test_drift_prompt_keeps_prototype_finish_contract() -> None:
-    assert "message_push 成功后禁止 recall_memory" in DRIFT_SYSTEM_PROMPT
+    assert "message_push 成功后不要再调用 recall_memory" in DRIFT_SYSTEM_PROMPT
     assert "必须调用 finish_drift" in DRIFT_SYSTEM_PROMPT
     assert "message_result" in DRIFT_SYSTEM_PROMPT
