@@ -41,7 +41,7 @@
 | 分层记忆 | 短期会话、`MEMORY.md` / `SELF.md` 等 Markdown 记忆、SQLite + sqlite-vec 向量记忆 |
 | 主动链路 | 固定 Tick、MCP Source、Alert / Content / Context 分类、内容去重与 ACK |
 | 任务调度 | `at`、`after`、`every` 三种触发方式，支持固定消息和 Agent 任务两种执行模式 |
-| 可靠投递 | SQLite 事实源、Transactional Outbox、Redis Streams、Lease / Fencing、Effect 记录 |
+| 可靠投递 | SQLite 事实源、Transactional Outbox、Redis Streams、Lease / Fencing、发送记录 |
 | 扩展机制 | `@tool`、`@on_tool_pre`、Event Handler、PhaseModule、Skills、MCP stdio |
 | 飞书接入 | 飞书私聊长连接、流式思考卡片、工具过程展示和最终消息独立投递 |
 
@@ -49,28 +49,28 @@
 
 ```mermaid
 flowchart LR
-    U[飞书私聊] --> A["App<br/>Inbound / Outbox"]
+    U[飞书私聊] --> A["Gateway<br/>Inbound / Outbox"]
     S["Scheduler<br/>Tick / 定时任务"] --> DB[("SQLite<br/>事实源与审计")]
     A --> DB
     DB --> R[(Redis
 Streams / Lease / Priority)]
     S --> R
-    R --> W["Worker<br/>Agent Runtime"]
+    R --> W["Runner<br/>Agent Runtime"]
     W --> P[Phase Pipeline]
     P --> X["ReAct<br/>Function Calling"]
     X --> E[Tools / Plugins / Skills / MCP]
     X --> M[("分层记忆<br/>Markdown / sqlite-vec")]
-    X --> F[Feishu Effect]
+    X --> F[Feishu 回复]
     F --> U
 ```
 
-系统默认拆成三个常驻进程：
+系统在一个 Python 进程中运行三个异步服务：
 
 | 进程 | 职责 |
 | --- | --- |
-| `App` | 接收飞书私聊事件、写入 Inbox、创建用户消息 Job，并负责外发 Outbox |
-| `Scheduler` | 生成固定 Tick、扫描用户定时任务、提交记忆维护任务 |
-| `Worker` | 获取会话 Lease，执行 Agent Runtime、工具调用、记忆检索和最终回复 |
+| `Gateway` 协程 | 接收飞书私聊事件、写入 Inbox、创建用户消息 Job，并负责外发 Outbox |
+| `Scheduler` 协程 | 生成固定 Tick、扫描用户定时任务、提交记忆维护任务 |
+| `Runner` 协程 | 获取会话 Lease，执行 Agent Runtime、工具调用、记忆检索和最终回复 |
 
 用户消息使用 P0 优先级；主动内容使用 P2；后台 Drift 使用 P3。它们共享同一个会话 Lease，因此主动消息不会插入正在进行的用户回复。
 
@@ -81,10 +81,10 @@ Streams / Lease / Priority)]
   │
   ├─ SQLite 事务：Inbox + AgentJob + Outbox
   ├─ Redis：发布可恢复的执行副本
-  ├─ Worker：Lease + Fencing 校验
+  ├─ Runner：Lease + Fencing 校验
   ├─ Phase Pipeline：准备上下文 → ReAct → 响应后处理
   ├─ ReAct：检索记忆 / 调用工具 / 处理 Observation
-  ├─ Effect：幂等地发送最终消息
+  ├─ 回复：幂等地发送最终消息
   └─ 异步任务：Consolidation / Post-response / 向量写入
 ```
 
@@ -133,20 +133,33 @@ MEMOPILOT_FEISHU_ALLOW_FROM=["允许的 open_id"]
 
 MCP 第一版使用 stdio。将服务器定义放在 `workspace/mcp_servers.json`，主动信息源映射放在 `workspace/proactive_sources.json`。MCP 环境变量使用 `${变量名}` 引用，不要把真实密钥写进 JSON。
 
-### 4. 启动三个进程
+### 4. 启动 MemoPilot
 
-分别打开三个终端：
+一个命令即可启动 Gateway、Scheduler 和 Runner。它们在同一个 `asyncio` 事件循环中协作：
 
 ```bash
-uv run memopilot app --config config.toml --workspace workspace
-uv run memopilot scheduler --config config.toml --workspace workspace
-uv run memopilot worker --config config.toml --workspace workspace
+uv run main.py
 ```
 
-如果使用旧原型中的本地配置，可通过仓库提供的桥接脚本启动；脚本只在当前进程中读取密钥，不会复制到仓库：
+启动后可在另一个终端使用原型同款纯文本 CLI：
+
+```bash
+uv run main.py cli
+```
+
+输入消息后，主进程会通过本地 TCP 通道把最终回复返回到 CLI；输入 `exit` 退出。
+
+也可以显式使用包入口：
+
+```bash
+uv run memopilot run --config config.toml --workspace workspace
+```
+
+如果使用旧原型配置，先将旧原型的 `config.toml` 放到当前项目根目录。该文件已被 `.gitignore` 忽略，不会进入 Git：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_with_prototype_config.ps1 worker
+Copy-Item D:\PROJECTS\MemoPilot-Agent-Main\config.toml .\config.toml
+uv run memopilot run --config config.toml --workspace workspace
 ```
 
 ## 记忆系统
@@ -179,13 +192,6 @@ uv run ruff check .
 uv run mypy
 ```
 
-运行单次 Effect 核对：
-
-```bash
-uv run memopilot effects list --config config.toml --workspace workspace
-uv run memopilot effects show <operation_id> --config config.toml --workspace workspace
-```
-
 真实模型和飞书测试会产生外部调用或费用。默认测试使用 Fake Provider、Fake Feishu 和本地测试数据；只有明确授权后才进行真实 API 验证。
 
 ## 项目结构
@@ -204,6 +210,7 @@ MemoPilot/
 ## 设计边界
 
 - 第一版只支持飞书私聊，不引入多渠道和独立 Dashboard。
+- Gateway、Scheduler 和 Runner 默认运行在同一个异步进程中；内部模块边界保留，后续有扩展需求时再拆分部署。
 - 核心编排保持显式可追踪，不使用 LangChain 或 LangGraph 替代 Agent Loop。
 - SQLite 是持久化事实源；Redis 负责队列、优先级、Lease 和运行时协调。
 - 外部 MCP 只通过 stdio 接入；工具、插件和 Skills 仍受统一审计与权限边界约束。
