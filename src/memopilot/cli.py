@@ -1,4 +1,4 @@
-"""MemoPilot 三进程入口与 Effect 人工核对命令。"""
+"""MemoPilot 单进程异步入口与 Effect 人工核对命令。"""
 
 from __future__ import annotations
 
@@ -31,35 +31,8 @@ def main() -> None:
 
 async def _run(args: argparse.Namespace) -> None:
     settings = load_settings(args.config, workspace=args.workspace)
-    if args.command == "app":
-        if not settings.feishu_allow_from:
-            logger.warning("飞书 allowlist 为空：当前允许所有私聊用户访问")
-        app_bundle = build_app(settings)
-        try:
-            await app_bundle.service.start()
-            logger.info("MemoPilot App 已启动：飞书私聊长连接 + Outbox")
-            await asyncio.Event().wait()
-        finally:
-            await app_bundle.close()
-        return
-    if args.command == "worker":
-        worker_bundle = await build_worker(settings)
-        try:
-            await worker_bundle.start_extensions()
-            for diagnostic in worker_bundle.mcp_diagnostics:
-                logger.warning("MCP Server 不可用，核心 Runtime 继续启动: %s", diagnostic)
-            logger.info("MemoPilot Worker 已启动：Agent Runtime + 飞书外发")
-            await worker_bundle.service.run_forever()
-        finally:
-            await worker_bundle.close()
-        return
-    if args.command == "scheduler":
-        scheduler_bundle = build_scheduler(settings)
-        try:
-            logger.info("MemoPilot Scheduler 已启动：主动唤醒、定时任务与周期维护")
-            await scheduler_bundle.service.run_forever()
-        finally:
-            await scheduler_bundle.close()
+    if args.command == "run":
+        await run_all(settings)
         return
     effect_bundle = build_effects(settings)
     try:
@@ -72,6 +45,47 @@ async def _run(args: argparse.Namespace) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     finally:
         await effect_bundle.close()
+
+
+async def run_all(settings: Any) -> None:
+    """在同一个 asyncio 事件循环中运行全部常驻服务。"""
+    app_bundle: Any = None
+    scheduler_bundle: Any = None
+    worker_bundle: Any = None
+    service_tasks: list[asyncio.Task[None]] = []
+    try:
+        app_bundle = build_app(settings)
+        scheduler_bundle = build_scheduler(settings)
+        worker_bundle = await build_worker(settings)
+        await worker_bundle.start_extensions()
+        for diagnostic in worker_bundle.mcp_diagnostics:
+            logger.warning("MCP Server 不可用，核心 Runtime 继续启动: %s", diagnostic)
+        if not settings.feishu_allow_from:
+            logger.warning("飞书 allowlist 为空：当前允许所有私聊用户访问")
+        await app_bundle.service.start()
+        logger.info("MemoPilot 已启动：App、Scheduler、Worker 运行于同一 asyncio 事件循环")
+        service_tasks = [
+            asyncio.create_task(
+                scheduler_bundle.service.run_forever(),
+                name="memopilot-scheduler",
+            ),
+            asyncio.create_task(
+                worker_bundle.service.run_forever(),
+                name="memopilot-worker",
+            ),
+        ]
+        await asyncio.gather(*service_tasks)
+    finally:
+        for task in service_tasks:
+            task.cancel()
+        if service_tasks:
+            await asyncio.gather(*service_tasks, return_exceptions=True)
+        if worker_bundle is not None:
+            await worker_bundle.close()
+        if scheduler_bundle is not None:
+            await scheduler_bundle.close()
+        if app_bundle is not None:
+            await app_bundle.close()
 
 
 async def execute_effect_action(
@@ -112,9 +126,8 @@ def _effect_dict(effect: EffectRecord | Any) -> dict[str, Any]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="memopilot")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("app", "worker", "scheduler"):
-        command = subparsers.add_parser(name)
-        _add_config_arguments(command)
+    run = subparsers.add_parser("run", help="在一个 asyncio 事件循环中启动全部服务")
+    _add_config_arguments(run)
     effects = subparsers.add_parser("effects")
     _add_config_arguments(effects)
     effect_commands = effects.add_subparsers(dest="effect_action", required=True)
@@ -140,4 +153,4 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["execute_effect_action", "main"]
+__all__ = ["execute_effect_action", "main", "run_all"]
