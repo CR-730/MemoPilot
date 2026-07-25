@@ -15,7 +15,6 @@ from pydantic_settings import (
     NoDecode,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
-    YamlConfigSettingsSource,
 )
 
 from memopilot.extensions.mcp import McpServerConfig
@@ -25,7 +24,7 @@ class MemoPilotSettings(BaseSettings):
     """运行配置。
 
     初始化参数主要服务于测试和显式嵌入；常规运行的配置优先级为环境变量、
-    ``.env``、``config/default.yaml``、字段默认值。
+    ``.env``、字段默认值。
     """
 
     model_config = SettingsConfigDict(
@@ -34,8 +33,6 @@ class MemoPilotSettings(BaseSettings):
         env_file_encoding="utf-8",
         env_ignore_empty=True,
         extra="ignore",
-        yaml_file=Path("config/default.yaml"),
-        yaml_file_encoding="utf-8",
     )
 
     workspace: Path = Path("workspace")
@@ -122,7 +119,6 @@ class MemoPilotSettings(BaseSettings):
             init_settings,
             env_settings,
             dotenv_settings,
-            YamlConfigSettingsSource(settings_cls),
             file_secret_settings,
         )
 

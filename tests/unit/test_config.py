@@ -49,16 +49,10 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
     assert settings.memory_inject_max_event_profile == 2
 
 
-def test_environment_overrides_dotenv_and_yaml(
+def test_environment_overrides_dotenv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config_dir = tmp_path / "config"
-    config_dir.mkdir()
-    (config_dir / "default.yaml").write_text(
-        "proactive_tick_seconds: 900\nredis_url: redis://yaml:6379/0\n",
-        encoding="utf-8",
-    )
     env_file = tmp_path / ".env"
     env_file.write_text(
         "MEMOPILOT_PROACTIVE_TICK_SECONDS=600\nMEMOPILOT_REDIS_URL=redis://dotenv:6379/0\n",

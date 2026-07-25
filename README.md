@@ -114,6 +114,8 @@ uv sync --all-groups
 cp .env.example .env
 ```
 
+运行时唯一的主配置文件是项目根目录的 `config.toml`。`.env` 只用于提供 `MEMOPILOT_*` 密钥或未写入 TOML 的环境变量，不承担另一套业务配置；也可以在 `config.toml` 中使用 `${变量名}` 引用环境变量。
+
 至少需要填写以下配置：
 
 ```dotenv
@@ -202,7 +204,6 @@ uv run mypy
 MemoPilot/
 ├── src/memopilot/          # Agent、记忆、调度、主动链路和渠道实现
 ├── tests/                  # 单元、集成和恢复场景测试
-├── config/default.yaml     # 不含密钥的默认配置
 ├── scripts/                # 本地启动与受控冒烟脚本
 ├── .env.example            # 环境变量示例
 ├── pyproject.toml          # 依赖与工程配置
