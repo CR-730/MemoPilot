@@ -2,171 +2,208 @@
 
 # MemoPilot
 
-### 会记得、会判断，也会主动行动的个人 AI Agent
+### 会记忆、会判断，也会主动行动的个人 AI Agent
 
-基于 ReAct + Function Calling 构建可追踪的 Agent Runtime，融合分层长期记忆、主动唤醒、定时任务、插件、Skills 与 MCP。
+一个面向 AI 后端与 Agent 工程实践的 Python 项目：以可追踪的 ReAct Runtime 为核心，把长期记忆、主动信息筛选、定时任务和工具扩展组织成一条可恢复的执行链路。
 
-[![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![MCP](https://img.shields.io/badge/MCP-stdio-6B57FF)](https://modelcontextprotocol.io/)
-[![Channel](https://img.shields.io/badge/Channel-飞书私聊-00D6B9)](#项目边界)
+<p>
+  <a href="#核心能力">核心能力</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#系统架构">系统架构</a> ·
+  <a href="#开发与验证">开发与验证</a>
+</p>
+
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![Runtime](https://img.shields.io/badge/Agent-ReAct%20%2B%20Function%20Calling-7C3AED)
+![Storage](https://img.shields.io/badge/Storage-SQLite%20%2B%20Redis-DC382D)
+![MCP](https://img.shields.io/badge/MCP-stdio-5B5BD6)
+![Channel](https://img.shields.io/badge/Channel-Feishu%20Private%20Chat-00B96B)
 
 </div>
 
-## 为什么做 MemoPilot
+> MemoPilot 的重点不是“把模型接进聊天框”，而是把一次 Agent Turn 变成可观察、可审计、可恢复的后端执行过程。
 
-传统对话式 AI 往往只能等待提问：它不了解长期关系，也很难在合适的时间主动完成任务。MemoPilot 尝试把个人助理拆成一组可理解、可测试、可恢复的后端能力：
+## 项目简介
 
-- **不只回复**：周期性感知外部事件，判断是否值得主动联系用户。
-- **不只记日志**：区分近期上下文、可读长期记忆和可检索向量记忆。
-- **不依赖黑盒编排**：自主实现外层 Phase Pipeline 与内层 ReAct 循环。
-- **不牺牲可靠性**：用 Redis 协调优先级和抢占，用 SQLite 保存事实与恢复意图。
+传统聊天式 AI 通常只在用户提问后响应，缺少稳定的长期上下文，也很难在合适的时间主动完成任务。MemoPilot 将个人助理拆解为几个清晰的后端边界：
+
+- **理解问题**：外层 Phase Pipeline 管理上下文、记忆、推理和响应阶段；内层 ReAct 循环负责逐步决定是否调用工具。
+- **记住重要信息**：短期对话、Markdown 长期记忆和 SQLite 向量记忆分层保存，检索使用向量、关键词和 RRF 融合。
+- **主动发现内容**：Scheduler 周期性触发主动链路，由 MCP Source 获取 Alert、Content 和 Context，再由同一个 Agent Runtime 判断是否值得打扰用户。
+- **可靠地执行**：SQLite 保存事实与审计记录，Redis 负责排队、优先级、Lease 和跨进程协调；外部发送使用 Outbox 与幂等键避免重复副作用。
+- **保持可扩展**：工具、Prompt、PhaseModule、Event Handler、Tool Hook、Skills 和 MCP stdio Server 均可在不改核心循环的情况下扩展能力。
 
 ## 核心能力
 
-| 能力 | 设计重点 |
-|---|---|
-| Agent Runtime | 外层 Phase DAG + 内层 ReAct / Function Calling，每一步均可追踪 |
-| 分层记忆 | 短期消息、Markdown 长期记忆、SQLite + sqlite-vec 向量检索 |
-| 主动唤醒 | `Alert > Content > Context-fallback` 的统一 AgentTick、Reservoir 与 Drift |
-| 定时任务 | 支持 `at / after / every` 与 `instant / agent` 两种执行模式 |
-| 扩展机制 | Python 插件、PromptBlock、ToolHook、Skills 与 MCP stdio |
-| 任务协调 | Redis Streams P0–P3、会话租约、持久化 fencing epoch 与用户消息抢占 |
-| 可靠副作用 | Transactional Outbox、稳定 operation ID、飞书 UUID 幂等与不明确状态核对 |
-| 飞书私聊 | 长连接入站、实时思考/工具过程卡、终态折叠与独立可靠最终回复 |
-| 可观测性 | Diagnostic Log、Strategy Trace 与只读 Inspector API，不开发独立 Dashboard |
+| 模块 | 作用 |
+| --- | --- |
+| Agent Runtime | 可追踪的 Phase Pipeline + ReAct / Function Calling，工具异常作为 Observation 交回模型判断 |
+| 分层记忆 | 短期会话、`MEMORY.md` / `SELF.md` 等 Markdown 记忆、SQLite + sqlite-vec 向量记忆 |
+| 主动链路 | 固定 Tick、MCP Source、Alert / Content / Context 分类、内容去重与 ACK |
+| 任务调度 | `at`、`after`、`every` 三种触发方式，支持固定消息和 Agent 任务两种执行模式 |
+| 可靠投递 | SQLite 事实源、Transactional Outbox、Redis Streams、Lease / Fencing、Effect 记录 |
+| 扩展机制 | `@tool`、`@on_tool_pre`、Event Handler、PhaseModule、Skills、MCP stdio |
+| 飞书接入 | 飞书私聊长连接、流式思考卡片、工具过程展示和最终消息独立投递 |
 
 ## 系统架构
 
 ```mermaid
 flowchart LR
-    F["飞书私聊"] --> A["App\n长连接 · Inbound Bridge"]
-    A --> O[("operational.db\nInbox · Job · Outbox")]
-    O --> R["Redis Streams\nP0 · P1 · P2 · P3"]
-    R --> W["Worker\nLease · Fencing"]
-    W --> P["Phase Pipeline"]
-    P --> X["ReAct + Function Calling"]
-    X --> T["Tools · Plugins · Skills · MCP"]
-    X --> M[("分层记忆\nMarkdown · SQLite · Vector")]
-    S["Scheduler"] --> O
-    W --> K[("proactive.db\nReservoir · Decision · ACK")]
-    X --> F
+    U[飞书私聊] --> A["App<br/>Inbound / Outbox"]
+    S["Scheduler<br/>Tick / 定时任务"] --> DB[("SQLite<br/>事实源与审计")]
+    A --> DB
+    DB --> R[(Redis
+Streams / Lease / Priority)]
+    S --> R
+    R --> W["Worker<br/>Agent Runtime"]
+    W --> P[Phase Pipeline]
+    P --> X["ReAct<br/>Function Calling"]
+    X --> E[Tools / Plugins / Skills / MCP]
+    X --> M[("分层记忆<br/>Markdown / sqlite-vec")]
+    X --> F[Feishu Effect]
+    F --> U
 ```
 
-### 一条消息如何执行
+系统默认拆成三个常驻进程：
 
-1. 飞书长连接接收私聊事件，Inbox 去重并递增用户活动版本。
-2. 同一 SQLite 事务创建 P0 Job 与 Outbox，随后至少一次发布到 Redis。
-3. Worker 获取会话 Lease 和单调 Fencing Epoch，运行 Phase Pipeline。
-4. ReAct 循环按需检索记忆、调用工具，并把失败作为 Observation 交回模型。
-5. 最终发送前以数据库 CAS 校验用户活动版本，避免主动消息插入正在进行的聊天。
-6. Turn 提交后异步执行 Consolidation、Markdown 归档与向量记忆写入。
+| 进程 | 职责 |
+| --- | --- |
+| `App` | 接收飞书私聊事件、写入 Inbox、创建用户消息 Job，并负责外发 Outbox |
+| `Scheduler` | 生成固定 Tick、扫描用户定时任务、提交记忆维护任务 |
+| `Worker` | 获取会话 Lease，执行 Agent Runtime、工具调用、记忆检索和最终回复 |
 
-## 记忆系统
+用户消息使用 P0 优先级；主动内容使用 P2；后台 Drift 使用 P3。它们共享同一个会话 Lease，因此主动消息不会插入正在进行的用户回复。
+
+## 一次对话如何运行
 
 ```text
-当前对话
-   │
-   ├── 短期消息窗口 ──────────────── 当前 Turn 的直接上下文
-   ├── Markdown 长期记忆 ─────────── MEMORY / SELF / HISTORY / PENDING / RECENT_CONTEXT / JOURNAL
-   └── SQLite 向量记忆 ───────────── event / profile / preference / procedure
-                                         │
-                              Vector + Keyword + RRF
+飞书事件
+  │
+  ├─ SQLite 事务：Inbox + AgentJob + Outbox
+  ├─ Redis：发布可恢复的执行副本
+  ├─ Worker：Lease + Fencing 校验
+  ├─ Phase Pipeline：准备上下文 → ReAct → 响应后处理
+  ├─ ReAct：检索记忆 / 调用工具 / 处理 Observation
+  ├─ Effect：幂等地发送最终消息
+  └─ 异步任务：Consolidation / Post-response / 向量写入
 ```
 
-自动预检索与 `recall_memory` 复用同一 Retriever，但承担不同职责：前者在普通 Turn 前用原始问题获取上下文，默认不开启 HyDE；后者是模型按需调用的工具，`answer` 路径会使用双假设查询增强证据召回。
+工具失败不会直接让整个 Agent Turn 崩溃：Runtime 会把结构化错误交回模型，由模型决定修正参数、重试、换工具或向用户解释失败。只有启动配置错误、失权和无法恢复的基础设施错误才会提前终止执行。
 
-## 项目边界
+## 快速开始
 
-- 单所有者、自托管，不做 SaaS 多租户。
-- 第一版只支持飞书机器人私聊，不做多渠道。
-- Chat Provider 使用统一 OpenAI-compatible 接口，首个验证模型为 DeepSeek。
-- MCP 第一版只支持 stdio，外部 MCP Server 不并入本仓库。
-- 不使用 LangChain、LangGraph 编排核心 Agent Loop。
-- 不开发 Dashboard；通过 FastAPI `/docs` 查询 Inspector 数据。
-- 不引入 PostgreSQL；第一版使用 SQLite、Markdown 与 Redis。
+### 1. 准备环境
 
-## 开发环境
+要求：
 
-项目使用 Python 3.12 与 [uv](https://docs.astral.sh/uv/) 管理环境。Redis 集成测试需要本机 Redis 7.2 或更高版本监听 `127.0.0.1:6379`；Python 依赖仍全部由 `uv` 隔离管理，不要求使用 Docker 开发。
+- Python 3.12
+- [uv](https://docs.astral.sh/uv/)
+- Redis 7.2 或更高版本（运行并发任务链路时需要）
 
 ```bash
 git clone https://github.com/CR-730/MemoPilot.git
 cd MemoPilot
 uv sync --all-groups
-uv run pytest
 ```
 
-当前自动化测试使用 Fake Provider 与 Fake Feishu，不需要模型 API Key，也不会产生外部副作用。
+### 2. 配置模型和飞书
 
-仓库还提供真实 DeepSeek 手动冒烟脚本。配置 `MEMOPILOT_CHAT_API_KEY` 后，它会要求模型调用一个无副作用的本地状态工具，再输出自然语言结果：
-
-```bash
-uv run python scripts/smoke_deepseek_runtime.py
-```
-
-默认模型为 `deepseek-v4-flash`，可通过 `MEMOPILOT_CHAT_MODEL` 覆盖；Provider 使用统一 OpenAI-compatible Chat Completions 接口。思考模式默认关闭，可通过 `MEMOPILOT_LLM_THINKING_ENABLED=true` 开启。开启后，DeepSeek Provider 会把 `reasoning_content` 收入不透明的 `provider_fields`，修补历史 assistant 消息并在后续请求中原样回传；通用 Provider 会剥离该字段，运行审计也不持久化思考正文。
-
-飞书会使用 schema 2.0 交互卡片展示流式过程：生成期间更新模型返回的思考增量、工具调用状态和临时回复，结束后将思考折叠为过程卡，最终答案单独通过可靠外发状态机发送。未开启思考模式时不会生成思考正文；live 卡失败或限流只关闭过程预览，不改变最终任务结果。
-
-### 配置
-
-复制示例配置并填写自己的密钥：
+复制示例配置：
 
 ```bash
 cp .env.example .env
 ```
 
-对话模型与 Embedding Provider 独立配置。任何 API Key、飞书 Secret、用户数据、SQLite 数据库和上传文件都不会进入 Git。
+至少需要填写以下配置：
 
-非敏感默认值位于 `config/default.yaml`，实际优先级为环境变量 > `.env` > YAML 默认值。启动核心服务前会一次性检查模型、Embedding、飞书 owner 白名单和 workspace 路径；已有向量库还会校验 Provider、模型与向量维度，避免静默混用不兼容向量。
-
-主动唤醒默认关闭。启用时，在 `workspace/proactive_sources.json` 中把已经配置的 stdio MCP Server 映射为主动信息源；密钥仍只写环境变量引用：
-
-```json
-{
-  "sources": [
-    {
-      "id": "personal-feed",
-      "server": "feed",
-      "channel": "content",
-      "get_tool": "fetch_events",
-      "ack_tool": "ack_event"
-    }
-  ]
-}
+```dotenv
+MEMOPILOT_CHAT_API_KEY=你的模型密钥
+MEMOPILOT_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MEMOPILOT_EMBEDDING_MODEL=text-embedding-v2
+MEMOPILOT_EMBEDDING_API_KEY=你的向量模型密钥
+MEMOPILOT_EMBEDDING_DIMENSION=1536
+MEMOPILOT_FEISHU_APP_ID=你的飞书应用 ID
+MEMOPILOT_FEISHU_APP_SECRET=你的飞书应用 Secret
+MEMOPILOT_FEISHU_ALLOW_FROM=["允许的 open_id"]
 ```
 
-固定 Tick 先并行采集 Alert、Content 与 Context，形成一份静态快照，再交给同一个 AgentTick ReAct 按 `Alert > Content > Context-fallback` 决策：同 Tick 的 Alert 合并发送；无 Alert 时逐条判断最多 5 条 Content；Context 只作为背景，或在策略明确放行时充当末级兜底。正文会提前并发抓取，但模型默认只看到元数据，需要时再通过工具读取。被引用、感兴趣但未引用、明确丢弃的内容分别以 168、24、720 小时 ACK；发送前还会执行来源级与语义级去重。没有可推送内容且超过最短间隔时，Drift 会把一个 P3 后台任务排入队列，由模型从可用 Skills 中选择任务并通过 ReAct 执行。
+密钥只放在本地 `.env` 或外部配置文件中，不要提交到 Git。默认聊天 Provider 使用 OpenAI-compatible 接口，可通过 `MEMOPILOT_CHAT_BASE_URL` 和 `MEMOPILOT_CHAT_MODEL` 切换模型。
 
-系统由三个可独立部署的常驻进程组成。App 只负责飞书入站，Scheduler 生成固定 Tick、用户定时任务和记忆维护 Job，Worker 按 P0–P3 优先级执行：
+### 3. 配置 MCP
+
+MCP 第一版使用 stdio。将服务器定义放在 `workspace/mcp_servers.json`，主动信息源映射放在 `workspace/proactive_sources.json`。MCP 环境变量使用 `${变量名}` 引用，不要把真实密钥写进 JSON。
+
+### 4. 启动三个进程
+
+分别打开三个终端：
 
 ```bash
-uv run memopilot app --config config.toml
-uv run memopilot scheduler --config config.toml
-uv run memopilot worker --config config.toml
+uv run memopilot app --config config.toml --workspace workspace
+uv run memopilot scheduler --config config.toml --workspace workspace
+uv run memopilot worker --config config.toml --workspace workspace
 ```
 
-`schedule` 工具支持 `at / after / every`；`instant` 到时直接发送固定文本，不调用模型，`agent` 到时重新运行 Agent。用户新消息会抢占正在执行的 Proactive/Drift；定时任务则原子延期并重新排队，避免为了及时回复而丢失任务。
+如果使用旧原型中的本地配置，可通过仓库提供的桥接脚本启动；脚本只在当前进程中读取密钥，不会复制到仓库：
 
-## 仓库结构
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_with_prototype_config.ps1 worker
+```
+
+## 记忆系统
+
+```text
+当前 Turn
+   ├─ 短期消息窗口：控制本轮上下文
+   ├─ Markdown 长期记忆：MEMORY / SELF / HISTORY / PENDING / RECENT_CONTEXT
+   └─ SQLite 向量记忆：event / profile / preference / procedure
+                         └─ 向量 + 关键词 + RRF + hotness
+```
+
+- 自动预检索在第一次模型推理前注入上下文；`recall_memory` 由模型在 ReAct 中按需调用。
+- 默认使用原始 Query，不开启 HyDE；`timeline`、`interest`、`procedure` 等意图拥有独立检索路径。
+- Consolidation 负责从已完成对话中提取长期记忆和近期上下文；Post-response 负责处理用户后续纠正。
+- 向量写入使用稳定 `source_ref` 与内容哈希幂等，旧事实不会被静默覆盖。
+
+## 开发与验证
+
+运行完整测试：
+
+```bash
+uv run pytest -q
+```
+
+运行代码质量检查：
+
+```bash
+uv run ruff check .
+uv run mypy
+```
+
+运行单次 Effect 核对：
+
+```bash
+uv run memopilot effects list --config config.toml --workspace workspace
+uv run memopilot effects show <operation_id> --config config.toml --workspace workspace
+```
+
+真实模型和飞书测试会产生外部调用或费用。默认测试使用 Fake Provider、Fake Feishu 和本地测试数据；只有明确授权后才进行真实 API 验证。
+
+## 项目结构
 
 ```text
 MemoPilot/
-├── src/memopilot/     # Agent 核心代码
-├── scripts/           # 手动冒烟与演示脚本
-├── tests/             # 单元、集成、回放与 E2E 测试
-├── config/            # 不含 Secret 的 YAML 默认配置
-├── .env.example       # 无 Secret 的配置示例
-└── pyproject.toml     # 依赖与工程工具配置
+├── src/memopilot/          # Agent、记忆、调度、主动链路和渠道实现
+├── tests/                  # 单元、集成和恢复场景测试
+├── config/default.yaml     # 不含密钥的默认配置
+├── scripts/                # 本地启动与受控冒烟脚本
+├── .env.example            # 环境变量示例
+├── pyproject.toml          # 依赖与工程配置
+└── uv.lock                 # 可复现依赖锁定
 ```
 
-## 提交约定
+## 设计边界
 
-提交信息使用中文 Conventional Commits，保证历史既真实又便于阅读：
-
-```text
-feat: 实现会话级任务租约
-fix: 修复主动消息抢占竞态
-test: 增加 Redis 清空恢复测试
-docs: 完善分层记忆说明
-```
+- 第一版只支持飞书私聊，不引入多渠道和独立 Dashboard。
+- 核心编排保持显式可追踪，不使用 LangChain 或 LangGraph 替代 Agent Loop。
+- SQLite 是持久化事实源；Redis 负责队列、优先级、Lease 和运行时协调。
+- 外部 MCP 只通过 stdio 接入；工具、插件和 Skills 仍受统一审计与权限边界约束。
