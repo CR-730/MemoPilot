@@ -5,8 +5,8 @@ import json
 
 import pytest
 
-from memopilot.channels.contracts import MessageBus
 import memopilot.channels.cli as cli
+from memopilot.channels.contracts import MessageBus
 from memopilot.channels.ipc import IPCServerChannel
 
 
