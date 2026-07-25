@@ -445,7 +445,18 @@ def _format_pending_items(value: object) -> str:
         return value.strip()
     if not isinstance(value, list):
         return ""
-    return "\n".join(str(item).strip() for item in value if str(item).strip())
+    lines: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            tag = str(item.get("tag") or "").strip()
+            content = str(item.get("content") or "").strip()
+            if tag and content:
+                lines.append(f"- [{tag}] {content}")
+        else:
+            text = str(item).strip()
+            if text:
+                lines.append(text)
+    return "\n".join(lines)
 
 
 def _replace_recent_turns_block(old_context: str, recent_turns: str) -> str:

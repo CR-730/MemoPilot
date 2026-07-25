@@ -32,6 +32,7 @@ from memopilot.scheduling.tool_context import current_schedule_tool_context
 class _Provider(ChatProvider):
     def __init__(self, responses: Sequence[ModelResponse]) -> None:
         self.responses = list(responses)
+        self.requests: list[tuple[ChatMessage, ...]] = []
 
     async def complete(
         self,
@@ -39,11 +40,53 @@ class _Provider(ChatProvider):
         messages: Sequence[ChatMessage],
         tools: Sequence[ToolSchema],
     ) -> ModelResponse:
+        self.requests.append(tuple(messages))
         return self.responses.pop(0)
 
 
 async def _echo(*, text: str) -> str:
     return text
+
+
+async def test_passive_turn_injects_prototype_prompt_assets(tmp_path) -> None:
+    provider = _Provider(
+        [ModelResponse(content="收到", tool_calls=(), finish_reason="stop")]
+    )
+    received_at = datetime(2026, 7, 23, 20, 30, tzinfo=UTC)
+
+    await AgentRuntime(
+        provider,
+        _tools(),
+        prompt_workspace=tmp_path,
+    ).run(
+        TurnInput(
+            "feishu:chat-1",
+            "你好",
+            received_at=received_at,
+        )
+    )
+
+    system = provider.requests[0][0]
+    assert system.role == "system"
+    assert "你是 MemoPilot" in (system.content or "")
+    assert "## 行为规范" in (system.content or "")
+    assert "request_time=2026-07-23T20:30:00+00:00" in (system.content or "")
+    assert "Channel: feishu" in (system.content or "")
+    assert "Chat ID: chat-1" in (system.content or "")
+
+
+async def test_explicit_system_prompt_is_not_overwritten_by_default_assets(tmp_path) -> None:
+    provider = _Provider(
+        [ModelResponse(content="收到", tool_calls=(), finish_reason="stop")]
+    )
+
+    await AgentRuntime(
+        provider,
+        _tools(),
+        prompt_workspace=tmp_path,
+    ).run(TurnInput("feishu:chat-1", "你好", system_prompt="专用 Prompt"))
+
+    assert provider.requests[0][0].content == "专用 Prompt"
 
 
 def _tools() -> ToolRegistry:
@@ -701,7 +744,7 @@ async def test_runtime_injects_catalog_always_and_explicitly_mentioned_skills() 
     assert "先运行测试" in prompt
     assert "# Skill: policy" in prompt
     assert "每轮核验事实" in prompt
-    assert "read_file" not in prompt
+    assert "先 `read_file` 读取 `<location>` 中的完整 SKILL.md" in prompt
 
 
 async def test_runtime_skill_selection_does_not_leak_between_users() -> None:

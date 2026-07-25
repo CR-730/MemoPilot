@@ -464,6 +464,7 @@ async def build_runtime_bundle(
             event_bus=event_bus,
             skills=active_skills,
             tool_search_enabled=settings.tool_search_enabled,
+            prompt_workspace=settings.workspace,
         )
         memory_jobs = MemoryJobRouter(
             ConsolidationService(

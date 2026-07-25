@@ -12,7 +12,6 @@ from openai import AsyncOpenAI
 from memopilot.memory.prompts import (
     CONSOLIDATION_SYSTEM,
     CONSOLIDATION_USER,
-    HYPOTHESIS_SYSTEM,
     IMPLICIT_LONG_TERM_SYSTEM,
     IMPLICIT_LONG_TERM_USER,
     MEMORY_OPTIMIZER_SYSTEM,
@@ -199,11 +198,13 @@ class ChatPostResponseModel:
                     "忘掉/废弃/过时/改掉”等否定词\n"
                     "2. 否定的对象是 agent 的某个操作行为（不是用户自己的事，不是第三方信息）\n\n"
                     "【以下情况绝对不触发，返回 []】\n"
-                    "✗ 用户在询问/确认 agent 的流程\n"
+                    "✗ 用户在询问/确认 agent 的流程（\"你的流程是什么\""
+                    "\"你怎么做的\"\"你是按什么步骤\"）\n"
                     "✗ 用户在描述/回顾自己的操作\n"
                     "✗ 用户提问句、疑问句（即使涉及 agent 行为）\n"
-                    "✗ 含“也许/可能/猜测”等不确定措辞且无明确废弃指令\n\n"
-                    "若触发，提取受影响的行为主题。返回 JSON 数组，大多数消息应返回 []。"
+                    "✗ 含\"也许/可能/猜测\"等不确定措辞且无明确废弃指令\n\n"
+                    "若触发，提取受影响的行为主题（简短描述，如\"steam查询流程\"）。\n"
+                    "返回 JSON 数组，大多数消息应返回 []。"
                 ),
             ),
             tools=(),
@@ -226,8 +227,10 @@ class ChatPostResponseModel:
                     f"用户明确表示 agent 关于“{topic}”的现有行为/流程有误，需要废弃。\n"
                     "以下是数据库中与该主题相关的现有规则，判断哪些应被标记为废弃：\n\n"
                     f"{block}\n\n"
+                    "规则：\n"
                     f"- 若条目确实描述了“{topic}”相关的 agent 操作流程/行为，输出其 id\n"
-                    "- 若条目无关，不输出；若无关联条目，返回 []\n"
+                    "- 若条目与该主题无关，不输出\n"
+                    "- 若无关联条目，返回 []\n\n"
                     "只返回 JSON 数组，如 [\"abc123\"] 或 []"
                 ),
             ),
@@ -305,12 +308,22 @@ class ChatHypothesisProvider:
         self.provider = provider
 
     async def generate(self, query: str, *, style: str) -> str:
-        focus = "可能发生过的具体事件" if style == "event" else "一般事实或稳定偏好"
+        if style == "event":
+            prompt = (
+                "你是个人助手的记忆系统。根据用户提问，生成一条带具体时间的假想记忆条目，"
+                "格式如 '[2026-03-08] 用户...'\n"
+                "规则：第三人称、简洁事实陈述、只输出那一条文本\n\n"
+                f"用户提问：{query}\n假想记忆条目："
+            )
+        else:
+            prompt = (
+                "你是个人助手的记忆系统。根据用户提问，生成一条假想记忆条目。\n"
+                "规则：始终生成肯定式、第三人称（'用户…'）、简洁事实陈述、"
+                "只输出那一条文本\n\n"
+                f"用户提问：{query}\n假想记忆条目："
+            )
         response = await self.provider.complete(
-            messages=(
-                ChatMessage.system(HYPOTHESIS_SYSTEM),
-                ChatMessage.user(f"原问题：{query}\n改写重点：{focus}"),
-            ),
+            messages=(ChatMessage.user(prompt),),
             tools=(),
         )
         return (response.content or "").strip()
@@ -339,7 +352,7 @@ class ChatOptimizerModel:
                 ChatMessage.system(SELF_OPTIMIZER_SYSTEM),
                 ChatMessage.user(
                     SELF_OPTIMIZER_USER.format(
-                        self_text=self_text or "（空）",
+                        self_content=self_text or "（空）",
                         pending=pending or "（无新内容）",
                     )
                 ),
@@ -438,7 +451,11 @@ def _validate_consolidation_output(output: dict[str, object]) -> dict[str, objec
         pending_items = output.get("pending_items", [])
         if not isinstance(pending_items, list):
             raise ValueError("Consolidation pending_items 必须是数组")
-        pending = "\n".join(str(item).strip() for item in pending_items if str(item).strip())
+        pending = "\n".join(
+            line
+            for item in pending_items
+            if (line := _normalize_pending_item(item))
+        )
         _validate_pending_artifact(pending)
         output["pending_items"] = pending.splitlines()
     artifacts = output.get("artifacts", {})
@@ -511,6 +528,14 @@ def _validate_consolidation_output(output: dict[str, object]) -> dict[str, objec
     if has_memories:
         output["memories"] = normalized
     return output
+
+
+def _normalize_pending_item(value: object) -> str:
+    if isinstance(value, dict):
+        tag = str(value.get("tag") or "").strip()
+        content = str(value.get("content") or "").strip()
+        return f"- [{tag}] {content}" if tag and content else ""
+    return str(value).strip()
 
 
 def _string_list(value: object, *, limit: int) -> list[str]:

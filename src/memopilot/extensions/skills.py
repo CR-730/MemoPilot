@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from memopilot.runtime.prompt_assets import build_skills_catalog_prompt
+
 _SKILL_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _MENTION = re.compile(r"\$([a-z][a-z0-9_-]{0,63})", re.IGNORECASE)
 
@@ -204,7 +206,7 @@ class SkillCatalog:
             lines.append(
                 f"- {skill.name} | {skill.description} | {skill.source} | {availability}"
             )
-        return "\n".join(lines)
+        return build_skills_catalog_prompt("\n".join(lines))
 
     def render(self, names: tuple[str, ...], *, max_chars: int) -> str:
         if max_chars <= 0:

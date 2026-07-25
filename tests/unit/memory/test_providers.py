@@ -41,7 +41,12 @@ async def test_consolidation_and_implicit_long_term_use_separate_contracts() -> 
                             "emotional_weight": 4,
                         }
                     ],
-                    "pending_items": ["- [preference] 用户偏好先读原型生产代码。"],
+                    "pending_items": [
+                        {
+                            "tag": "preference",
+                            "content": "用户偏好先读原型生产代码。",
+                        }
+                    ],
                 },
                 ensure_ascii=False,
             ),
@@ -72,7 +77,12 @@ async def test_consolidation_and_implicit_long_term_use_separate_contracts() -> 
     implicit = await ChatImplicitMemoryExtractor(provider).extract("USER: 开始")  # type: ignore[arg-type]
 
     assert archive["history_entries"][0]["emotional_weight"] == 4
+    assert archive["pending_items"] == ["- [preference] 用户偏好先读原型生产代码。"]
     assert "memories" not in archive
+    assert "Memory Extraction Agent" in (provider.calls[0][1].content or "")
+    assert '"pending_items" → PENDING.md 候选缓冲' in (
+        provider.calls[0][1].content or ""
+    )
     assert [item["kind"] for item in implicit] == ["profile", "procedure"]
     assert "6 个月后" in (provider.calls[1][1].content or "")
     assert "绝对不输出：event" in (provider.calls[1][1].content or "")
@@ -116,7 +126,8 @@ async def test_hypothesis_and_optimizer_adapters_keep_model_roles_explicit() -> 
     assert hypothesis == "事件假设"
     assert memory.startswith("# 用户长期记忆")
     assert self_text.startswith("# MemoPilot 的自我认知")
-    assert all(call[0].role == "system" for call in provider.calls)
+    assert provider.calls[0][0].role == "user"
+    assert all(call[0].role == "system" for call in provider.calls[1:])
     assert "缺席成本测试" in provider.calls[1][1].content
     assert "只允许保留以下三个 section" in provider.calls[2][1].content
 

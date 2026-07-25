@@ -7,6 +7,7 @@ from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from functools import partial
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from memopilot.extensions.events import EventBus
@@ -45,6 +46,7 @@ from memopilot.runtime.phases import (
     PhaseModule,
     PhasePipeline,
 )
+from memopilot.runtime.prompt_assets import build_passive_system_prompt
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.react import (
     AfterStepControl,
@@ -150,6 +152,7 @@ class AgentRuntime:
         event_bus: EventBus | None = None,
         skills: SkillCatalog | None = None,
         tool_search_enabled: bool = False,
+        prompt_workspace: Path | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -158,6 +161,7 @@ class AgentRuntime:
         self._memory_profile = memory_profile
         self._event_bus = event_bus
         self._tool_search_enabled = tool_search_enabled
+        self._prompt_workspace = prompt_workspace
         self._tool_discovery = ToolDiscoveryState()
         prompt_renderer = PromptRenderer(tuple(prompt_blocks))
         if prompt_max_chars <= 0:
@@ -263,6 +267,19 @@ class AgentRuntime:
         memory_assert_current: Callable[[], None] | None = None,
         memory_fenced_write: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> TurnResult:
+        if (
+            not turn.system_prompt.strip()
+            and self._prompt_workspace is not None
+            and turn.prompt_scope == "passive"
+        ):
+            turn = replace(
+                turn,
+                system_prompt=build_passive_system_prompt(
+                    workspace=self._prompt_workspace,
+                    session_key=turn.session_key,
+                    received_at=turn.received_at,
+                ),
+            )
         state = _turn_state(turn)
         context = PhaseContext(
             slots={
