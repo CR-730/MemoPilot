@@ -62,11 +62,13 @@ class FinalResponseDispatcher:
         effects: EffectRepository,
         transport: TextTransport,
         *,
+        transports: dict[str, TextTransport] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._operational = operational
         self._effects = effects
         self._transport = transport
+        self._transports = transports or {}
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def create_live_progress(
@@ -83,7 +85,10 @@ class FinalResponseDispatcher:
             job = self._operational.get_job(claim.job_id)
             if job is None:
                 return None
-            chat_id = str(json.loads(job.payload_json).get("chat_id") or "")
+            payload = json.loads(job.payload_json)
+            if str(payload.get("channel") or "feishu") != "feishu":
+                return None
+            chat_id = str(payload.get("chat_id") or "")
             if not chat_id:
                 return None
             provider_uuid = str(uuid5(NAMESPACE_URL, f"feishu:{claim.run_id}:live-card"))
@@ -117,6 +122,7 @@ class FinalResponseDispatcher:
         if job is None:
             raise KeyError(claim.job_id)
         payload = json.loads(job.payload_json)
+        channel = str(payload.get("channel") or "feishu")
         chat_id = str(payload.get("chat_id") or "")
         if not chat_id:
             raise ValueError("Agent Job 缺少飞书 chat_id")
@@ -127,7 +133,7 @@ class FinalResponseDispatcher:
                 operation_id=operation_id or f"{claim.run_id}:final-text",
                 run_id=claim.run_id,
                 session_key=claim.session_key,
-                channel="feishu",
+                channel=channel,
                 chat_id=chat_id,
                 text=text,
                 expected_activity_version=job.activity_version,
@@ -153,7 +159,8 @@ class FinalResponseDispatcher:
                 self._require_effect(effect.operation_id),
             )
         try:
-            receipt = await self._transport.send(
+            transport = self._transports.get(channel, self._transport)
+            receipt = await transport.send(
                 effect.chat_id,
                 effect.text,
                 provider_uuid=effect.provider_uuid,
@@ -246,7 +253,9 @@ class FinalResponseDispatcher:
                 self._require_effect(operation_id),
             )
         try:
-            receipt = await self._transport.send(
+            channel = effect.channel
+            transport = self._transports.get(channel, self._transport)
+            receipt = await transport.send(
                 effect.chat_id,
                 effect.text,
                 provider_uuid=effect.provider_uuid,

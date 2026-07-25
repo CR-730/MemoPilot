@@ -12,13 +12,13 @@ from uuid import uuid4
 from redis.asyncio import Redis
 
 from memopilot.app.inbound import InboundBridge, OperationalInterruptController
-from memopilot.app.service import AppService
+from memopilot.app.service import GatewayService
 from memopilot.channels.base import AttachmentStore, SessionIdentityIndex
 from memopilot.channels.contracts import MessageBus
 from memopilot.channels.feishu import FeishuChannel
 from memopilot.config import MemoPilotSettings
 from memopilot.delivery.effects import EffectRepository
-from memopilot.delivery.feishu import FinalResponseDispatcher
+from memopilot.delivery.feishu import FinalResponseDispatcher, TextTransport
 from memopilot.delivery.reconciliation import EffectReconciliationService
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.mcp_manage_tools import register_mcp_management_tools
@@ -89,7 +89,7 @@ from memopilot.tasks.lease import SessionLeaseManager
 from memopilot.tasks.operational import FenceToken, OperationalRepository, RunClaim
 from memopilot.tasks.outbox import OutboxDispatcher
 from memopilot.tasks.redis_queue import RedisTaskQueue
-from memopilot.worker.service import WorkerService
+from memopilot.worker.service import RunnerService
 
 _BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
 _PROACTIVE_CONTEXT_TEMPLATE = """# Proactive Context
@@ -104,20 +104,24 @@ _PROACTIVE_CONTEXT_TEMPLATE = """# Proactive Context
 
 @dataclass(slots=True)
 class AppBundle:
-    service: AppService
+    service: GatewayService
     redis: Redis
+    console: object | None = None
 
     async def close(self) -> None:
         await self.service.stop()
+        if self.console is not None:
+            await self.console.stop()  # type: ignore[attr-defined]
         await self.redis.aclose()
 
 
 @dataclass(slots=True)
 class WorkerBundle:
-    service: WorkerService
+    service: RunnerService
     transport: FeishuChannel
     redis: Redis
     runtime: RuntimeBundle
+    console_transport: object | None = None
     _extensions_started: bool = False
 
     @property
@@ -133,6 +137,8 @@ class WorkerBundle:
     async def close(self) -> None:
         await self.runtime.close_extensions()
         await self.transport.stop()
+        if self.console_transport is not None:
+            await self.console_transport.stop()  # type: ignore[attr-defined]
         await self.redis.aclose()
 
 
@@ -189,20 +195,23 @@ def build_app(settings: MemoPilotSettings) -> AppBundle:
     queue = RedisTaskQueue(redis)
     signal = RedisInterruptSignal(redis)
     bus = MessageBus()
+    from memopilot.channels.ipc import IPCServerChannel
+
+    console = IPCServerChannel(bus)
     channel = _feishu_channel(
         settings,
         repository,
         bus=bus,
         interrupt_controller=OperationalInterruptController(repository, signal=signal),
     )
-    service = AppService(
+    service = GatewayService(
         channel=channel,
         bus=bus,
         bridge=InboundBridge(repository),
         queue=queue,
         outbox=OutboxDispatcher(repository, queue, owner_id=f"app-{uuid4().hex[:8]}"),
     )
-    return AppBundle(service, redis)
+    return AppBundle(service, redis, console)
 
 
 def build_scheduler(settings: MemoPilotSettings) -> SchedulerBundle:
@@ -240,7 +249,11 @@ def build_scheduler(settings: MemoPilotSettings) -> SchedulerBundle:
     )
 
 
-async def build_worker(settings: MemoPilotSettings) -> WorkerBundle:
+async def build_worker(
+    settings: MemoPilotSettings,
+    *,
+    console_transport: object | None = None,
+) -> WorkerBundle:
     settings.validate_worker_ready()
     repository = _repository(settings)
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -256,6 +269,11 @@ async def build_worker(settings: MemoPilotSettings) -> WorkerBundle:
         repository,
         EffectRepository(repository.database),
         transport,
+        transports=(
+            {"cli": cast(TextTransport, console_transport)}
+            if console_transport is not None
+            else None
+        ),
     )
     try:
         runtime_bundle = await build_runtime_bundle(
@@ -268,7 +286,7 @@ async def build_worker(settings: MemoPilotSettings) -> WorkerBundle:
         await transport.stop()
         await redis.aclose()
         raise
-    service = WorkerService(
+    service = RunnerService(
         repository,
         queue,
         leases,
@@ -285,6 +303,7 @@ async def build_worker(settings: MemoPilotSettings) -> WorkerBundle:
         transport,
         redis,
         runtime_bundle,
+        console_transport,
     )
 
 

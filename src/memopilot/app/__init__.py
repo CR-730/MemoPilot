@@ -1,6 +1,6 @@
-"""MemoPilot App 进程组件。"""
+"""MemoPilot Gateway 组件。"""
 
 from memopilot.app.inbound import InboundBridge, OperationalInterruptController
-from memopilot.app.service import AppService
+from memopilot.app.service import GatewayService
 
-__all__ = ["AppService", "InboundBridge", "OperationalInterruptController"]
+__all__ = ["GatewayService", "InboundBridge", "OperationalInterruptController"]

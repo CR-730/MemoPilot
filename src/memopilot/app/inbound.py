@@ -82,7 +82,7 @@ class OperationalInterruptController:
             try:
                 await self._signal.publish(result.target_run_id)
             except Exception as exc:
-                logger.warning("Redis 中断通知写入失败，Worker 将回退轮询 SQLite: %s", exc)
+                logger.warning("Redis 中断通知写入失败，Runner 将回退轮询 SQLite: %s", exc)
         provider_uuid = str(uuid5(NAMESPACE_URL, f"feishu:interrupt:{stable_event_id}"))
         message_text = (
             "已收到停止请求，正在中断本轮任务。"

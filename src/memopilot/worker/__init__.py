@@ -1,5 +1,5 @@
-"""Worker 进程服务。"""
+"""Runner 服务。"""
 
-from memopilot.worker.service import WorkerService
+from memopilot.worker.service import RunnerService
 
-__all__ = ["WorkerService"]
+__all__ = ["RunnerService"]

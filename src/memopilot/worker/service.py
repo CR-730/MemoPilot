@@ -28,7 +28,7 @@ from memopilot.tasks.redis_queue import QueueMessage, RedisTaskQueue
 _TERMINAL_JOB_STATES = frozenset({"succeeded", "failed", "cancelled", "needs_review"})
 
 
-class WorkerService:
+class RunnerService:
     def __init__(
         self,
         repository: OperationalRepository,
@@ -265,7 +265,7 @@ class WorkerService:
                 if not await self._leases.renew(lease, now=self._clock()):
                     execution.cancel()
                     await asyncio.gather(execution, return_exceptions=True)
-                    raise LostLeaseError("会话 Lease 续租失败，当前 Worker 已停止提交")
+                    raise LostLeaseError("会话 Lease 续租失败，当前 Runner 已停止提交")
                 self._repository.heartbeat_run(
                     claim.run_id,
                     lease=lease,
@@ -347,4 +347,7 @@ class WorkerService:
             await self._queue.acknowledge(message)
 
 
-__all__ = ["WorkerService"]
+# 兼容已有内部导入；新代码统一使用 RunnerService。
+WorkerService = RunnerService
+
+__all__ = ["RunnerService", "WorkerService"]

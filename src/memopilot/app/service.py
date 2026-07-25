@@ -22,7 +22,7 @@ class ChannelLifecycle(Protocol):
     async def stop(self) -> None: ...
 
 
-class AppService:
+class GatewayService:
     """只负责编排 App 所属组件，不承载 Agent Runtime。"""
 
     def __init__(
@@ -77,6 +77,12 @@ class AppService:
                 self._unsubscribe_inbound = None
 
     async def _persist_inbound(self, message: InboundMessage) -> None:
+        logger.info(
+            "收到消息 channel=%s sender=%s content=%s",
+            message.channel,
+            message.sender,
+            message.content[:120],
+        )
         while True:
             try:
                 await self._bridge.handle(message)
@@ -100,4 +106,7 @@ class AppService:
                 await asyncio.sleep(self._idle_interval)
 
 
-__all__ = ["AppService", "ChannelLifecycle"]
+# 兼容已有内部导入；新代码统一使用 GatewayService。
+AppService = GatewayService
+
+__all__ = ["GatewayService", "ChannelLifecycle", "AppService"]
