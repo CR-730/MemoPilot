@@ -45,7 +45,7 @@ async def test_cli_client_can_send_and_receive_reply_offline(
 ) -> None:
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         line = await reader.readline()
-        assert b"本地离线测试" in line
+        assert "本地离线测试".encode() in line
         writer.write('{"content":"本地假服务回复"}\n'.encode())
         await writer.drain()
         await asyncio.sleep(0.05)
