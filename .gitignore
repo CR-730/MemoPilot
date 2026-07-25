@@ -18,6 +18,7 @@ htmlcov/
 Thumbs.db
 
 workspace/
+config.toml
 *.db
 *.db-shm
 *.db-wal
