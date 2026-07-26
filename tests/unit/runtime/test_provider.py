@@ -113,6 +113,44 @@ async def test_task_completion_overrides_token_budget_and_thinking_mode() -> Non
     assert "reasoning_content" not in completions.calls[0]["messages"][0]
 
 
+async def test_provider_sends_image_to_vision_model() -> None:
+    response = SimpleNamespace(
+        id="chat-vision",
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content="图片里是一只猫", tool_calls=None),
+            )
+        ],
+        usage=None,
+    )
+    client, completions = _client(response)
+    provider = OpenAICompatibleProvider(client=client, model="vision-model")
+
+    result = await provider.complete_vision(
+        data_uri="data:image/png;base64,AAAA",
+        prompt="描述图片",
+    )
+
+    assert result == "图片里是一只猫"
+    assert completions.calls[0]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "描述图片"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,AAAA",
+                        "detail": "high",
+                    },
+                },
+            ],
+        }
+    ]
+    assert completions.calls[0]["tools"] == ()
+
+
 async def test_provider_serializes_assistant_and_tool_messages() -> None:
     response = SimpleNamespace(
         id="chat-2",

@@ -26,7 +26,7 @@ class FunctionCall:
 @dataclass(frozen=True)
 class ChatMessage:
     role: Literal["system", "user", "assistant", "tool"]
-    content: str | None
+    content: str | list[dict[str, Any]] | None
     tool_calls: tuple[FunctionCall, ...] = ()
     tool_call_id: str | None = None
     name: str | None = None
@@ -38,6 +38,10 @@ class ChatMessage:
 
     @classmethod
     def user(cls, content: str) -> ChatMessage:
+        return cls(role="user", content=content)
+
+    @classmethod
+    def user_blocks(cls, content: list[dict[str, Any]]) -> ChatMessage:
         return cls(role="user", content=content)
 
     @classmethod

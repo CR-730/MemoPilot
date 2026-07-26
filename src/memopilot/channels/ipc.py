@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from uuid import uuid4
 
 from memopilot.channels.contracts import InboundMessage, MessageBus, SendReceipt
@@ -64,11 +65,21 @@ class IPCServerChannel:
             writer.close()
             await writer.wait_closed()
 
-    async def send(self, chat_id: str, message: str, *, provider_uuid: str) -> SendReceipt:
+    async def send(
+        self,
+        chat_id: str,
+        message: str,
+        *,
+        provider_uuid: str,
+        metadata: Mapping[str, object] | None = None,
+    ) -> SendReceipt:
         writer = self._writers.get(chat_id)
         if writer is None or writer.is_closing():
             raise ConnectionError("CLI 客户端已断开")
-        writer.write((json.dumps({"content": message}, ensure_ascii=False) + "\n").encode())
+        payload: dict[str, object] = {"content": message}
+        if metadata:
+            payload["metadata"] = dict(metadata)
+        writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
         await writer.drain()
         return SendReceipt(message_id=provider_uuid)
 

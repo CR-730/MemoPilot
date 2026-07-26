@@ -150,6 +150,15 @@ model = "deepseek-chat"
 api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com/v1"
 enable_thinking = true
+multimodal = false
+[llm.fast]
+model = "qwen-turbo"
+api_key = "fast-secret"
+base_url = "https://fast.example/v1"
+[llm.vl]
+model = "qwen-vl"
+api_key = "vl-secret"
+base_url = "https://vl.example/v1"
 [agent]
 max_tokens = 4096
 max_iterations = 12
@@ -176,6 +185,13 @@ channel_name = "feishu_work"
     assert settings.chat_model == "deepseek-chat"
     assert settings.chat_api_key.get_secret_value() == "chat-secret"
     assert settings.llm_thinking_enabled is True
+    assert settings.chat_multimodal is False
+    assert settings.fast_model == "qwen-turbo"
+    assert settings.fast_api_key.get_secret_value() == "fast-secret"
+    assert settings.fast_base_url == "https://fast.example/v1"
+    assert settings.vl_model == "qwen-vl"
+    assert settings.vl_api_key.get_secret_value() == "vl-secret"
+    assert settings.vl_base_url == "https://vl.example/v1"
     assert settings.llm_max_output_tokens == 4096
     assert settings.llm_max_iterations == 12
     assert settings.tool_search_enabled is True

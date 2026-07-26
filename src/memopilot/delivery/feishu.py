@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -39,6 +39,7 @@ class TextTransport(Protocol):
         message: str,
         *,
         provider_uuid: str,
+        metadata: Mapping[str, object] | None = None,
     ) -> SendReceipt: ...
 
 
@@ -117,6 +118,7 @@ class FinalResponseDispatcher:
         lease: FenceToken,
         text: str,
         operation_id: str | None = None,
+        metadata: Mapping[str, object] | None = None,
     ) -> DeliveryResult:
         job = self._operational.get_job(claim.job_id)
         if job is None:
@@ -160,11 +162,19 @@ class FinalResponseDispatcher:
             )
         try:
             transport = self._transports.get(channel, self._transport)
-            receipt = await transport.send(
-                effect.chat_id,
-                effect.text,
-                provider_uuid=effect.provider_uuid,
-            )
+            if channel == "cli" and metadata:
+                receipt = await transport.send(
+                    effect.chat_id,
+                    effect.text,
+                    provider_uuid=effect.provider_uuid,
+                    metadata=metadata,
+                )
+            else:
+                receipt = await transport.send(
+                    effect.chat_id,
+                    effect.text,
+                    provider_uuid=effect.provider_uuid,
+                )
         except asyncio.CancelledError:
             self._effects.mark_unknown(
                 effect.operation_id,

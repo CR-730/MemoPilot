@@ -228,6 +228,24 @@ def build_drift_tool_registry(
             ),
         )
     )
+    if shared_tools is not None:
+        # Drift 的本地文件与发送工具保留专用实现；其余公共工具直接复用
+        # 主 Agent 注册表，确保提示词声明与实际可见工具一致。
+        shared_names = tuple(
+            name
+            for name in (
+                "recall_memory",
+                "shell",
+                "task_output",
+                "task_stop",
+                "web_search",
+                "web_fetch",
+                "fetch_messages",
+                "search_messages",
+            )
+            if name not in registry.tool_names and shared_tools.get_tool(name) is not None
+        )
+        registry.register_existing(shared_tools, shared_names)
     return registry
 
 

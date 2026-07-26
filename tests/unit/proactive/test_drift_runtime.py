@@ -104,3 +104,25 @@ async def test_mount_server_copies_only_connected_mcp_tools(tmp_path: Path) -> N
         FunctionCall("2", "mount_server", {"server": "missing"})
     )
     assert "unavailable" in str(unavailable.result)
+
+
+@pytest.mark.asyncio
+async def test_drift_reuses_shared_public_tools(tmp_path: Path) -> None:
+    async def recall(**_: object) -> str:
+        return "ok"
+
+    shared = ToolRegistry()
+    shared.register(
+        Tool(
+            "recall_memory",
+            "recall",
+            {"type": "object", "properties": {}},
+            recall,
+        )
+    )
+    registry = build_drift_tool_registry(
+        workspace=tmp_path,
+        state=DriftRunState(frozenset()),
+        shared_tools=shared,
+    )
+    assert registry.has_tool("recall_memory")

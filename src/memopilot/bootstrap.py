@@ -74,8 +74,10 @@ from memopilot.proactive.job_handler import (
 from memopilot.proactive.mcp_sources import ProactiveSourceGateway, load_proactive_sources
 from memopilot.proactive.service import ProactiveService
 from memopilot.proactive.store import ProactiveRepository
+from memopilot.runtime.common_tools import register_common_tools
+from memopilot.runtime.common_tools.vision import build_read_image_vision_tool
 from memopilot.runtime.engine import AgentRuntime
-from memopilot.runtime.providers import ChatProvider, OpenAICompatibleProvider
+from memopilot.runtime.providers import ChatProvider, OpenAICompatibleProvider, VisionProvider
 from memopilot.runtime.tool_search import build_tool_search_tool
 from memopilot.runtime.tools import Tool, ToolRegistry
 from memopilot.runtime.worker import RuntimeJobExecutor
@@ -92,6 +94,7 @@ from memopilot.tasks.redis_queue import RedisTaskQueue
 from memopilot.worker.service import RunnerService
 
 _BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
+_BUILTIN_PLUGINS_DIR = Path(__file__).resolve().parent / "builtin_plugins"
 _PROACTIVE_CONTEXT_TEMPLATE = """# Proactive Context
 
 在这里写用户当前对主动推送的明确要求和规则。
@@ -332,6 +335,8 @@ async def build_runtime_bundle(
     settings: MemoPilotSettings,
     *,
     chat_provider: ChatProvider | None = None,
+    fast_provider: ChatProvider | None = None,
+    vl_provider: VisionProvider | None = None,
     embedder: EmbeddingProvider | None = None,
     tools: Iterable[Tool] = (),
     final_response_dispatcher: FinalResponseDispatcher | None = None,
@@ -346,6 +351,8 @@ async def build_runtime_bundle(
         busy_timeout_seconds=settings.sqlite_busy_timeout_seconds,
     )
     provider = chat_provider or _chat_provider(settings)
+    light_provider = fast_provider or _fast_provider(settings) or provider
+    vision_provider = vl_provider or _vl_provider(settings)
     embedding_provider = embedder or OpenAIEmbeddingProvider(
         api_key=settings.embedding_api_key.get_secret_value(),
         base_url=settings.embedding_base_url,
@@ -383,11 +390,25 @@ async def build_runtime_bundle(
     )
     memory_engine = LayeredMemoryEngine(
         retriever,
-        hypothesis_provider=ChatHypothesisProvider(provider),
+        hypothesis_provider=ChatHypothesisProvider(light_provider),
     )
     registry = ToolRegistry(configured_tools)
     registry.register(build_recall_memory_tool(memory_engine), always_on=True)
     registry.register(build_tool_search_tool(registry), always_on=True)
+    register_common_tools(
+        registry,
+        workspace=settings.workspace,
+        repository=operational,
+        multimodal=settings.chat_multimodal,
+        vl_available=vision_provider is not None,
+    )
+    if not settings.chat_multimodal and vision_provider is not None and settings.vl_model:
+        registry.register(
+            build_read_image_vision_tool(vision_provider, workspace=settings.workspace),
+            always_on=True,
+            risk="read-only",
+            search_hint="看图 识图 图片内容 视觉识别 VL",
+        )
     schedule_service = ScheduleService(
         ScheduleRepository(
             settings.operational_database,
@@ -414,7 +435,7 @@ async def build_runtime_bundle(
         on_tools_changed=refresh_skill_availability,
     )
     manager = PluginManager(
-        [settings.plugins_dir],
+        [settings.plugins_dir, _BUILTIN_PLUGINS_DIR],
         event_bus=event_bus,
         tool_registry=registry,
         workspace=settings.workspace,
@@ -452,7 +473,7 @@ async def build_runtime_bundle(
             skill_diagnostics = ()
         skill_holder.append(active_skills)
         procedure_tagger = ChatProcedureTagger(
-            provider,
+            light_provider,
             allowed_tools={
                 *(name for name in registry.tool_names),
                 "memorize",
@@ -490,7 +511,7 @@ async def build_runtime_bundle(
                 settings.operational_database,
                 markdown,
                 ChatConsolidationExtractor(provider, markdown),
-                recent_context=ChatRecentContextCompressor(provider),
+                recent_context=ChatRecentContextCompressor(light_provider),
                 keep_count=settings.memory_consolidation_keep_count,
                 min_new_messages=settings.memory_consolidation_min_new_messages,
             ),
@@ -509,7 +530,7 @@ async def build_runtime_bundle(
                 PostResponseMemoryWorker(
                     store,
                     retriever,
-                    ChatPostResponseModel(provider),
+                    ChatPostResponseModel(light_provider),
                 ),
             ),
         )
@@ -727,6 +748,43 @@ def _chat_provider(settings: MemoPilotSettings) -> OpenAICompatibleProvider:
         max_retries=settings.llm_retry_limit,
         timeout_seconds=settings.llm_timeout_seconds,
         thinking_enabled=settings.llm_thinking_enabled,
+    )
+
+
+def _fast_provider(settings: MemoPilotSettings) -> OpenAICompatibleProvider | None:
+    if not settings.fast_model or not (
+        settings.fast_api_key.get_secret_value() or settings.fast_base_url
+    ):
+        return None
+    base_url = settings.fast_base_url or settings.chat_base_url
+    extra_body = (
+        None
+        if "googleapis.com" in base_url or "generativelanguage" in base_url
+        else {"enable_thinking": False}
+    )
+    return OpenAICompatibleProvider.from_credentials(
+        api_key=settings.fast_api_key.get_secret_value()
+        or settings.chat_api_key.get_secret_value(),
+        base_url=base_url,
+        model=settings.fast_model,
+        max_output_tokens=settings.llm_max_output_tokens,
+        max_retries=settings.llm_retry_limit,
+        timeout_seconds=settings.llm_timeout_seconds,
+        extra_body=extra_body,
+    )
+
+
+def _vl_provider(settings: MemoPilotSettings) -> OpenAICompatibleProvider | None:
+    if settings.chat_multimodal or not settings.vl_model:
+        return None
+    return OpenAICompatibleProvider.from_credentials(
+        api_key=settings.vl_api_key.get_secret_value()
+        or settings.chat_api_key.get_secret_value(),
+        base_url=settings.vl_base_url or settings.chat_base_url,
+        model=settings.vl_model,
+        max_output_tokens=settings.llm_max_output_tokens,
+        max_retries=settings.llm_retry_limit,
+        timeout_seconds=settings.llm_timeout_seconds,
     )
 
 

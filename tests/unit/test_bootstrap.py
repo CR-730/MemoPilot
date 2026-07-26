@@ -145,8 +145,25 @@ async def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(
     )
 
     tool_names = {schema["function"]["name"] for schema in bundle.tools.schemas()}
+    assert {
+        "tool_search",
+        "shell",
+        "task_output",
+        "task_stop",
+        "web_search",
+        "web_fetch",
+        "read_file",
+        "list_dir",
+        "fetch_messages",
+        "search_messages",
+        "message_push",
+        "write_file",
+        "edit_file",
+    } <= tool_names
     assert "recall_memory" in tool_names
     assert {"schedule", "list_schedules", "cancel_schedule"} <= tool_names
+    assert any("shell_restore" in hook_id for hook_id in bundle.hook_ids)
+    assert any("shell_safety" in hook_id for hook_id in bundle.hook_ids)
     assert bundle.runtime is not None
     assert bundle.executor is not None
     assert bundle.executor._system_jobs is not None

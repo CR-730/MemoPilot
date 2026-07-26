@@ -12,6 +12,7 @@ import logging
 import mimetypes
 import threading
 import time
+from collections.abc import Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,19 @@ logger = logging.getLogger(__name__)
 _API_BASE = "https://open.feishu.cn/open-apis"
 _TOKEN_URL = f"{_API_BASE}/auth/v3/tenant_access_token/internal"
 _SEEN_EVENT_MAXSIZE = 500
+
+
+class _ExpectedWsShutdownFilter(logging.Filter):
+    """仅隐藏显式停机时 SDK 把正常断连误报成 ERROR 的日志。"""
+
+    def __init__(self, stop_requested: threading.Event) -> None:
+        super().__init__()
+        self._stop_requested = stop_requested
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not self._stop_requested.is_set():
+            return True
+        return "receive message loop exit" not in record.getMessage()
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +95,8 @@ class FeishuChannel:
         self._ws_thread: threading.Thread | None = None
         self._ws_stop_requested = threading.Event()
         self._ws_ready = threading.Event()
+        self._ws_receive_started = threading.Event()
+        self._ws_receive_stopped = threading.Event()
         self._ws_start_error: BaseException | None = None
         self._ws_event_timeout_seconds = ws_event_timeout_seconds
         self._ws_stop_timeout_seconds = ws_stop_timeout_seconds
@@ -213,7 +229,15 @@ class FeishuChannel:
         path = self._attachments.write_bytes(data, prefix="feishu_image_", suffix=suffix)
         return (str(path),)
 
-    async def send(self, chat_id: str, message: str, *, provider_uuid: str) -> SendReceipt:
+    async def send(
+        self,
+        chat_id: str,
+        message: str,
+        *,
+        provider_uuid: str,
+        metadata: Mapping[str, object] | None = None,
+    ) -> SendReceipt:
+        del metadata
         token = await self._get_tenant_access_token()
         body = {
             "receive_id": str(chat_id),
@@ -335,6 +359,8 @@ class FeishuChannel:
             return
         self._ws_stop_requested.clear()
         self._ws_ready.clear()
+        self._ws_receive_started.clear()
+        self._ws_receive_stopped.clear()
         self._ws_start_error = None
         self._main_loop = asyncio.get_running_loop()
         self._ws_thread = threading.Thread(
@@ -366,6 +392,7 @@ class FeishuChannel:
             original_connect = getattr(client, "_connect", None)
             if original_connect is None:
                 raise RuntimeError("当前飞书 SDK 不支持长连接就绪探测")
+            self._guard_receive_loop(client)
 
             async def connect_and_mark_ready() -> None:
                 await original_connect()
@@ -383,12 +410,37 @@ class FeishuChannel:
             return
         if self._ws_stop_requested.is_set():
             return
+        sdk_logger = logging.getLogger("Lark")
+        shutdown_filter = _ExpectedWsShutdownFilter(self._ws_stop_requested)
+        sdk_logger.addFilter(shutdown_filter)
         try:
             self._ws_client.start()
         except Exception as exc:
+            if self._ws_stop_requested.is_set():
+                return
             self._ws_start_error = exc
             self._ws_ready.set()
             logger.warning("[feishu] long connection exited: %s", exc)
+        finally:
+            sdk_logger.removeFilter(shutdown_filter)
+
+    def _guard_receive_loop(self, client: Any) -> None:
+        """等待 SDK 接收任务退出，并吞掉显式停机产生的正常关闭异常。"""
+        original_receive = getattr(client, "_receive_message_loop", None)
+        if original_receive is None:
+            return
+
+        async def receive_with_shutdown_guard() -> None:
+            self._ws_receive_started.set()
+            try:
+                await original_receive()
+            except BaseException:
+                if not self._ws_stop_requested.is_set():
+                    raise
+            finally:
+                self._ws_receive_stopped.set()
+
+        client._receive_message_loop = receive_with_shutdown_guard
 
     def _on_ws_message(self, data: Any) -> None:
         payload = _marshal_ws_event(data)
@@ -443,6 +495,13 @@ class FeishuChannel:
                     timeout=timeout_seconds,
                 )
                 if ws_loop is not asyncio.get_running_loop():
+                    if self._ws_receive_started.is_set():
+                        stopped = await asyncio.to_thread(
+                            self._ws_receive_stopped.wait,
+                            timeout_seconds,
+                        )
+                        if not stopped:
+                            raise TimeoutError("飞书长连接接收任务未在停止超时内退出")
                     ws_loop.call_soon_threadsafe(ws_loop.stop)
         except TimeoutError:
             raise

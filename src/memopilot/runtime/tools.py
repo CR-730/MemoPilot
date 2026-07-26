@@ -111,7 +111,13 @@ class ToolObservation:
     def content(self) -> str:
         payload: dict[str, Any] = {"ok": self.ok, "status": self.status}
         if self.ok:
-            payload["result"] = self.result
+            if (
+                isinstance(self.result, dict)
+                and isinstance(self.result.get("content_blocks"), list)
+            ):
+                payload["result"] = self.result.get("text") or "工具执行完成。"
+            else:
+                payload["result"] = self.result
         else:
             payload["error"] = {
                 "type": self.error_type,

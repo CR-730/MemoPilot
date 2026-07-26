@@ -1,4 +1,4 @@
-"""MemoPilot 的原型式启动入口。"""
+"""MemoPilot 的单命令启动入口：启动服务并进入终端 CLI。"""
 
 from __future__ import annotations
 

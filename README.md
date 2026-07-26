@@ -120,6 +120,11 @@ cp .env.example .env
 
 ```dotenv
 MEMOPILOT_CHAT_API_KEY=你的模型密钥
+MEMOPILOT_CHAT_MULTIMODAL=false
+MEMOPILOT_FAST_MODEL=轻量任务模型
+MEMOPILOT_FAST_API_KEY=轻量任务模型密钥
+MEMOPILOT_VL_MODEL=视觉模型
+MEMOPILOT_VL_API_KEY=视觉模型密钥
 MEMOPILOT_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 MEMOPILOT_EMBEDDING_MODEL=text-embedding-v2
 MEMOPILOT_EMBEDDING_API_KEY=你的向量模型密钥
@@ -129,7 +134,9 @@ MEMOPILOT_FEISHU_APP_SECRET=你的飞书应用 Secret
 MEMOPILOT_FEISHU_ALLOW_FROM=["允许的 open_id"]
 ```
 
-密钥只放在本地 `.env` 或外部配置文件中，不要提交到 Git。默认聊天 Provider 使用 OpenAI-compatible 接口，可通过 `MEMOPILOT_CHAT_BASE_URL` 和 `MEMOPILOT_CHAT_MODEL` 切换模型。
+密钥只放在本地 `.env` 或外部配置文件中，不要提交到 Git。三个对话 Provider 均使用 OpenAI-compatible 接口：`main` 执行 Agent、主动判断和长期记忆提取；`fast` 执行 Recent Context、PostResponse、记忆假设查询和 Procedure Tagger，未配置时自动回退到 `main`；主模型不支持图片时，`vl` 提供 `read_image_vision` 工具。
+
+也可以直接在 `config.toml` 中配置 `[llm.main]`、`[llm.fast]` 和 `[llm.vl]`。当 `llm.main.multimodal = true` 时，图片直接进入主模型，不注册独立 VL 工具。
 
 ### 3. 配置 MCP
 
@@ -140,18 +147,12 @@ MCP 第一版使用 stdio。将服务器定义放在 `workspace/mcp_servers.json
 一个命令即可启动 Gateway、Scheduler 和 Runner。它们在同一个 `asyncio` 事件循环中协作：
 
 ```bash
-uv run main.py
+uv run python main.py
 ```
 
 启动入口会先检查配置中的 Redis。对于本机地址，它会优先复用已有服务；连接失败时自动查找并启动 `redis-server`，退出时只关闭本次启动的子进程。可以通过 `MEMOPILOT_REDIS_SERVER` 指定可执行文件路径。远程 Redis 只做连接检查，不会启动本地替代服务。
 
-启动后可在另一个终端使用原型同款纯文本 CLI：
-
-```bash
-uv run main.py cli
-```
-
-输入消息后，主进程会通过本地 TCP 通道把最终回复返回到 CLI；输入 `exit` 退出。
+启动后当前终端会直接进入纯文本 CLI，不需要再启动第二个 CLI 进程。输入消息后，主进程会在同一个事件循环中处理并返回最终回复；输入 `exit` 退出。
 
 也可以显式使用包入口：
 
@@ -159,12 +160,7 @@ uv run main.py cli
 uv run memopilot run --config config.toml --workspace workspace
 ```
 
-如果使用旧原型配置，先将旧原型的 `config.toml` 放到当前项目根目录。该文件已被 `.gitignore` 忽略，不会进入 Git：
-
-```powershell
-Copy-Item D:\PROJECTS\MemoPilot-Agent-Main\config.toml .\config.toml
-uv run memopilot run --config config.toml --workspace workspace
-```
+请直接填写 MemoPilot 根目录现有的 `config.toml`，不要覆盖复制其他项目的完整配置文件。只迁移当前配置模板中真实存在的同名字段；未出现在模板中的旧频道、旧 Provider 或旧主动链路字段不会生效。
 
 ## 记忆系统
 

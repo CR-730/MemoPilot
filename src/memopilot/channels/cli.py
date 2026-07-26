@@ -68,6 +68,23 @@ class CLIClient:
                 print("\n连接已断开")
                 return
             data = json.loads(line)
+            metadata = data.get("metadata")
+            if isinstance(metadata, dict):
+                tool_chain = metadata.get("tool_chain")
+                if isinstance(tool_chain, list):
+                    for group in tool_chain:
+                        if not isinstance(group, dict):
+                            continue
+                        calls = group.get("calls")
+                        if not isinstance(calls, list):
+                            continue
+                        names = [
+                            str(item.get("name") or "unknown")
+                            for item in calls
+                            if isinstance(item, dict)
+                        ]
+                        if names:
+                            print(f"\n工具调用: {'、'.join(names)}")
             print(f"\n{data['content']}\n> ", end="", flush=True)
 
 

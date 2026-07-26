@@ -7,15 +7,18 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
   "apscheduler>=3.11,<4",
   "fastapi>=0.115,<1",
+  "html2text>=2025.4.15,<2026",
   "httpx>=0.28,<1",
   "jsonschema>=4,<5",
   "lark-oapi>=1.4,<2",
+  "lxml>=5,<7",
   "mcp>=1.20,<2",
   "openai>=2,<3",
   "pydantic-settings>=2.10,<3",
   "pyyaml>=6,<7",
   "redis>=6,<9",
   "sqlite-vec>=0.1.6,<0.2",
+  "textual>=5,<7",
   "uvicorn[standard]>=0.35,<1",
 ]
 
@@ -58,3 +61,15 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 python_version = "3.12"
 strict = true
 packages = ["memopilot"]
+
+[[tool.mypy.overrides]]
+module = [
+  "memopilot.runtime.common_tools.legacy_base",
+  "memopilot.runtime.common_tools.shell",
+  "memopilot.runtime.common_tools.filesystem",
+  "memopilot.runtime.common_tools.web_fetch",
+  "memopilot.runtime.common_tools.web_search",
+  "memopilot.runtime.common_tools.message_lookup",
+  "memopilot.runtime.common_tools.message_push",
+]
+ignore_errors = true

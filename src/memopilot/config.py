@@ -48,6 +48,15 @@ class MemoPilotSettings(BaseSettings):
     chat_base_url: str = "https://api.deepseek.com"
     chat_model: str = "deepseek-v4-flash"
     chat_api_key: SecretStr = SecretStr("")
+    chat_multimodal: bool = True
+
+    fast_base_url: str = ""
+    fast_model: str = ""
+    fast_api_key: SecretStr = SecretStr("")
+
+    vl_base_url: str = ""
+    vl_model: str = ""
+    vl_api_key: SecretStr = SecretStr("")
 
     embedding_base_url: str = ""
     embedding_model: str = ""
@@ -253,6 +262,8 @@ def load_settings(
     data = _resolve_environment(raw_data)
     llm = _as_dict(data.get("llm"))
     main = _as_dict(llm.get("main"))
+    fast = _as_dict(llm.get("fast"))
+    vl = _as_dict(llm.get("vl"))
     agent = _as_dict(data.get("agent"))
     agent_tools = _as_dict(agent.get("tools"))
     memory = _as_dict(data.get("memory"))
@@ -267,6 +278,11 @@ def load_settings(
         (main, "model", "chat_model"),
         (main, "base_url", "chat_base_url"),
         (main, "enable_thinking", "llm_thinking_enabled"),
+        (main, "multimodal", "chat_multimodal"),
+        (fast, "model", "fast_model"),
+        (fast, "base_url", "fast_base_url"),
+        (vl, "model", "vl_model"),
+        (vl, "base_url", "vl_base_url"),
         (agent, "max_tokens", "llm_max_output_tokens"),
         (agent, "max_iterations", "llm_max_iterations"),
         (agent_tools, "search_enabled", "tool_search_enabled"),
@@ -313,6 +329,8 @@ def load_settings(
         )
     optional_values = {
         "chat_api_key": main.get("api_key"),
+        "fast_api_key": fast.get("api_key"),
+        "vl_api_key": vl.get("api_key"),
         "embedding_model": embedding.get("model"),
         "embedding_api_key": embedding.get("api_key"),
         "embedding_base_url": embedding.get("base_url"),

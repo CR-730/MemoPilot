@@ -266,6 +266,7 @@ class RuntimeJobExecutor:
                     claim=claim,
                     lease=lease,
                     text=result.reply,
+                    metadata={"tool_chain": _tool_chain_metadata(result)},
                 )
             except asyncio.CancelledError:
                 if self._repository.has_pending_interrupt(claim.run_id):
@@ -320,6 +321,24 @@ class RuntimeJobExecutor:
             )
             raise TurnInterrupted(claim.run_id) from None
         return result
+
+
+def _tool_chain_metadata(result: TurnResult) -> list[dict[str, object]]:
+    groups: dict[int, dict[str, object]] = {}
+    for record in result.react.tool_chain:
+        group = groups.setdefault(
+            record.iteration,
+            {"text": "", "calls": []},
+        )
+        calls = group["calls"]
+        if isinstance(calls, list):
+            calls.append(
+                {
+                    "name": record.call.name,
+                    "status": record.observation.status,
+                }
+            )
+    return [groups[index] for index in sorted(groups)]
 
 
 __all__ = [

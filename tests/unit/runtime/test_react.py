@@ -112,6 +112,45 @@ async def test_react_executes_function_and_returns_observation_to_model() -> Non
     assert second_messages[-1].tool_call_id == "c1"
 
 
+async def test_react_appends_multimodal_tool_blocks_as_user_message() -> None:
+    async def read_image() -> dict[str, object]:
+        return {
+            "text": "已读取图片",
+            "content_blocks": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                }
+            ],
+        }
+
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="read_file",
+                description="read",
+                parameters={"type": "object"},
+                handler=read_image,
+            )
+        ]
+    )
+    call = FunctionCall(id="image-1", name="read_file", arguments={})
+    provider = _FakeProvider([_response(calls=(call,)), _response("看到了")])
+
+    await ReActEngine(provider, registry).run((ChatMessage.user("看看图片"),))
+
+    second_messages = provider.calls[1]["messages"]
+    assert second_messages[-2].role == "tool"
+    assert second_messages[-1].role == "user"
+    assert second_messages[-1].content == [
+        {"type": "text", "text": "以下是工具 read_file 读取到的文件内容，请直接查看。"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AAAA"},
+        },
+    ]
+
+
 def _discovery_registry(calls: list[str]) -> ToolRegistry:
     registry = ToolRegistry()
 

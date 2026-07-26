@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import threading
 from pathlib import Path
@@ -357,6 +358,68 @@ def test_ws_sdk_uses_log_level_that_does_not_print_connection_url(
     channel._run_ws_client()
 
     assert captured["log_level"] == "warning"
+
+
+def test_expected_sdk_shutdown_does_not_become_start_error_or_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    channel, _ = _channel(tmp_path)
+
+    class _Builder:
+        def register_p2_im_message_receive_v1(self, callback: object) -> _Builder:
+            return self
+
+        def build(self) -> object:
+            return object()
+
+    class _Client:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._auto_reconnect = bool(kwargs["auto_reconnect"])
+
+        async def _connect(self) -> None:
+            return None
+
+        async def _receive_message_loop(self) -> None:
+            raise RuntimeError("normal close")
+
+        def start(self) -> None:
+            channel._ws_stop_requested.set()
+            asyncio.run(self._receive_message_loop())
+            raise RuntimeError("Event loop stopped before Future completed.")
+
+    fake_lark = SimpleNamespace(
+        EventDispatcherHandler=SimpleNamespace(builder=lambda *_: _Builder()),
+        LogLevel=SimpleNamespace(WARNING="warning"),
+        ws=SimpleNamespace(Client=_Client),
+    )
+    monkeypatch.setitem(sys.modules, "lark_oapi", fake_lark)
+
+    with caplog.at_level(logging.WARNING, logger="memopilot.channels.feishu"):
+        channel._run_ws_client()
+
+    assert channel._ws_start_error is None
+    assert "long connection exited" not in caplog.text
+
+
+async def test_receive_loop_exception_is_consumed_only_during_explicit_shutdown(
+    tmp_path: Path,
+) -> None:
+    channel, _ = _channel(tmp_path)
+
+    class _Client:
+        async def _receive_message_loop(self) -> None:
+            raise RuntimeError("connection closed")
+
+    client = _Client()
+    channel._guard_receive_loop(client)
+
+    with pytest.raises(RuntimeError, match="connection closed"):
+        await client._receive_message_loop()
+
+    channel._ws_stop_requested.set()
+    await client._receive_message_loop()
 
 
 @pytest.mark.asyncio

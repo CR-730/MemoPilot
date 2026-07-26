@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.hooks import ToolExecutionRequest
@@ -386,6 +386,9 @@ class ReActEngine:
                     content=observation.content,
                 )
             )
+            multimodal_message = _multimodal_tool_message(call.name, observation.result)
+            if multimodal_message is not None:
+                working.append(multimodal_message)
             if progress is not None:
                 await progress.on_tool_call_completed(iteration, call, observation)
         return tuple(step_records)
@@ -509,6 +512,26 @@ class ReActEngine:
             exit_reason="provider_error",
             infrastructure_error=type(error).__name__,
         )
+
+
+def _multimodal_tool_message(
+    tool_name: str,
+    result: object,
+) -> ChatMessage | None:
+    if not isinstance(result, dict):
+        return None
+    raw_blocks = result.get("content_blocks")
+    if not isinstance(raw_blocks, list) or not raw_blocks:
+        return None
+    blocks = [block for block in raw_blocks if isinstance(block, dict)]
+    if not blocks:
+        return None
+    prefix = f"以下是工具 {tool_name} 读取到的文件内容，请直接查看。"
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": prefix},
+        *blocks,
+    ]
+    return ChatMessage.user_blocks(content)
 
 
 class _BestEffortProgress:

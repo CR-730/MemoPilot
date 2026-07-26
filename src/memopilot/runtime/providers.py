@@ -27,6 +27,10 @@ class ChatProvider(Protocol):
     ) -> ModelResponse: ...
 
 
+class VisionProvider(Protocol):
+    async def complete_vision(self, *, data_uri: str, prompt: str) -> str: ...
+
+
 class OpenAICompatibleProvider:
     """将 Runtime 合同适配为非流式 Chat Completions 请求。"""
 
@@ -127,6 +131,31 @@ class OpenAICompatibleProvider:
             max_output_tokens=max_output_tokens,
             thinking_enabled=thinking_enabled,
         )
+
+    async def complete_vision(self, *, data_uri: str, prompt: str) -> str:
+        """使用当前 Provider 的模型完成一次独立视觉理解请求。"""
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_uri, "detail": "high"},
+                        },
+                    ],
+                }
+            ],
+            tools=(),
+            max_tokens=self._max_output_tokens,
+            stream=False,
+        )
+        if not response.choices:
+            raise RuntimeError("视觉 Provider 返回空 choices")
+        content = response.choices[0].message.content
+        return str(content or "").strip()
 
     async def _complete_request(
         self,
@@ -340,4 +369,4 @@ async def _emit_delta(
         await result
 
 
-__all__ = ["ChatProvider", "OpenAICompatibleProvider"]
+__all__ = ["ChatProvider", "OpenAICompatibleProvider", "VisionProvider"]
