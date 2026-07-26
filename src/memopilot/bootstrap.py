@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from redis.asyncio import Redis
 
@@ -68,13 +69,13 @@ from memopilot.proactive.dedupe import MessageDeduper
 from memopilot.proactive.drift import DriftSkillSelector
 from memopilot.proactive.investigation import ToolContentFetcher
 from memopilot.proactive.job_handler import (
-    OperationalProactiveJobEnqueuer,
     ProactiveJobHandlerService,
 )
 from memopilot.proactive.mcp_sources import ProactiveSourceGateway, load_proactive_sources
 from memopilot.proactive.service import ProactiveService
 from memopilot.proactive.store import ProactiveRepository
 from memopilot.runtime.common_tools import register_common_tools
+from memopilot.runtime.common_tools.http import SharedHttpResources
 from memopilot.runtime.common_tools.vision import build_read_image_vision_tool
 from memopilot.runtime.engine import AgentRuntime
 from memopilot.runtime.providers import ChatProvider, OpenAICompatibleProvider, VisionProvider
@@ -178,6 +179,7 @@ class RuntimeBundle:
     plugin_manager: PluginManager
     hook_ids: tuple[str, ...]
     mcp_registry: McpServerRegistry
+    http_resources: SharedHttpResources
     plugin_diagnostics: tuple[PluginDiagnostic, ...]
     skill_diagnostics: tuple[SkillDiagnostic, ...]
 
@@ -188,6 +190,7 @@ class RuntimeBundle:
             self.tools.unregister_hook(hook_id)
         await self.plugin_manager.unload_all()
         await self.mcp_registry.shutdown()
+        await self.http_resources.aclose()
         await self.event_bus.aclose()
 
 
@@ -393,12 +396,14 @@ async def build_runtime_bundle(
         hypothesis_provider=ChatHypothesisProvider(light_provider),
     )
     registry = ToolRegistry(configured_tools)
+    http_resources = SharedHttpResources()
     registry.register(build_recall_memory_tool(memory_engine), always_on=True)
     registry.register(build_tool_search_tool(registry), always_on=True)
     register_common_tools(
         registry,
         workspace=settings.workspace,
         repository=operational,
+        http_requester=http_resources.external_default,
         multimodal=settings.chat_multimodal,
         vl_available=vision_provider is not None,
     )
@@ -490,8 +495,8 @@ async def build_runtime_bundle(
             embedding_provider,
             procedure_tagger=procedure_tagger,
         )
-        registry.register(build_memorize_tool(memorizer))
-        registry.register(build_forget_memory_tool(store))
+        registry.register(build_memorize_tool(memorizer), always_on=True)
+        registry.register(build_forget_memory_tool(store), always_on=True)
         refresh_skill_availability()
         runtime = AgentRuntime(
             provider,
@@ -540,8 +545,6 @@ async def build_runtime_bundle(
             config_path=proactive_source_path,
             caller_for_server=mcp_registry.caller,
         )
-        proactive_enqueuer = OperationalProactiveJobEnqueuer(operational)
-
         def build_proactive_service(claim: RunClaim, lease: FenceToken) -> ProactiveService:
             job = operational.get_job(claim.job_id)
             if job is None:
@@ -589,12 +592,15 @@ async def build_runtime_bundle(
                 proactive_gateway,
                 agent_tick,
                 skill_catalog=active_skills,
-                job_enqueuer=proactive_enqueuer,
                 assert_current=assert_proactive_current,
                 drift_min_interval=timedelta(
                     hours=settings.drift_min_interval_hours
                 ),
                 drift_enabled=settings.drift_enabled,
+                context_probability=settings.proactive_context_probability,
+                active_timezone=ZoneInfo(settings.display_timezone),
+                active_start_hour=settings.proactive_active_start_hour,
+                active_end_hour=settings.proactive_active_end_hour,
                 message_deduper=MessageDeduper(provider),
                 memory_text=lambda: markdown.read("MEMORY.md"),
                 proactive_context=lambda: _read_optional_text(
@@ -643,6 +649,7 @@ async def build_runtime_bundle(
             plugin_manager=manager,
             hook_ids=hook_ids,
             mcp_registry=mcp_registry,
+            http_resources=http_resources,
             plugin_diagnostics=tuple(manager.diagnostics),
             skill_diagnostics=skill_diagnostics,
         )
@@ -651,6 +658,7 @@ async def build_runtime_bundle(
             registry.unregister_hook(hook_id)
         await manager.unload_all()
         await mcp_registry.shutdown()
+        await http_resources.aclose()
         await event_bus.aclose()
         raise
 
@@ -740,7 +748,7 @@ def _repository(settings: MemoPilotSettings) -> OperationalRepository:
 
 
 def _chat_provider(settings: MemoPilotSettings) -> OpenAICompatibleProvider:
-    return OpenAICompatibleProvider.from_deepseek_credentials(
+    return OpenAICompatibleProvider.from_routed_credentials(
         api_key=settings.chat_api_key.get_secret_value(),
         base_url=settings.chat_base_url,
         model=settings.chat_model,
@@ -757,12 +765,17 @@ def _fast_provider(settings: MemoPilotSettings) -> OpenAICompatibleProvider | No
     ):
         return None
     base_url = settings.fast_base_url or settings.chat_base_url
-    extra_body = (
-        None
-        if "googleapis.com" in base_url or "generativelanguage" in base_url
-        else {"enable_thinking": False}
-    )
-    return OpenAICompatibleProvider.from_credentials(
+    if "googleapis.com" in base_url or "generativelanguage" in base_url:
+        return OpenAICompatibleProvider.from_credentials(
+            api_key=settings.fast_api_key.get_secret_value()
+            or settings.chat_api_key.get_secret_value(),
+            base_url=base_url,
+            model=settings.fast_model,
+            max_output_tokens=settings.llm_max_output_tokens,
+            max_retries=settings.llm_retry_limit,
+            timeout_seconds=settings.llm_timeout_seconds,
+        )
+    return OpenAICompatibleProvider.from_routed_credentials(
         api_key=settings.fast_api_key.get_secret_value()
         or settings.chat_api_key.get_secret_value(),
         base_url=base_url,
@@ -770,7 +783,7 @@ def _fast_provider(settings: MemoPilotSettings) -> OpenAICompatibleProvider | No
         max_output_tokens=settings.llm_max_output_tokens,
         max_retries=settings.llm_retry_limit,
         timeout_seconds=settings.llm_timeout_seconds,
-        extra_body=extra_body,
+        thinking_enabled=False,
     )
 
 

@@ -73,7 +73,10 @@ class MemoPilotSettings(BaseSettings):
     feishu_receive_mode: str = "ws"
 
     proactive_enabled: bool = False
-    proactive_tick_seconds: int = Field(default=300, ge=300, le=300)
+    proactive_tick_seconds: int = Field(default=1800, ge=1800, le=1800)
+    proactive_context_probability: float = Field(default=0.3, ge=0, le=1)
+    proactive_active_start_hour: int = Field(default=8, ge=0, le=23)
+    proactive_active_end_hour: int = Field(default=23, ge=1, le=24)
     drift_enabled: bool = True
     drift_min_interval_hours: float = Field(default=3, ge=0)
     lease_ttl_seconds: int = Field(default=30, gt=0)
@@ -148,6 +151,8 @@ class MemoPilotSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _resolve_bounded_paths(self) -> Self:
+        if self.proactive_active_start_hour >= self.proactive_active_end_hour:
+            raise ValueError("主动发送时段必须满足 start < end")
         workspace = self.workspace.expanduser().resolve()
         self.workspace = workspace
         for field_name in (
@@ -310,6 +315,13 @@ def load_settings(
         ),
         (proactive, "enabled", "proactive_enabled"),
         (proactive, "tick_seconds", "proactive_tick_seconds"),
+        (
+            proactive,
+            "context_probability",
+            "proactive_context_probability",
+        ),
+        (proactive, "active_start_hour", "proactive_active_start_hour"),
+        (proactive, "active_end_hour", "proactive_active_end_hour"),
         (proactive, "drift_enabled", "drift_enabled"),
         (proactive, "drift_min_interval_hours", "drift_min_interval_hours"),
     )

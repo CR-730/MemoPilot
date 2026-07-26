@@ -113,6 +113,34 @@ async def test_task_completion_overrides_token_budget_and_thinking_mode() -> Non
     assert "reasoning_content" not in completions.calls[0]["messages"][0]
 
 
+async def test_dashscope_task_completion_uses_enable_thinking_not_deepseek_body() -> None:
+    response = SimpleNamespace(
+        id="chat-memory",
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content="done", tool_calls=None),
+            )
+        ],
+        usage=None,
+    )
+    client, completions = _client(response)
+    provider = OpenAICompatibleProvider(
+        client=client,
+        model="qwen-flash",
+        extra_body={"enable_thinking": True},
+    )
+
+    await provider.complete_task(
+        messages=(ChatMessage.user("提取记忆"),),
+        tools=(),
+        max_output_tokens=600,
+        thinking_enabled=False,
+    )
+
+    assert completions.calls[0]["extra_body"] == {"enable_thinking": False}
+
+
 async def test_provider_sends_image_to_vision_model() -> None:
     response = SimpleNamespace(
         id="chat-vision",

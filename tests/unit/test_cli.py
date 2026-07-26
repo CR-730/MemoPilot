@@ -9,6 +9,46 @@ import pytest
 from memopilot import cli
 
 
+async def test_default_run_starts_service_terminal_without_embedded_tui(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeShutdownBridge:
+        def __init__(self, _loop: object, _event: object) -> None:
+            return None
+
+        def install(self) -> None:
+            return None
+
+        def mark_shutdown_complete(self) -> None:
+            return None
+
+        def uninstall(self) -> None:
+            return None
+
+    async def fake_run_all(
+        settings: object,
+        *,
+        interactive: bool,
+        shutdown_event: asyncio.Event,
+    ) -> None:
+        captured["settings"] = settings
+        captured["interactive"] = interactive
+        captured["shutdown_event"] = shutdown_event
+
+    settings = object()
+    monkeypatch.setattr(cli, "load_settings", lambda *_args, **_kwargs: settings)
+    monkeypatch.setattr(cli, "_WindowsConsoleShutdownBridge", FakeShutdownBridge)
+    monkeypatch.setattr(cli, "run_all", fake_run_all)
+
+    await cli._run(SimpleNamespace(command="run", config=None, workspace=None))
+
+    assert captured["settings"] is settings
+    assert captured["interactive"] is False
+    assert isinstance(captured["shutdown_event"], asyncio.Event)
+
+
 def test_configure_logging_hides_http_handshake_noise() -> None:
     cli._configure_logging()
 
@@ -199,6 +239,67 @@ async def test_external_terminal_shutdown_signal_closes_all_services(
     await asyncio.sleep(0)
     shutdown_event.set()
     await task
+
+    assert events == ["close", "close", "close", "redis.close"]
+
+
+async def test_service_failure_is_propagated_after_orderly_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeAppService:
+        async def start(self) -> None:
+            return None
+
+    class FailingService:
+        async def run_forever(self) -> None:
+            raise RuntimeError("runner failed")
+
+    class BlockingService:
+        async def run_forever(self) -> None:
+            await asyncio.Event().wait()
+
+    class FakeBundle:
+        mcp_diagnostics: tuple[str, ...] = ()
+
+        def __init__(self, service: object) -> None:
+            self.service = service
+
+        async def start_extensions(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            events.append("close")
+
+    class FakeRedisRuntime:
+        managed = False
+
+        @classmethod
+        async def ensure(cls, _redis_url: str) -> FakeRedisRuntime:
+            return cls()
+
+        async def close(self) -> None:
+            events.append("redis.close")
+
+    monkeypatch.setattr(cli, "build_app", lambda _settings: FakeBundle(FakeAppService()))
+    monkeypatch.setattr(
+        cli,
+        "build_scheduler",
+        lambda _settings: FakeBundle(BlockingService()),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_worker",
+        lambda _settings: _async_bundle(FakeBundle(FailingService())),
+    )
+    monkeypatch.setattr(cli, "RedisRuntime", FakeRedisRuntime)
+
+    with pytest.raises(RuntimeError, match="runner failed"):
+        await cli.run_all(
+            SimpleNamespace(feishu_allow_from=(), redis_url="redis://localhost:6379/0"),
+            shutdown_event=asyncio.Event(),
+        )
 
     assert events == ["close", "close", "close", "redis.close"]
 

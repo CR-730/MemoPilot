@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,7 @@ from memopilot.tasks.recovery import (
 from memopilot.tasks.redis_queue import QueueMessage, RedisTaskQueue
 
 _TERMINAL_JOB_STATES = frozenset({"succeeded", "failed", "cancelled", "needs_review"})
+logger = logging.getLogger(__name__)
 
 
 class RunnerService:
@@ -145,7 +147,13 @@ class RunnerService:
             raise ValueError("idle_interval 必须大于 0")
         await self._queue.ensure_consumer_groups()
         while True:
-            processed = await self.run_once()
+            try:
+                processed = await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Runner 处理任务失败，当前 Job 已终止，继续消费后续任务")
+                processed = True
             if not processed:
                 await asyncio.sleep(idle_interval)
 

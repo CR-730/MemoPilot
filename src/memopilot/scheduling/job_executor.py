@@ -97,6 +97,8 @@ class SystemJobRouter:
                 turn=turn,
                 now=now,
             )
+            if outcome == "drift":
+                return await self._run_drift(payload, claim, lease, turn, now)
             return SystemJobResult(outcome=outcome)
         raise ValueError(f"不支持的系统任务: {kind}")
 

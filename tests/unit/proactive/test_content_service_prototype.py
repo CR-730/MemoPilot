@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -45,12 +45,6 @@ class _ContentTurn:
         return self.result
 
 
-class _Enqueuer:
-    def enqueue_drift(self, **kwargs):
-        del kwargs
-        return True
-
-
 def _event(index: int) -> ProactiveEvent:
     return ProactiveEvent(
         "feed",
@@ -75,8 +69,9 @@ def _service(tmp_path: Path, result: ContentTurnResult):
         _Gateway(repository, tuple(_event(index) for index in range(1, 7))),  # type: ignore[arg-type]
         content_turn,  # type: ignore[arg-type]
         skill_catalog=SkillCatalog(),
-        job_enqueuer=_Enqueuer(),  # type: ignore[arg-type]
         assert_current=lambda: None,
+        active_timezone=UTC,
+        ordinary_cooldown=timedelta(0),
     )
     return service, repository, content_turn
 

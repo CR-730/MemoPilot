@@ -18,7 +18,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import signal
 import shlex
 import ipaddress
@@ -105,8 +104,6 @@ _RESTRICTED_SHELL_RUNNERS = frozenset(
         "lua",
     }
 )
-_WINDOWS_BASH_ARITHMETIC = re.compile(r"\$\(\(")
-_WINDOWS_PYTHON3 = re.compile(r"(?<![\w-])python3(?:\s|$)", re.IGNORECASE)
 
 # ── 后台任务注册表 ────────────────────────────────────────────────────
 
@@ -256,7 +253,7 @@ def _bg_timeout(task_id: str) -> None:
 
 
 class ShellTool(Tool):
-    """在 bash 中执行命令，返回结构化结果"""
+    """在系统命令解释器中执行命令，返回结构化结果"""
 
     name = "shell"
 
@@ -275,16 +272,8 @@ class ShellTool(Tool):
 
     @property
     def description(self) -> str:
-        platform_note = (
-            (
-                "当前运行在 Windows，命令由 cmd.exe 执行；不要使用 Bash 专属语法 "
-                "$((...))，也不要使用 python3，Python 计算请使用 python -c。"
-            )
-            if _IS_WINDOWS
-            else "当前运行在类 Unix 环境，命令由 shell 执行，可使用 Bash 语法。"
-        )
         return (
-            f"执行命令并返回输出。\n{platform_note}\n"
+            "在当前系统的命令解释器中执行命令并返回输出。\n"
             "注意：\n"
             "- 使用绝对路径，避免依赖 cd 切换目录\n"
             "- 多条命令用 ; 或 && 连接，不要用换行分隔\n"
@@ -308,7 +297,7 @@ class ShellTool(Tool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "要执行的 bash 命令",
+                    "description": "要执行的终端命令",
                 },
                 "description": {
                     "type": "string",
@@ -367,10 +356,6 @@ class ShellTool(Tool):
 
         if not command:
             return _err("命令不能为空")
-
-        platform_err = _platform_command_error(command)
-        if platform_err:
-            return _err(platform_err)
 
         cwd = self._working_dir
         env = _shell_env()
@@ -1088,19 +1073,6 @@ def _validate_network_command(command: str) -> str | None:
         err = _validate_url_target(u)
         if err:
             return err
-    return None
-
-
-def _platform_command_error(command: str) -> str | None:
-    if not _IS_WINDOWS:
-        return None
-    if _WINDOWS_BASH_ARITHMETIC.search(command):
-        return (
-            "当前 Windows shell 不支持 Bash 算术语法 $((...))；"
-            "请改用 python -c 或 PowerShell 语法。"
-        )
-    if _WINDOWS_PYTHON3.search(command):
-        return "当前 Windows 环境请使用 python，不要使用 python3。"
     return None
 
 

@@ -588,6 +588,26 @@ async def test_runtime_prompt_render_preserves_system_history_and_user_order() -
     assert provider.messages[-1].content == "new"
 
 
+async def test_event_bus_preserves_typed_chat_history() -> None:
+    provider = _CapturingProvider()
+    runtime = AgentRuntime(provider, ToolRegistry(), event_bus=EventBus())
+
+    await runtime.run(
+        TurnInput(
+            session_key="fake:1",
+            content="new",
+            history=(ChatMessage.user("old"), ChatMessage.assistant(content="answer")),
+        )
+    )
+
+    assert all(isinstance(message, ChatMessage) for message in provider.messages)
+    assert [message.content for message in provider.messages[-3:]] == [
+        "old",
+        "answer",
+        "new",
+    ]
+
+
 async def test_runtime_records_symmetric_step_phases_when_provider_fails() -> None:
     result = await AgentRuntime(_FailingProvider(), ToolRegistry()).run(
         TurnInput(session_key="fake:1", content="hello")

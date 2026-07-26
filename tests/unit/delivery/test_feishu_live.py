@@ -76,6 +76,42 @@ async def test_live_progress_creates_updates_and_freezes_one_process_card() -> N
 
 
 @pytest.mark.asyncio
+async def test_live_progress_marks_nonzero_shell_exit_as_failed() -> None:
+    transport = AsyncMock()
+    transport.send_card.return_value = SendReceipt(message_id="om-live")
+    progress = FeishuLiveProgress(
+        transport,
+        chat_id="oc-chat",
+        provider_uuid="live-uuid",
+        min_interval_seconds=0,
+    )
+    call = FunctionCall(
+        id="call-shell",
+        name="shell",
+        arguments={"description": "执行计算", "command": "python3 -c \"print(1)\""},
+    )
+
+    await progress.on_tool_call_started(1, call)
+    await progress.on_tool_call_completed(
+        1,
+        call,
+        ToolObservation(
+            call_id="call-shell",
+            tool_name="shell",
+            ok=True,
+            result='{"status":"done","exit_code":9009,"output":"not found"}',
+        ),
+    )
+    await progress.finalize()
+
+    final_card = json.loads(transport.patch_card.await_args.args[1])
+    tools = final_card["body"]["elements"][0]["content"]
+    assert "shell" in tools
+    assert "✗" in tools
+    assert "✅" not in tools
+
+
+@pytest.mark.asyncio
 async def test_live_progress_never_renders_partial_citation_metadata() -> None:
     transport = AsyncMock()
     transport.send_card.return_value = SendReceipt(message_id="om-live")

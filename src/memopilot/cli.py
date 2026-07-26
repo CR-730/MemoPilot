@@ -50,7 +50,7 @@ async def _run(args: argparse.Namespace) -> None:
         try:
             await run_all(
                 settings,
-                interactive=True,
+                interactive=False,
                 shutdown_event=shutdown_event,
             )
         finally:
@@ -106,19 +106,30 @@ async def run_all(
                 name="memopilot-worker",
             ),
         ]
+        wait_tasks: set[asyncio.Task[Any]] = set(service_tasks)
         if interactive:
             cli_task = asyncio.create_task(
                 run_tui_async(),
                 name="memopilot-tui",
             )
-            tasks: set[asyncio.Task[Any]] = {*service_tasks, cli_task}
-            if shutdown_event is not None:
-                shutdown_task = asyncio.create_task(
-                    shutdown_event.wait(),
-                    name="memopilot-shutdown",
-                )
-                tasks.add(shutdown_task)
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            wait_tasks.add(cli_task)
+        if shutdown_event is not None:
+            shutdown_task = asyncio.create_task(
+                shutdown_event.wait(),
+                name="memopilot-shutdown",
+            )
+            wait_tasks.add(shutdown_task)
+        if interactive or shutdown_event is not None:
+            done, _ = await asyncio.wait(
+                wait_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            completed_services = [task for task in service_tasks if task in done]
+            for task in completed_services:
+                await task
+                raise RuntimeError(f"常驻服务意外退出: {task.get_name()}")
+            if cli_task is not None and cli_task in done:
+                await cli_task
         else:
             await asyncio.gather(*service_tasks)
     finally:

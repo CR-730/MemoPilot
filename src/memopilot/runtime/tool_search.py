@@ -208,7 +208,10 @@ class ToolSearchTool:
                 "matched": matches,
                 "unlocked": unlocked,
                 "already_loaded": [],
-                "next_action": "下一轮可直接调用 unlocked 中的工具，无需再次搜索。",
+                "next_action": (
+                    "unlocked 中的工具 schema 已加载。下一步直接调用需要的工具，"
+                    "不要再次 tool_search。"
+                ),
             },
             ensure_ascii=False,
         )
@@ -257,7 +260,10 @@ class ToolSearchTool:
         if blocked:
             tips.append("风险等级不符: " + ", ".join(blocked))
         if unlocked:
-            result["next_action"] = "下一轮可直接调用 unlocked 中的工具，无需再次搜索。"
+            result["next_action"] = (
+                "unlocked 中的工具 schema 已加载。下一步直接调用需要的工具，"
+                "不要再次 tool_search。"
+            )
         if tips:
             result["tip"] = "; ".join(tips)
         return json.dumps(result, ensure_ascii=False)

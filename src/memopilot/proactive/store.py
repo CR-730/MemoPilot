@@ -293,15 +293,15 @@ class ProactiveRepository:
             return None
         return _parse_time(row[0])
 
-    def mark_drift_scheduled(
+    def mark_drift_started(
         self,
         *,
         session_key: str,
         job_id: str,
-        scheduled_at: datetime,
+        started_at: datetime,
     ) -> None:
-        """记录 Drift 已排队；沿用旧表以兼容已经创建的 proactive.db。"""
-        timestamp = _utc_iso(scheduled_at)
+        """记录当前主动 Job 已进入 Drift；沿用旧表保持数据库兼容。"""
+        timestamp = _utc_iso(started_at)
         drift_id = str(uuid5(NAMESPACE_URL, f"memopilot:drift:{session_key}:{job_id}"))
         with connect_database(self._database) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -311,7 +311,10 @@ class ProactiveRepository:
                     INSERT OR REPLACE INTO drift_history(
                         drift_id, session_key, skill_name, drive_before, threshold,
                         outcome, job_id, reason, created_at, updated_at, trace_json
-                    ) VALUES (?, ?, NULL, 0, 0, 'queued', ?, 'min_interval_elapsed', ?, ?, '{}')
+                    ) VALUES (
+                        ?, ?, NULL, 0, 0, 'running', ?,
+                        'direct_proactive_fallback', ?, ?, '{}'
+                    )
                     """,
                     (drift_id, session_key, job_id, timestamp, timestamp),
                 )
@@ -518,6 +521,52 @@ class ProactiveRepository:
                 (session_key, max(1, limit)),
             ).fetchall()
         return tuple(str(row[0]) for row in rows)
+
+    def count_confirmed_sends(
+        self,
+        session_key: str,
+        *,
+        trigger_kind: str,
+        since: datetime,
+    ) -> int:
+        with connect_database(self._database) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) FROM proactive_decisions
+                WHERE session_key = ?
+                  AND trigger_kind = ?
+                  AND action IN ('share', 'alert', 'send_event')
+                  AND state = 'committed'
+                  AND committed_at >= ?
+                """,
+                (session_key, trigger_kind, _utc_iso(since)),
+            ).fetchone()
+        return int(row[0])
+
+    def last_confirmed_send(
+        self,
+        session_key: str,
+        *,
+        trigger_kinds: Sequence[str],
+    ) -> datetime | None:
+        kinds = tuple(dict.fromkeys(str(item) for item in trigger_kinds if str(item)))
+        if not kinds:
+            return None
+        placeholders = ", ".join("?" for _ in kinds)
+        with connect_database(self._database) as connection:
+            row = connection.execute(
+                f"""
+                SELECT MAX(committed_at) FROM proactive_decisions
+                WHERE session_key = ?
+                  AND trigger_kind IN ({placeholders})
+                  AND action IN ('share', 'alert', 'send_event')
+                  AND state = 'committed'
+                """,
+                (session_key, *kinds),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return _parse_time(row[0])
 
     def commit_skip(self, decision_id: str, *, committed_at: datetime) -> None:
         decision = self._load_decision(decision_id)

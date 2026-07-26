@@ -14,7 +14,10 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
 
     assert settings.chat_base_url == "https://api.deepseek.com"
     assert settings.chat_model == "deepseek-v4-flash"
-    assert settings.proactive_tick_seconds == 300
+    assert settings.proactive_tick_seconds == 1800
+    assert settings.proactive_context_probability == 0.3
+    assert settings.proactive_active_start_hour == 8
+    assert settings.proactive_active_end_hour == 23
     assert settings.proactive_enabled is False
     assert settings.drift_enabled is True
     assert settings.drift_min_interval_hours == 3
@@ -55,15 +58,19 @@ def test_environment_overrides_dotenv(
 ) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "MEMOPILOT_PROACTIVE_TICK_SECONDS=600\nMEMOPILOT_REDIS_URL=redis://dotenv:6379/0\n",
+        "MEMOPILOT_PROACTIVE_TICK_SECONDS=1800\n"
+        "MEMOPILOT_DRIFT_MIN_INTERVAL_HOURS=4\n"
+        "MEMOPILOT_REDIS_URL=redis://dotenv:6379/0\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("MEMOPILOT_PROACTIVE_TICK_SECONDS", "300")
+    monkeypatch.setenv("MEMOPILOT_PROACTIVE_TICK_SECONDS", "1800")
+    monkeypatch.setenv("MEMOPILOT_DRIFT_MIN_INTERVAL_HOURS", "3")
 
     settings = MemoPilotSettings(_env_file=env_file)
 
-    assert settings.proactive_tick_seconds == 300
+    assert settings.proactive_tick_seconds == 1800
+    assert settings.drift_min_interval_hours == 3
     assert settings.redis_url == "redis://dotenv:6379/0"
 
 
@@ -320,7 +327,10 @@ args = ["feeds.py"]
 
 [proactive]
 enabled = true
-tick_seconds = 300
+tick_seconds = 1800
+context_probability = 0.3
+active_start_hour = 8
+active_end_hour = 23
 drift_enabled = false
 drift_min_interval_hours = 4
 
@@ -331,7 +341,10 @@ drift_min_interval_hours = 4
     settings = load_settings(config, workspace=tmp_path / "workspace")
 
     assert settings.proactive_enabled is True
-    assert settings.proactive_tick_seconds == 300
+    assert settings.proactive_tick_seconds == 1800
+    assert settings.proactive_context_probability == 0.3
+    assert settings.proactive_active_start_hour == 8
+    assert settings.proactive_active_end_hour == 23
     assert settings.drift_enabled is False
     assert settings.drift_min_interval_hours == 4
 def test_proactive_enabled_without_sources_supports_drift_with_diagnostic(tmp_path: Path) -> None:
@@ -353,7 +366,7 @@ def test_fixed_proactive_tick_rejects_environment_override(
     config = tmp_path / "config.toml"
     config.write_text("[proactive]\nenabled = true\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="300"):
+    with pytest.raises(ValueError, match="1800"):
         load_settings(config, workspace=tmp_path / "workspace")
 
 

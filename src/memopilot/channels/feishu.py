@@ -97,6 +97,8 @@ class FeishuChannel:
         self._ws_ready = threading.Event()
         self._ws_receive_started = threading.Event()
         self._ws_receive_stopped = threading.Event()
+        self._ws_ping_task: asyncio.Task[Any] | None = None
+        self._ws_cache_task: asyncio.Task[Any] | None = None
         self._ws_start_error: BaseException | None = None
         self._ws_event_timeout_seconds = ws_event_timeout_seconds
         self._ws_stop_timeout_seconds = ws_stop_timeout_seconds
@@ -361,6 +363,8 @@ class FeishuChannel:
         self._ws_ready.clear()
         self._ws_receive_started.clear()
         self._ws_receive_stopped.clear()
+        self._ws_ping_task = None
+        self._ws_cache_task = None
         self._ws_start_error = None
         self._main_loop = asyncio.get_running_loop()
         self._ws_thread = threading.Thread(
@@ -389,10 +393,13 @@ class FeishuChannel:
                 auto_reconnect=False,
             )
             self._ws_client = client
+            cache = getattr(client, "_cache", None)
+            self._ws_cache_task = getattr(cache, "_cron", None)
             original_connect = getattr(client, "_connect", None)
             if original_connect is None:
                 raise RuntimeError("当前飞书 SDK 不支持长连接就绪探测")
             self._guard_receive_loop(client)
+            self._guard_ping_loop(client)
 
             async def connect_and_mark_ready() -> None:
                 await original_connect()
@@ -441,6 +448,30 @@ class FeishuChannel:
                 self._ws_receive_stopped.set()
 
         client._receive_message_loop = receive_with_shutdown_guard
+
+    def _guard_ping_loop(self, client: Any) -> None:
+        """记录 SDK 未公开保存的心跳任务，供停机时取消并等待。"""
+        original_ping = getattr(client, "_ping_loop", None)
+        if original_ping is None:
+            return
+
+        async def tracked_ping_loop() -> None:
+            self._ws_ping_task = asyncio.current_task()
+            await original_ping()
+
+        client._ping_loop = tracked_ping_loop
+
+    async def _cancel_ws_background_tasks(self) -> None:
+        current = asyncio.current_task()
+        tasks = {
+            task
+            for task in (self._ws_ping_task, self._ws_cache_task)
+            if task is not None and task is not current and not task.done()
+        }
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _on_ws_message(self, data: Any) -> None:
         payload = _marshal_ws_event(data)
@@ -502,7 +533,17 @@ class FeishuChannel:
                         )
                         if not stopped:
                             raise TimeoutError("飞书长连接接收任务未在停止超时内退出")
+                    cleanup_future = asyncio.run_coroutine_threadsafe(
+                        self._cancel_ws_background_tasks(),
+                        ws_loop,
+                    )
+                    await asyncio.wait_for(
+                        asyncio.wrap_future(cleanup_future),
+                        timeout=timeout_seconds,
+                    )
                     ws_loop.call_soon_threadsafe(ws_loop.stop)
+                else:
+                    await self._cancel_ws_background_tasks()
         except TimeoutError:
             raise
         except Exception as exc:

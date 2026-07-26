@@ -191,18 +191,17 @@ def build_common_tools(
     """构建旧公共工具集的完整固定集合。"""
     readonly = (
         ReadFileTool(
-            allowed_dir=workspace,
             multimodal=multimodal,
             vl_available=vl_available,
         ),
-        ListDirTool(allowed_dir=workspace),
+        ListDirTool(),
         WebFetchTool(http_requester),
         WebSearchTool(),
     )
     message_store = OperationalMessageStoreAdapter(repository)
     legacy_tools: tuple[LegacyTool, ...] = (
         ToolSearchPlaceholder(),  # 由当前 ToolRegistry 的 tool_search 提供
-        ShellTool(working_dir=workspace, restricted_dir=workspace),
+        ShellTool(),
         ShellTaskOutputTool(),
         ShellTaskStopTool(),
         readonly[2],
@@ -212,8 +211,8 @@ def build_common_tools(
         FetchMessagesTool(message_store),
         SearchMessagesTool(message_store),
         push_tool or MessagePushTool(),
-        WriteFileTool(allowed_dir=workspace),
-        EditFileTool(allowed_dir=workspace),
+        WriteFileTool(),
+        EditFileTool(),
     )
     return tuple(adapt_legacy_tool(tool) for tool in legacy_tools if tool.name != "tool_search")
 
@@ -234,6 +233,7 @@ def register_common_tools(
     *,
     workspace: Path,
     repository: Any,
+    http_requester: HttpRequester | None = None,
     push_tool: MessagePushTool | None = None,
     multimodal: bool = True,
     vl_available: bool = False,
@@ -241,10 +241,21 @@ def register_common_tools(
     tools = build_common_tools(
         workspace=workspace,
         repository=repository,
+        http_requester=http_requester,
         push_tool=push_tool,
         multimodal=multimodal,
         vl_available=vl_available,
     )
+    search_hints = {
+        "shell": "终端 脚本 bash 命令",
+        "task_output": "后台任务输出 task_output 进程日志",
+        "task_stop": "停止后台任务 task_stop 杀进程",
+        "web_search": "谷歌 Bing 查资料",
+        "web_fetch": "读取网址 浏览网页",
+        "list_dir": "ls 查看目录",
+        "fetch_messages": "消息回溯 按ID查对话原文 source_ref",
+        "search_messages": "你之前说 聊过什么 历史对话",
+    }
     for tool in tools:
         registry.register(
             tool,
@@ -256,6 +267,7 @@ def register_common_tools(
                 if tool.name in {"write_file", "edit_file"}
                 else "read-only"
             ),
+            search_hint=search_hints.get(tool.name),
         )
     return tools
 

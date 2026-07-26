@@ -66,7 +66,7 @@ def _runner(repository: OperationalRepository):
         repository,
         memory_scheduler=memory,
         schedule_service=schedules,
-        proactive_tick_seconds=300,
+        proactive_tick_seconds=1800,
     )
     return runner, memory, schedules
 
@@ -77,12 +77,12 @@ def test_same_proactive_bucket_enqueues_only_one_p2_job(tmp_path) -> None:
     runner, memory, schedules = _runner(repository)
 
     first = runner.tick(now=NOW)
-    second = runner.tick(now=NOW + timedelta(seconds=299))
+    second = runner.tick(now=NOW + timedelta(seconds=1799))
 
     assert first.proactive is not None and first.proactive.created is True
-    assert second.proactive is not None and second.proactive.created is False
-    assert memory.calls == [NOW, NOW + timedelta(seconds=299)]
-    assert schedules.calls == [NOW, NOW + timedelta(seconds=299)]
+    assert second.proactive is None
+    assert memory.calls == [NOW, NOW + timedelta(seconds=1799)]
+    assert schedules.calls == [NOW, NOW + timedelta(seconds=1799)]
     with connect_database(repository.database) as connection:
         job = connection.execute(
             "SELECT kind, priority, session_key, activity_version, payload_json "
@@ -90,7 +90,7 @@ def test_same_proactive_bucket_enqueues_only_one_p2_job(tmp_path) -> None:
         ).fetchone()
         assert tuple(job[:4]) == ("proactive.tick", 2, "feishu:chat-1", 4)
         assert json.loads(job[4]) == {
-            "bucket": int(NOW.timestamp() // 300),
+            "bucket": int(NOW.timestamp() // 1800),
             "chat_id": "chat-1",
         }
         assert connection.execute(
@@ -105,9 +105,15 @@ def test_next_proactive_bucket_enqueues_new_job(tmp_path) -> None:
     runner, _, _ = _runner(repository)
 
     first = runner.tick(now=NOW)
-    second = runner.tick(now=NOW + timedelta(seconds=300))
+    assert first.proactive is not None
+    with connect_database(repository.database) as connection:
+        connection.execute(
+            "UPDATE agent_jobs SET state = 'succeeded' WHERE job_id = ?",
+            (first.proactive.job_id,),
+        )
+    second = runner.tick(now=NOW + timedelta(seconds=1800))
 
-    assert first.proactive is not None and second.proactive is not None
+    assert second.proactive is not None
     assert first.proactive.job_id != second.proactive.job_id
     assert repository.count("agent_jobs") == 2
 
@@ -132,7 +138,7 @@ def test_disabled_proactive_does_not_enqueue_even_when_private_session_exists(tm
         repository,
         memory_scheduler=memory,
         schedule_service=schedules,
-        proactive_tick_seconds=300,
+        proactive_tick_seconds=1800,
         proactive_enabled=False,
     )
 
@@ -154,6 +160,32 @@ def test_multiple_private_sessions_are_rejected_explicitly(tmp_path) -> None:
     assert memory.calls == [NOW]
     assert schedules.calls == [NOW]
     assert repository.count("agent_jobs") == 0
+
+
+def test_busy_session_skips_proactive_job_and_outbox_until_next_tick(tmp_path) -> None:
+    repository = _repository(tmp_path)
+    _add_session(repository)
+    repository.enqueue_system_job(
+        kind="schedule.run",
+        priority=1,
+        session_key="feishu:chat-1",
+        idempotency_key="schedule:busy",
+        activity_version=4,
+        payload={"execution_id": "busy"},
+        now=NOW,
+    )
+    runner, _, _ = _runner(repository)
+
+    result = runner.tick(now=NOW)
+
+    assert result.proactive is None
+    with connect_database(repository.database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM agent_jobs WHERE kind = 'proactive.tick'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM outbox_events"
+        ).fetchone()[0] == 1
 
 
 async def test_run_forever_uses_injected_sleep_and_clock(tmp_path) -> None:

@@ -73,6 +73,8 @@ class ProactiveJobHandlerService:
             activity_version=job.activity_version,
             now=now,
         )
+        if outcome.action == "drift":
+            return "drift"
         if outcome.action != "send":
             return "succeeded"
         if outcome.decision_id is None or outcome.effect_operation_id is None:
@@ -118,34 +120,6 @@ class ProactiveJobHandlerService:
             service.finalize_failed(outcome, failed_at=now)
         return mapped
 
-class OperationalProactiveJobEnqueuer:
-    """把领域层 Drift 意图写成 P3 Job + Transactional Outbox。"""
-
-    def __init__(self, operational: OperationalRepository) -> None:
-        self._operational = operational
-
-    def enqueue_drift(
-        self,
-        *,
-        job_id: str,
-        session_key: str,
-        chat_id: str,
-        activity_version: int,
-        priority: int,
-        now: datetime,
-    ) -> bool:
-        result = self._operational.enqueue_system_job(
-            kind="drift.run",
-            priority=priority,
-            session_key=session_key,
-            idempotency_key=job_id,
-            activity_version=activity_version,
-            payload={"chat_id": chat_id},
-            now=now,
-        )
-        return result.created
-
-
 def _required_text(payload: Mapping[str, object], key: str) -> str:
     value = str(payload.get(key) or "").strip()
     if not value:
@@ -154,7 +128,6 @@ def _required_text(payload: Mapping[str, object], key: str) -> str:
 
 
 __all__ = [
-    "OperationalProactiveJobEnqueuer",
     "ProactiveExecutionService",
     "ProactiveJobHandlerService",
     "ProactiveServiceFactory",

@@ -24,12 +24,13 @@ class OperationalStepSink:
         self._clock = clock
 
     async def record(self, event: RuntimeTraceEvent) -> None:
+        state = {"error": "failed", "denied": "skipped"}.get(event.state, event.state)
         self._repository.append_step(
             self._run_id,
             lease=self._lease,
             phase=event.phase.value,
             step_type=event.step_type,
-            state=event.state,
+            state=state,
             tool_name=event.tool_name,
             input=event.input,
             observation=event.observation,

@@ -234,6 +234,35 @@ async def test_proactive_is_delegated_to_injected_handler() -> None:
 
 
 @pytest.mark.asyncio
+async def test_proactive_drift_continues_in_same_job_and_lease() -> None:
+    repository = _Repository()
+    runtime = _Runtime(_result("后台结论"))
+    proactive = _ProactiveHandler("drift")
+    selector = _DriftSelector()
+    claim, lease = _identity()
+    router = SystemJobRouter(
+        repository,
+        runtime,
+        dispatcher=_Dispatcher(),  # type: ignore[arg-type]
+        proactive_handler=proactive,  # type: ignore[arg-type]
+        drift_selector=selector,
+    )
+
+    result = await router.execute(
+        kind="proactive.tick",
+        payload={"bucket": 1},
+        claim=claim,
+        lease=lease,
+        turn=TurnInput("feishu:chat-1", "", received_at=NOW),
+        now=NOW,
+    )
+
+    assert result.outcome == "succeeded"
+    assert selector.calls == 1
+    assert runtime.calls[0][0].prompt_scope == "background"
+
+
+@pytest.mark.asyncio
 async def test_schedule_delivery_needs_review_updates_execution_state() -> None:
     repository = _Repository()
     claim, lease = _identity()

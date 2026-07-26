@@ -80,6 +80,10 @@ async def test_tool_search_supports_keyword_and_select_unlocks() -> None:
     )
 
     assert keyword["unlocked"] == ["weather_forecast"]
+    assert keyword["next_action"] == (
+        "unlocked 中的工具 schema 已加载。下一步直接调用需要的工具，"
+        "不要再次 tool_search。"
+    )
     assert selected["unlocked"] == ["mcp_calendar_create"]
     assert selected["already_loaded"] == ["recall_memory"]
 

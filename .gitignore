@@ -19,6 +19,9 @@ Thumbs.db
 
 workspace/
 config.toml
+mcp_servers.json
+proactive_sources.json
+PROACTIVE_CONTEXT.md
 *.db
 *.db-shm
 *.db-wal

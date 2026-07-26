@@ -161,6 +161,11 @@ async def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(
         "edit_file",
     } <= tool_names
     assert "recall_memory" in tool_names
+    assert {
+        "recall_memory",
+        "memorize",
+        "forget_memory",
+    } <= bundle.tools.get_always_on_names()
     assert {"schedule", "list_schedules", "cancel_schedule"} <= tool_names
     assert any("shell_restore" in hook_id for hook_id in bundle.hook_ids)
     assert any("shell_safety" in hook_id for hook_id in bundle.hook_ids)
@@ -426,7 +431,7 @@ async def test_scheduler_builds_system_tick_and_outbox_process_without_model_cre
 
     assert isinstance(bundle.service, SchedulerProcess)
     assert isinstance(bundle.service.scheduler, SystemScheduler)
-    assert bundle.service.scheduler.proactive_tick_seconds == 300
+    assert bundle.service.scheduler.proactive_tick_seconds == 1800
     await bundle.close()
 
 

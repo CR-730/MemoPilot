@@ -211,16 +211,16 @@ def test_proactive_audit_records_observation_and_drift(tmp_path: Path) -> None:
         llm_input=({"role": "user", "content": "候选"},),
         created_at=NOW,
     )
-    repository.mark_drift_scheduled(
+    repository.mark_drift_started(
         session_key="feishu:chat-1",
         job_id="job-1",
-        scheduled_at=NOW,
+        started_at=NOW,
     )
 
     assert repository.list_observations("feishu:chat-1")[0]["subject_id"] == "decision-1"
     drift = repository.list_drift_history("feishu:chat-1")[0]
     assert drift["job_id"] == "job-1"
-    assert drift["outcome"] == "queued"
+    assert drift["outcome"] == "running"
 
 
 def test_failed_event_serialization_does_not_change_existing_reservoir(tmp_path: Path) -> None:
@@ -576,10 +576,10 @@ def test_drift_progress_survives_repository_restart(tmp_path: Path) -> None:
     database = tmp_path / "proactive.db"
     migrate_database(database, DatabaseKind.PROACTIVE)
     repository = ProactiveRepository(database)
-    repository.mark_drift_scheduled(
+    repository.mark_drift_started(
         session_key="feishu:chat-1",
         job_id="job-1",
-        scheduled_at=NOW,
+        started_at=NOW,
     )
 
     reopened = ProactiveRepository(database)

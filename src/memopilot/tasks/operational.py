@@ -270,6 +270,77 @@ class OperationalRepository:
         finally:
             connection.close()
 
+    def enqueue_proactive_if_session_idle(
+        self,
+        *,
+        session_key: str,
+        idempotency_key: str,
+        activity_version: int,
+        payload: Mapping[str, object],
+        now: datetime,
+    ) -> EnqueueResult | None:
+        """仅在会话没有排队或运行任务时，原子创建 P2 Job 与 Outbox。"""
+        if not idempotency_key.strip():
+            raise ValueError("主动 Job idempotency_key 不能为空")
+        if activity_version < 0:
+            raise ValueError("activity_version 不能为负数")
+        now_text = _utc_iso(now)
+        job_id = _stable_id("job", f"system:{idempotency_key}")
+        outbox_id = _stable_id("outbox", job_id)
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            busy = connection.execute(
+                """
+                SELECT 1 FROM agent_jobs
+                WHERE session_key = ? AND state IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (session_key,),
+            ).fetchone()
+            if busy is not None:
+                connection.execute("COMMIT")
+                return None
+            existing = connection.execute(
+                "SELECT job_id, activity_version FROM agent_jobs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                existing_job_id = str(existing["job_id"])
+                outbox = connection.execute(
+                    "SELECT outbox_id FROM outbox_events "
+                    "WHERE aggregate_id = ? AND event_type = 'agent.job.queued'",
+                    (existing_job_id,),
+                ).fetchone()
+                if outbox is None:
+                    raise RuntimeError("幂等主动 Job 缺少对应 Outbox")
+                connection.execute("COMMIT")
+                return EnqueueResult(
+                    existing_job_id,
+                    str(outbox["outbox_id"]),
+                    int(existing["activity_version"]),
+                    False,
+                )
+            self._insert_queued_job_with_outbox(
+                connection,
+                job_id=job_id,
+                kind="proactive.tick",
+                priority=2,
+                session_key=session_key,
+                idempotency_key=idempotency_key,
+                activity_version=activity_version,
+                payload=payload,
+                now_text=now_text,
+            )
+            connection.execute("COMMIT")
+            return EnqueueResult(job_id, outbox_id, activity_version, True)
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
     def get_single_private_session(self) -> PrivateSessionTarget | None:
         """返回唯一飞书私聊目标；多目标时拒绝隐式共享 Source 状态。"""
         with self._connect() as connection:

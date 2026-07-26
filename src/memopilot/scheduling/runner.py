@@ -70,9 +70,7 @@ class SystemScheduler:
         if target is None:
             return SystemTickResult(memory, schedules, None)
         bucket = int(current.timestamp() // self.proactive_tick_seconds)
-        proactive = self.repository.enqueue_system_job(
-            kind="proactive.tick",
-            priority=2,
+        proactive = self.repository.enqueue_proactive_if_session_idle(
             session_key=target.session_key,
             idempotency_key=f"proactive.tick:{target.session_key}:{bucket}",
             activity_version=target.activity_version,

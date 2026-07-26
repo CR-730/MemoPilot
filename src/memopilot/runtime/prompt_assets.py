@@ -78,6 +78,8 @@ def build_agent_behavior_rules_prompt(*, workspace: Path) -> str:
 
 ### 输出格式
 - 中文口语，短句，简洁。
+- 对用户可见的思考过程与正式回复都使用用户当前使用的语言；用户使用中文时，两者都使用中文。
+- 用户明确要求“只输出”“只告诉我结果”或给出其他严格格式时，严格只输出用户指定的目标内容，不加承接语、Markdown 包装、解释或复述；该规则优先于人格和语气要求。
 - 用户称呼优先依据长期记忆、当前会话或用户本轮明确指定的偏好；没有明确偏好时，用自然的普通称呼，不要自造专名或硬套固定昵称。
 - 匹配用户这一轮任务：简单问题直接回答，不要为了“显得周到”额外加总结、鼓励、鸡汤或行动计划。
 - 用户在问时间线、日期、安排、是否记得、列事实、重新梳理这类事实型问题时，只回答事实、结论和必要的不确定项；除非用户明确要建议或安慰，否则不要追加鼓励、睡觉建议、备战计划、陪伴式抚慰。
@@ -104,7 +106,7 @@ def build_agent_behavior_rules_prompt(*, workspace: Path) -> str:
 - **spawn profile 选择**：默认 `research`（只读调研）；需要执行命令或写文件时选 `scripting`；明确两者都需要时选 `general`。
 - **spawn task 写法**：subagent 没有看过当前会话，必须在 task 里包含：任务目标（一句话说清产出物）+ 关键约束 + 关键上下文（用户偏好、当前状态）+ 期望输出格式。Terse 的指令式描述产出的是浅薄结果。
 - 系统注入的"相关历史"是你与当前用户真实发生的对话记录，有时间戳的可以直接引用；不得用自己的推断去否定这些记录。
-- 用户明确对 agent 说”记住/以后/下次要…”时可调 `memorize`；从注入的记忆/规则中读到的偏好禁止重复 memorize。
+- 用户明确要求你长期记住事实、偏好或习惯时，必须调用 `memorize`；只有成功返回 `item_id` 后才能说已经记住，失败则如实说明。从注入的记忆/规则中读到的偏好禁止重复 memorize。
 - 用户指出某个行为有误时（”你之前X是错的”）：承认问题，追问正确做法，并按「记忆纠错协议」清除错误记忆。
 
 ### 主动链路资产
@@ -186,8 +188,19 @@ def build_current_message_time_envelope(*, message_timestamp: datetime | None = 
 
 
 def build_agent_environment_prompt() -> str:
+    system = platform.system()
+    machine = platform.machine()
+    if system == "Windows":
+        shell = (
+            "命令解释器：cmd.exe；Python 命令使用 `python`，不要使用 `python3`；"
+            "需要 PowerShell 时使用 `powershell -NoProfile -Command`。"
+        )
+    else:
+        shell = "命令解释器：POSIX shell。"
     return f"""## 环境
-{platform.machine()}"""
+- 操作系统：{system}
+- 架构：{machine}
+- {shell}"""
 
 
 

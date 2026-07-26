@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import random
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 from hashlib import sha1
 from typing import Literal, Protocol
 from urllib.parse import urlsplit, urlunsplit
@@ -40,19 +41,6 @@ class ProactiveOutcome:
     delivery_key: str = ""
 
 
-class SystemJobEnqueuer(Protocol):
-    def enqueue_drift(
-        self,
-        *,
-        job_id: str,
-        session_key: str,
-        chat_id: str,
-        activity_version: int,
-        priority: int,
-        now: datetime,
-    ) -> bool: ...
-
-
 class AgentTickEngine(Protocol):
     async def run(
         self,
@@ -64,9 +52,6 @@ class AgentTickEngine(Protocol):
         proactive_context: str = "",
         recent_context: str = "",
     ) -> AgentTickResult: ...
-
-
-WakePolicy = Callable[[str, datetime], bool]
 
 
 class SemanticDeduper(Protocol):
@@ -83,11 +68,17 @@ class ProactiveService:
         agent_tick: AgentTickEngine,
         *,
         skill_catalog: SkillCatalog,
-        job_enqueuer: SystemJobEnqueuer,
         assert_current: Callable[[], None],
         drift_min_interval: timedelta = timedelta(hours=3),
         drift_enabled: bool = True,
-        wake_policy: WakePolicy = lambda _session, _now: False,
+        context_probability: float = 0.3,
+        random_value: Callable[[], float] = random.random,
+        active_timezone: tzinfo,
+        active_start_hour: int = 8,
+        active_end_hour: int = 23,
+        ordinary_daily_limit: int = 3,
+        ordinary_cooldown: timedelta = timedelta(hours=2),
+        alert_cooldown: timedelta = timedelta(minutes=30),
         message_deduper: SemanticDeduper | None = None,
         memory_text: Callable[[], str] = lambda: "",
         proactive_context: Callable[[], str] = lambda: "",
@@ -95,15 +86,29 @@ class ProactiveService:
     ) -> None:
         if drift_min_interval < timedelta(0):
             raise ValueError("drift_min_interval 不能小于 0")
+        if not 0 <= context_probability <= 1:
+            raise ValueError("context_probability 必须在 0 到 1 之间")
+        if not 0 <= active_start_hour < active_end_hour <= 24:
+            raise ValueError("主动发送时段必须满足 0 <= start < end <= 24")
+        if ordinary_daily_limit <= 0:
+            raise ValueError("ordinary_daily_limit 必须大于 0")
+        if ordinary_cooldown < timedelta(0) or alert_cooldown < timedelta(0):
+            raise ValueError("主动发送冷却不能小于 0")
         self._repository = repository
         self._source_gateway = source_gateway
         self._agent_tick = agent_tick
         self._skill_catalog = skill_catalog
-        self._job_enqueuer = job_enqueuer
         self._assert_current = assert_current
         self._drift_min_interval = drift_min_interval
         self._drift_enabled = drift_enabled
-        self._wake_policy = wake_policy
+        self._context_probability = context_probability
+        self._random_value = random_value
+        self._active_timezone = active_timezone
+        self._active_start_hour = active_start_hour
+        self._active_end_hour = active_end_hour
+        self._ordinary_daily_limit = ordinary_daily_limit
+        self._ordinary_cooldown = ordinary_cooldown
+        self._alert_cooldown = alert_cooldown
         self._message_deduper = message_deduper
         self._memory_text = memory_text
         self._proactive_context = proactive_context
@@ -117,7 +122,8 @@ class ProactiveService:
         activity_version: int,
         now: datetime,
     ) -> ProactiveOutcome:
-        del job_id
+        del chat_id
+        self._assert_current()
         await self._source_gateway.replay_pending_acknowledgements(now=now)
         await self._source_gateway.collect(session_key=session_key, fetched_at=now)
         pending = self._repository.find_pending_decision(session_key)
@@ -133,20 +139,67 @@ class ProactiveService:
         alerts = tuple(item for item in unread if item.kind == "alert")
         contexts = tuple(item for item in unread if item.kind == "context")
         contents = tuple(item for item in unread if item.kind == "content")[:5]
-        fallback_open = bool(self._wake_policy(session_key, now))
 
-        if not alerts and not contents and not fallback_open:
+        if alerts:
             self._commit_context_snapshot(
                 session_key, contexts, activity_version=activity_version, now=now
             )
-            return self._handle_drift(session_key, chat_id, activity_version, now)
+            blocked = self._send_block_reason(session_key, "alert", now)
+            if blocked:
+                return ProactiveOutcome(
+                    "quiet",
+                    session_key=session_key,
+                    trigger_kind="alert",
+                    reason=blocked,
+                    decided_at=now,
+                )
+            selected_alerts = alerts
+            selected_contents: tuple[StoredProactiveEvent, ...] = ()
+            selected_contexts: tuple[StoredProactiveEvent, ...] = ()
+            fallback_open = False
+        elif contents:
+            self._commit_context_snapshot(
+                session_key, contexts, activity_version=activity_version, now=now
+            )
+            blocked = self._send_block_reason(session_key, "content", now)
+            if blocked:
+                return ProactiveOutcome(
+                    "quiet",
+                    session_key=session_key,
+                    trigger_kind="content",
+                    reason=blocked,
+                    decided_at=now,
+                )
+            selected_alerts = ()
+            selected_contents = contents
+            selected_contexts = ()
+            fallback_open = False
+        elif contexts and self._random_value() < self._context_probability:
+            blocked = self._send_block_reason(session_key, "context", now)
+            if blocked:
+                return ProactiveOutcome(
+                    "quiet",
+                    session_key=session_key,
+                    trigger_kind="context",
+                    reason=blocked,
+                    decided_at=now,
+                )
+            selected_alerts = ()
+            selected_contents = ()
+            selected_contexts = contexts
+            fallback_open = True
+        else:
+            self._commit_context_snapshot(
+                session_key, contexts, activity_version=activity_version, now=now
+            )
+            return self._handle_drift(job_id, session_key, now)
 
         self._assert_current()
         result = await self._agent_tick.run(
             AgentTickInput(
-                alerts=tuple(_event_payload(item) for item in alerts),
-                contents=tuple(_content_candidate(item) for item in contents),
-                contexts=tuple(_context_payload(item) for item in contexts),
+                alerts=tuple(_event_payload(item) for item in selected_alerts),
+                contents=tuple(_content_candidate(item) for item in selected_contents),
+                contexts=tuple(_context_payload(item) for item in selected_contexts),
                 context_as_fallback_open=fallback_open,
             ),
             session_key=session_key,
@@ -159,12 +212,11 @@ class ProactiveService:
         return await self._resolve_tick(
             result,
             session_key=session_key,
-            chat_id=chat_id,
             activity_version=activity_version,
             now=now,
-            alerts=alerts,
-            contents=contents,
-            contexts=contexts,
+            alerts=selected_alerts,
+            contents=selected_contents,
+            contexts=selected_contexts,
             context_as_fallback_open=fallback_open,
         )
 
@@ -173,7 +225,6 @@ class ProactiveService:
         result: AgentTickResult,
         *,
         session_key: str,
-        chat_id: str,
         activity_version: int,
         now: datetime,
         alerts: Sequence[StoredProactiveEvent],
@@ -222,7 +273,12 @@ class ProactiveService:
                     decided_at=now,
                 )
             if discarded_record is None:
-                return self._handle_drift(session_key, chat_id, activity_version, now)
+                return ProactiveOutcome(
+                    "quiet",
+                    session_key=session_key,
+                    reason=result.reason,
+                    decided_at=now,
+                )
             return ProactiveOutcome(
                 "quiet",
                 session_key=session_key,
@@ -423,8 +479,44 @@ class ProactiveService:
             return False
         return self._repository.mark_decision_failed(outcome.decision_id)
 
+    def _send_block_reason(
+        self,
+        session_key: str,
+        trigger_kind: str,
+        now: datetime,
+    ) -> str:
+        if trigger_kind == "alert":
+            last_alert = self._repository.last_confirmed_send(
+                session_key, trigger_kinds=("alert",)
+            )
+            if last_alert is not None and now - last_alert < self._alert_cooldown:
+                return "alert_cooldown"
+            return ""
+        local_now = now.astimezone(self._active_timezone)
+        if not self._active_start_hour <= local_now.hour < self._active_end_hour:
+            return "outside_active_window"
+        local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if (
+            self._repository.count_confirmed_sends(
+                session_key,
+                trigger_kind=trigger_kind,
+                since=local_midnight,
+            )
+            >= self._ordinary_daily_limit
+        ):
+            return "daily_limit"
+        last_ordinary = self._repository.last_confirmed_send(
+            session_key, trigger_kinds=("content", "context")
+        )
+        if (
+            last_ordinary is not None
+            and now - last_ordinary < self._ordinary_cooldown
+        ):
+            return "shared_cooldown"
+        return ""
+
     def _handle_drift(
-        self, session_key: str, chat_id: str, activity_version: int, now: datetime
+        self, job_id: str, session_key: str, now: datetime
     ) -> ProactiveOutcome:
         if not self._drift_enabled:
             return ProactiveOutcome("quiet", session_key=session_key, reason="drift_disabled")
@@ -434,18 +526,8 @@ class ProactiveService:
         if last is not None and now - last < self._drift_min_interval:
             return ProactiveOutcome("quiet", session_key=session_key, reason="drift_cooldown")
         self._assert_current()
-        window = max(300, int(self._drift_min_interval.total_seconds()))
-        job_id = _stable_id("drift-job", f"{session_key}:{int(now.timestamp() // window)}")
-        self._job_enqueuer.enqueue_drift(
-            job_id=job_id,
-            session_key=session_key,
-            chat_id=chat_id,
-            activity_version=activity_version,
-            priority=3,
-            now=now,
-        )
-        self._repository.mark_drift_scheduled(
-            session_key=session_key, job_id=job_id, scheduled_at=now
+        self._repository.mark_drift_started(
+            session_key=session_key, job_id=job_id, started_at=now
         )
         return ProactiveOutcome(
             "drift", session_key=session_key, drift_job_id=job_id, decided_at=now
@@ -598,4 +680,4 @@ def _parse_time(value: object) -> datetime | None:
         return None
 
 
-__all__ = ["AgentTickEngine", "ProactiveOutcome", "ProactiveService", "SystemJobEnqueuer"]
+__all__ = ["AgentTickEngine", "ProactiveOutcome", "ProactiveService"]

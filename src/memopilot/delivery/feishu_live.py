@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Callable
 from typing import Protocol
@@ -30,6 +31,26 @@ _LIVE_MAX_FAILURES = 3
 _LIVE_MAX_BACKOFF_SECONDS = 16.0
 _LIVE_MAX_RATE_LIMITS = 5
 _RATE_LIMIT_CODES = frozenset({99991400, 99991661, 230020, 230027, 11232})
+
+
+def _tool_display_succeeded(
+    call: FunctionCall,
+    observation: ToolObservation,
+) -> bool:
+    if not observation.ok:
+        return False
+    if call.name != "shell" or not isinstance(observation.result, str):
+        return True
+    try:
+        payload = json.loads(observation.result)
+    except (json.JSONDecodeError, TypeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    if payload.get("status") in {"error", "timeout"}:
+        return False
+    exit_code = payload.get("exit_code")
+    return not isinstance(exit_code, int) or exit_code == 0
 
 
 class LiveCardTransport(Protocol):
@@ -129,7 +150,9 @@ class FeishuLiveProgress:
                 target=format_tool_target(call.arguments),
             )
             self._tools.append(line)
-        line.status = "done" if observation.ok else "error"
+        line.status = (
+            "done" if _tool_display_succeeded(call, observation) else "error"
+        )
         await self._sync()
 
     async def finalize(self) -> None:

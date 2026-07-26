@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -110,6 +111,41 @@ class _InterruptingExecutor:
         except asyncio.CancelledError:
             self.cancelled = True
             raise
+
+
+@pytest.mark.asyncio
+async def test_run_forever_logs_one_job_failure_and_keeps_consuming(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker = object.__new__(WorkerService)
+    continued = asyncio.Event()
+    calls = 0
+
+    class Queue:
+        async def ensure_consumer_groups(self) -> None:
+            return None
+
+    worker._queue = Queue()  # type: ignore[assignment]
+
+    async def run_once() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("provider rejected request")
+        continued.set()
+        return False
+
+    worker.run_once = run_once  # type: ignore[method-assign]
+    task = asyncio.create_task(worker.run_forever(idle_interval=0.001))
+    try:
+        with caplog.at_level(logging.ERROR, logger="memopilot.worker.service"):
+            await asyncio.wait_for(continued.wait(), timeout=1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert calls >= 2
+    assert "provider rejected request" in caplog.text
 
 
 @pytest.mark.asyncio

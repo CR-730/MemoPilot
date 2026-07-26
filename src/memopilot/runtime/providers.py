@@ -48,6 +48,13 @@ class OpenAICompatibleProvider:
         self._max_output_tokens = max_output_tokens
         self._extra_body = dict(extra_body) if extra_body is not None else None
         self._preserve_reasoning_content = preserve_reasoning_content
+        self._thinking_contract: str | None
+        if self._extra_body is not None and "thinking" in self._extra_body:
+            self._thinking_contract = "deepseek"
+        elif self._extra_body is not None and "enable_thinking" in self._extra_body:
+            self._thinking_contract = "dashscope"
+        else:
+            self._thinking_contract = None
 
     @classmethod
     def from_credentials(
@@ -102,6 +109,53 @@ class OpenAICompatibleProvider:
                 }
             },
             preserve_reasoning_content=thinking_enabled,
+        )
+
+    @classmethod
+    def from_routed_credentials(
+        cls,
+        *,
+        api_key: str,
+        base_url: str,
+        model: str,
+        max_output_tokens: int = 2048,
+        max_retries: int = 2,
+        timeout_seconds: float = 60,
+        thinking_enabled: bool = False,
+    ) -> OpenAICompatibleProvider:
+        """按旧项目的 Provider 边界选择思考参数合同。"""
+        if "deepseek" in f"{base_url} {model}".lower():
+            return cls.from_deepseek_credentials(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                max_output_tokens=max_output_tokens,
+                max_retries=max_retries,
+                timeout_seconds=timeout_seconds,
+                thinking_enabled=thinking_enabled,
+            )
+        provider_text = f"{base_url} {model}".lower()
+        if not (
+            "dashscope.aliyuncs.com" in provider_text
+            or "dashscope" in provider_text
+            or "xiaomimimo.com" in provider_text
+        ):
+            return cls.from_credentials(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                max_output_tokens=max_output_tokens,
+                max_retries=max_retries,
+                timeout_seconds=timeout_seconds,
+            )
+        return cls.from_credentials(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            max_output_tokens=max_output_tokens,
+            max_retries=max_retries,
+            timeout_seconds=timeout_seconds,
+            extra_body={"enable_thinking": thinking_enabled},
         )
 
     async def complete(
@@ -165,10 +219,8 @@ class OpenAICompatibleProvider:
         max_output_tokens: int,
         thinking_enabled: bool | None,
     ) -> ModelResponse:
-        preserve_reasoning = (
-            self._preserve_reasoning_content
-            if thinking_enabled is None
-            else thinking_enabled
+        preserve_reasoning = self._preserve_reasoning_content and (
+            thinking_enabled is None or thinking_enabled
         )
         request_messages = [
             message.to_openai(
@@ -192,9 +244,12 @@ class OpenAICompatibleProvider:
         extra_body = dict(self._extra_body) if self._extra_body is not None else None
         if thinking_enabled is not None:
             extra_body = extra_body or {}
-            extra_body["thinking"] = {
-                "type": "enabled" if thinking_enabled else "disabled"
-            }
+            if self._thinking_contract == "deepseek":
+                extra_body["thinking"] = {
+                    "type": "enabled" if thinking_enabled else "disabled"
+                }
+            elif self._thinking_contract == "dashscope":
+                extra_body["enable_thinking"] = thinking_enabled
         if extra_body is not None:
             request["extra_body"] = extra_body
         response = await self._client.chat.completions.create(**request)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from memopilot.bootstrap import build_runtime_bundle
+from memopilot.bootstrap import _chat_provider, build_runtime_bundle
 from memopilot.config import MemoPilotSettings
 from memopilot.runtime.contracts import ChatMessage, ModelResponse, ToolSchema
 
@@ -28,6 +28,48 @@ class _Embedder:
     async def embed(self, text: str) -> list[float]:
         del text
         return [1.0, 0.0]
+
+
+def test_main_provider_uses_dashscope_thinking_contract() -> None:
+    settings = MemoPilotSettings(
+        chat_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        chat_model="qwen-plus",
+        chat_api_key="test",
+        llm_thinking_enabled=True,
+        _env_file=None,
+    )
+
+    provider = _chat_provider(settings)
+
+    assert provider._extra_body == {"enable_thinking": True}
+
+
+def test_main_provider_keeps_deepseek_thinking_contract() -> None:
+    settings = MemoPilotSettings(
+        chat_base_url="https://api.deepseek.com",
+        chat_model="deepseek-chat",
+        chat_api_key="test",
+        llm_thinking_enabled=True,
+        _env_file=None,
+    )
+
+    provider = _chat_provider(settings)
+
+    assert provider._extra_body == {"thinking": {"type": "enabled"}}
+
+
+def test_generic_openai_provider_does_not_receive_dashscope_thinking_body() -> None:
+    settings = MemoPilotSettings(
+        chat_base_url="https://openai-compatible.example/v1",
+        chat_model="custom-model",
+        chat_api_key="test",
+        llm_thinking_enabled=True,
+        _env_file=None,
+    )
+
+    provider = _chat_provider(settings)
+
+    assert provider._extra_body is None
 
 
 async def test_runtime_routes_lightweight_memory_tasks_to_fast_provider(

@@ -422,6 +422,41 @@ async def test_receive_loop_exception_is_consumed_only_during_explicit_shutdown(
     await client._receive_message_loop()
 
 
+async def test_sdk_ping_and_cache_tasks_are_cancelled_and_awaited_on_shutdown(
+    tmp_path: Path,
+) -> None:
+    channel, _ = _channel(tmp_path)
+    ping_task = asyncio.create_task(asyncio.Event().wait())
+    cache_task = asyncio.create_task(asyncio.Event().wait())
+    channel._ws_ping_task = ping_task
+    channel._ws_cache_task = cache_task
+
+    await channel._cancel_ws_background_tasks()
+
+    assert ping_task.cancelled()
+    assert cache_task.cancelled()
+
+
+async def test_guarded_ping_loop_records_sdk_owned_task(tmp_path: Path) -> None:
+    channel, _ = _channel(tmp_path)
+    started = asyncio.Event()
+
+    class _Client:
+        async def _ping_loop(self) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+    client = _Client()
+    channel._guard_ping_loop(client)
+    task = asyncio.create_task(client._ping_loop())
+    await started.wait()
+
+    assert channel._ws_ping_task is task
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_stop_during_connect_does_not_reenable_auto_reconnect(
     tmp_path: Path,

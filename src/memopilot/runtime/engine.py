@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -1260,7 +1260,7 @@ async def _emit_gate(
         return
     ctx = context.slots[ctx_slot]
     payload = dict(context.slots)
-    payload.update(asdict(ctx))
+    payload.update({item.name: getattr(ctx, item.name) for item in fields(ctx)})
     updated = await event_bus.emit(phase.value, payload)
     for key, value in updated.items():
         if hasattr(ctx, key):
