@@ -323,14 +323,19 @@ class AgentRuntime:
             and (document := active_tools.get_document(name)) is not None
             and document.risk not in policy_turn.allowed_tool_risks
         }
-        preloaded_tools = tuple(
-            name
-            for name in self._tool_discovery.get_preloaded_ordered(
-                before_reasoning_ctx.session_key
+        deferred_search_enabled = self._tool_search_enabled and active_tools is self._tools
+        preloaded_tools = (
+            tuple(
+                name
+                for name in self._tool_discovery.get_preloaded_ordered(
+                    before_reasoning_ctx.session_key
+                )
+                if name not in blocked_tool_names
             )
-            if name not in blocked_tool_names
+            if deferred_search_enabled
+            else ()
         )
-        if self._tool_search_enabled:
+        if deferred_search_enabled:
             visible = (
                 active_tools.get_always_on_names() | set(preloaded_tools)
             ) - blocked_tool_names
@@ -382,7 +387,7 @@ class AgentRuntime:
                 session_key=effective_turn.session_key,
                 source=effective_turn.prompt_scope,
                 request_text=effective_turn.content,
-                tool_search_enabled=self._tool_search_enabled,
+                tool_search_enabled=deferred_search_enabled,
                 preloaded_tools=preloaded_tools,
                 assert_current=execution_assert_current,
                 excluded_tool_names=blocked_tool_names,
@@ -391,7 +396,7 @@ class AgentRuntime:
             if schedule_context_token is not None:
                 reset_schedule_tool_context(schedule_context_token)
             reset_memory_tool_context(tool_context_token)
-        if self._tool_search_enabled:
+        if deferred_search_enabled:
             self._tool_discovery.update(
                 effective_turn.session_key,
                 [

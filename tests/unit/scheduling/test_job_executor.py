@@ -1,10 +1,14 @@
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from memopilot.delivery.feishu import DeliveryOutcome
+from memopilot.persistence.migrations import DatabaseKind, migrate_database
+from memopilot.proactive.store import ProactiveRepository
+from memopilot.runtime.contracts import FunctionCall
 from memopilot.runtime.engine import TurnInput, TurnResult
 from memopilot.runtime.react import ReActResult
 from memopilot.scheduling.job_executor import SystemJobRouter
@@ -71,6 +75,34 @@ class _Runtime:
 class _FailingRuntime(_Runtime):
     async def run(self, turn: TurnInput, **kwargs: Any) -> TurnResult:
         raise RuntimeError("runtime failed")
+
+
+class _FinishingDriftRuntime(_Runtime):
+    async def run(self, turn: TurnInput, **kwargs: Any) -> TurnResult:
+        self.calls.append((turn, kwargs))
+        finished = await kwargs["tools"].execute(
+            FunctionCall(
+                "finish",
+                "finish_drift",
+                {
+                    "skill_used": "research",
+                    "one_line": "完成后台检查",
+                    "next": "等待下次空闲",
+                    "message_result": "silent",
+                },
+            )
+        )
+        assert finished.ok
+        return self.result
+
+
+class _BrokenDriftAudit:
+    def mark_drift_started(self, **kwargs: Any) -> None:
+        del kwargs
+
+    def complete_drift(self, **kwargs: Any) -> None:
+        del kwargs
+        raise KeyError("audit failed")
 
 
 class _Dispatcher:
@@ -179,10 +211,15 @@ async def test_schedule_agent_runs_prompt_then_dispatches_reply() -> None:
 
 
 @pytest.mark.asyncio
-async def test_drift_selects_skill_then_runs_without_sending_final_text() -> None:
+async def test_drift_selects_skill_then_runs_without_sending_final_text(
+    tmp_path: Path,
+) -> None:
     repository = _Repository()
-    runtime = _Runtime(_result("后台结论"))
+    runtime = _FinishingDriftRuntime(_result("后台结论"))
     dispatcher = _Dispatcher()
+    database = tmp_path / "proactive.db"
+    migrate_database(database, DatabaseKind.PROACTIVE)
+    drift_audit = ProactiveRepository(database)
     claim, lease = _identity()
     selector = _DriftSelector()
     router = SystemJobRouter(
@@ -190,6 +227,7 @@ async def test_drift_selects_skill_then_runs_without_sending_final_text() -> Non
         runtime,
         dispatcher=dispatcher,
         drift_selector=selector,
+        drift_repository=drift_audit,
     )  # type: ignore[arg-type]
 
     result = await router.execute(
@@ -206,6 +244,53 @@ async def test_drift_selects_skill_then_runs_without_sending_final_text() -> Non
     assert runtime.calls[0][0].content == "$research"
     assert runtime.calls[0][0].prompt_scope == "background"
     assert dispatcher.calls == []
+    audit = drift_audit.list_drift_history("feishu:chat-1")[0]
+    assert audit["outcome"] == "succeeded"
+    assert audit["reason"] == "silent"
+
+
+@pytest.mark.asyncio
+async def test_drift_runtime_error_is_not_masked_by_audit_failure() -> None:
+    repository = _Repository()
+    claim, lease = _identity()
+    router = SystemJobRouter(
+        repository,
+        _FailingRuntime(),
+        drift_selector=_DriftSelector(),
+        drift_repository=_BrokenDriftAudit(),  # type: ignore[arg-type]
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="runtime failed"):
+        await router.execute(
+            kind="drift.run",
+            payload={},
+            claim=claim,
+            lease=lease,
+            turn=TurnInput("feishu:chat-1", "", received_at=NOW),
+            now=NOW,
+        )
+
+
+@pytest.mark.asyncio
+async def test_drift_without_finish_is_failed() -> None:
+    repository = _Repository()
+    claim, lease = _identity()
+    router = SystemJobRouter(
+        repository,
+        _Runtime(_result("只输出文字，没有 finish_drift")),
+        drift_selector=_DriftSelector(),
+    )  # type: ignore[arg-type]
+
+    result = await router.execute(
+        kind="drift.run",
+        payload={},
+        claim=claim,
+        lease=lease,
+        turn=TurnInput("feishu:chat-1", "", received_at=NOW),
+        now=NOW,
+    )
+
+    assert result.outcome == "failed"
 
 
 @pytest.mark.asyncio
@@ -236,7 +321,7 @@ async def test_proactive_is_delegated_to_injected_handler() -> None:
 @pytest.mark.asyncio
 async def test_proactive_drift_continues_in_same_job_and_lease() -> None:
     repository = _Repository()
-    runtime = _Runtime(_result("后台结论"))
+    runtime = _FinishingDriftRuntime(_result("后台结论"))
     proactive = _ProactiveHandler("drift")
     selector = _DriftSelector()
     claim, lease = _identity()

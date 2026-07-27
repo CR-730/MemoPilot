@@ -437,6 +437,60 @@ async def test_runtime_keeps_successful_deferred_tool_in_session_lru() -> None:
     assert "search tools" not in first_system
 
 
+async def test_alternate_tool_registry_bypasses_main_registry_deferred_search() -> None:
+    provider = _Provider(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(
+                    FunctionCall("special", "special", {"text": "真实执行"}),
+                ),
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(content="完成", tool_calls=(), finish_reason="stop"),
+        ]
+    )
+    main = _tools()
+    search = ToolSearchTool(main)
+    main.register(
+        Tool(
+            "tool_search",
+            "search tools",
+            {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            search.execute,
+        ),
+        always_on=True,
+    )
+    alternate = ToolRegistry(
+        (
+            Tool(
+                "special",
+                "专用工具",
+                {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+                _echo,
+            ),
+        )
+    )
+
+    result = await AgentRuntime(
+        provider,
+        main,
+        tool_search_enabled=True,
+    ).run(TurnInput("feishu:background", "执行"), tools=alternate)
+
+    assert result.reply == "完成"
+    assert result.react.tool_chain[0].observation.ok is True
+    assert result.react.tool_chain[0].observation.result == "真实执行"
+
+
 async def test_before_turn_abort_returns_auditable_result_without_provider_call() -> None:
     provider = _Provider([ModelResponse(content="must not run", tool_calls=())])
     bus = EventBus()

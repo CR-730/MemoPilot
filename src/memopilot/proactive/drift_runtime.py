@@ -31,6 +31,7 @@ SaveDriftFinish = Callable[[dict[str, str]], Awaitable[None] | None]
 def build_drift_tool_registry(
     *,
     workspace: Path,
+    builtin_skills_dir: Path | None = None,
     state: DriftRunState,
     send_message: SendDriftMessage | None = None,
     save_finish: SaveDriftFinish | None = None,
@@ -38,9 +39,21 @@ def build_drift_tool_registry(
     connected_servers: frozenset[str] = frozenset(),
 ) -> ToolRegistry:
     workspace = workspace.resolve()
+    builtin_skills_dir = (
+        builtin_skills_dir.resolve() if builtin_skills_dir is not None else None
+    )
 
     async def read_file(path: str) -> str:
         target = _safe_path(workspace, path)
+        if (
+            not target.exists()
+            and builtin_skills_dir is not None
+            and Path(path).as_posix().startswith("skills/")
+        ):
+            relative = Path(path).as_posix().removeprefix("skills/")
+            builtin_target = _safe_path(builtin_skills_dir, relative)
+            if builtin_target.exists():
+                target = builtin_target
         return target.read_text(encoding="utf-8")
 
     async def write_file(path: str, content: str) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any, Protocol, cast
 from memopilot.delivery.feishu import DeliveryOutcome
 from memopilot.proactive.drift import DRIFT_SYSTEM_PROMPT
 from memopilot.proactive.drift_runtime import DriftRunState, build_drift_tool_registry
+from memopilot.proactive.store import ProactiveRepository
 from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.persistence import OperationalStepSink
 from memopilot.runtime.tools import ToolRegistry
@@ -60,6 +62,8 @@ class SystemJobRouter:
         proactive_handler: ProactiveJobHandler | None = None,
         drift_selector: DriftSkillSelector | None = None,
         drift_workspace: Path | None = None,
+        drift_builtin_skills: Path | None = None,
+        drift_repository: ProactiveRepository | None = None,
         shared_tools: ToolRegistry | None = None,
         connected_mcp_servers: Callable[[], frozenset[str]] | None = None,
     ) -> None:
@@ -69,6 +73,8 @@ class SystemJobRouter:
         self.proactive_handler = proactive_handler
         self.drift_selector = drift_selector
         self.drift_workspace = drift_workspace
+        self.drift_builtin_skills = drift_builtin_skills
+        self.drift_repository = drift_repository
         self.shared_tools = shared_tools
         self.connected_mcp_servers = connected_mcp_servers
 
@@ -86,7 +92,9 @@ class SystemJobRouter:
         if kind == "schedule.run":
             return await self._run_schedule(payload, claim, lease, turn, now)
         if kind == "drift.run":
-            return await self._run_drift(payload, claim, lease, turn, now)
+            return await self._run_drift(
+                payload, claim, lease, turn, now, ensure_audit=True
+            )
         if kind == "proactive.tick":
             if self.proactive_handler is None:
                 raise RuntimeError("未配置 Proactive Job Handler")
@@ -98,7 +106,9 @@ class SystemJobRouter:
                 now=now,
             )
             if outcome == "drift":
-                return await self._run_drift(payload, claim, lease, turn, now)
+                return await self._run_drift(
+                    payload, claim, lease, turn, now, ensure_audit=False
+                )
             return SystemJobResult(outcome=outcome)
         raise ValueError(f"不支持的系统任务: {kind}")
 
@@ -219,6 +229,8 @@ class SystemJobRouter:
         lease: FenceToken,
         turn: TurnInput,
         now: datetime,
+        *,
+        ensure_audit: bool,
     ) -> SystemJobResult:
         if self.drift_selector is None:
             raise RuntimeError("未配置 Drift Skill Selector")
@@ -227,6 +239,12 @@ class SystemJobRouter:
         skill_name = await self.drift_selector.select()
         assert_current()
         state = DriftRunState(frozenset({skill_name}))
+        if ensure_audit and self.drift_repository is not None:
+            self.drift_repository.mark_drift_started(
+                session_key=turn.session_key,
+                job_id=claim.job_id,
+                started_at=now,
+            )
 
         async def send_message(text: str, media: list[str]) -> bool:
             del media
@@ -245,6 +263,7 @@ class SystemJobRouter:
         )
         drift_tools = build_drift_tool_registry(
             workspace=workspace,
+            builtin_skills_dir=self.drift_builtin_skills,
             state=state,
             send_message=send_message,
             shared_tools=self.shared_tools,
@@ -254,29 +273,73 @@ class SystemJobRouter:
                 else frozenset()
             ),
         )
-        result = await self.runtime.run(
-            replace(
-                turn,
-                content=f"${skill_name}",
-                system_prompt=DRIFT_SYSTEM_PROMPT,
-                current_user_content=None,
-                prompt_scope="background",
-                memory_source_ref=f"run:{claim.run_id}",
-                allowed_tool_risks=frozenset({"read-only", "write"}),
-            ),
-            tools=drift_tools,
-            step_sink=OperationalStepSink(
-                self.repository,
-                run_id=claim.run_id,
-                lease=lease,
-                clock=lambda: now,
-            ),
-            execution_assert_current=assert_current,
-            memory_assert_current=assert_current,
-            memory_fenced_write=lambda: self.repository.fenced_write(lease),
+        try:
+            result = await self.runtime.run(
+                replace(
+                    turn,
+                    content=f"${skill_name}",
+                    system_prompt=DRIFT_SYSTEM_PROMPT,
+                    current_user_content=None,
+                    prompt_scope="background",
+                    memory_source_ref=f"run:{claim.run_id}",
+                    allowed_tool_risks=frozenset({"read-only", "write"}),
+                ),
+                tools=drift_tools,
+                step_sink=OperationalStepSink(
+                    self.repository,
+                    run_id=claim.run_id,
+                    lease=lease,
+                    clock=lambda: now,
+                ),
+                execution_assert_current=assert_current,
+                memory_assert_current=assert_current,
+                memory_fenced_write=lambda: self.repository.fenced_write(lease),
+            )
+        except BaseException as exc:
+            with suppress(Exception):
+                self._complete_drift(
+                    turn.session_key,
+                    claim.job_id,
+                    skill_name,
+                    "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                    state.finish_payload or {},
+                    now,
+                )
+            raise
+        outcome = (
+            "failed"
+            if result.react.infrastructure_error or not state.finished
+            else "succeeded"
         )
-        outcome = "failed" if result.react.infrastructure_error else "succeeded"
+        self._complete_drift(
+            turn.session_key,
+            claim.job_id,
+            skill_name,
+            outcome,
+            state.finish_payload or {},
+            now,
+        )
         return SystemJobResult(outcome, result)
+
+    def _complete_drift(
+        self,
+        session_key: str,
+        job_id: str,
+        skill_name: str,
+        outcome: str,
+        result: dict[str, str],
+        now: datetime,
+    ) -> None:
+        if self.drift_repository is None:
+            return
+        self.drift_repository.complete_drift(
+            session_key=session_key,
+            job_id=job_id,
+            skill_name=skill_name,
+            outcome=outcome,
+            result=result,
+            completed_at=now,
+        )
 
     def _system_checkpoint(
         self,

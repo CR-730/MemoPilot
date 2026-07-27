@@ -285,3 +285,17 @@ def test_skill_symlink_cannot_escape_discovery_root(tmp_path: Path) -> None:
 
     assert result.skills == ()
     assert [item.code for item in result.diagnostics] == ["path_outside_root"]
+
+
+def test_builtin_skills_keep_one_available_drift_candidate() -> None:
+    builtin_root = (
+        Path(__file__).resolve().parents[3] / "src" / "memopilot" / "builtin_skills"
+    )
+
+    result = SkillLoader(builtin_root=builtin_root).load()
+    candidates = SkillCatalog(result.skills).background_candidates()
+
+    assert result.diagnostics == ()
+    assert {skill.name for skill in candidates} == {"create-drift-skill"}
+    assert "没有明确可沉淀的长期任务" in candidates[0].content
+    assert "finish_drift" in candidates[0].content

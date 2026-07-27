@@ -339,6 +339,42 @@ class ProactiveRepository:
                 connection.execute("ROLLBACK")
                 raise
 
+    def complete_drift(
+        self,
+        *,
+        session_key: str,
+        job_id: str,
+        skill_name: str,
+        outcome: str,
+        result: dict[str, str],
+        completed_at: datetime,
+    ) -> None:
+        if outcome not in {"succeeded", "failed", "cancelled"}:
+            raise ValueError(f"无效 Drift outcome: {outcome}")
+        timestamp = _utc_iso(completed_at)
+        reason = str(result.get("message_result") or "unfinished")
+        trace = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        with connect_database(self._database) as connection:
+            changed = connection.execute(
+                """
+                UPDATE drift_history
+                SET skill_name = ?, outcome = ?, reason = ?,
+                    updated_at = ?, trace_json = ?
+                WHERE session_key = ? AND job_id = ? AND outcome = 'running'
+                """,
+                (
+                    skill_name,
+                    outcome,
+                    reason,
+                    timestamp,
+                    trace,
+                    session_key,
+                    job_id,
+                ),
+            ).rowcount
+        if changed != 1:
+            raise KeyError(f"找不到运行中的 Drift: {session_key}/{job_id}")
+
     def _list_audit(
         self, table: str, session_key: str, order_column: str
     ) -> tuple[dict[str, Any], ...]:

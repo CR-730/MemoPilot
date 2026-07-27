@@ -361,7 +361,10 @@ required_tools: [search]
     )
 
     assert "search" in bundle.tools.tool_names
-    assert [skill.name for skill in bundle.skills.background_candidates()] == ["research"]
+    assert [skill.name for skill in bundle.skills.background_candidates()] == [
+        "create-drift-skill",
+        "research",
+    ]
     assert [(item.plugin_id, item.code) for item in bundle.plugin_diagnostics] == [
         ("broken", "import_failed")
     ]
@@ -473,7 +476,9 @@ required_tools: [mcp_fake__echo]
     )
     worker = await build_worker(settings)
     try:
-        assert worker.runtime.skills.background_candidates() == ()
+        assert [
+            skill.name for skill in worker.runtime.skills.background_candidates()
+        ] == ["create-drift-skill"]
         await worker.start_extensions()
         await worker.start_extensions()
         for _ in range(100):
@@ -483,7 +488,7 @@ required_tools: [mcp_fake__echo]
         assert "mcp_fake__echo" in worker.runtime.tools.tool_names
         assert [
             skill.name for skill in worker.runtime.skills.background_candidates()
-        ] == ["mcp_research"]
+        ] == ["create-drift-skill", "mcp_research"]
         assert worker.mcp_diagnostics == []
     finally:
         await worker.close()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -585,3 +586,31 @@ def test_drift_progress_survives_repository_restart(tmp_path: Path) -> None:
     reopened = ProactiveRepository(database)
 
     assert reopened.load_last_drift_at("feishu:chat-1") == NOW
+
+
+def test_drift_finish_persists_result_for_audit(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    repository.mark_drift_started(
+        session_key="feishu:chat-1",
+        job_id="job-1",
+        started_at=NOW,
+    )
+
+    repository.complete_drift(
+        session_key="feishu:chat-1",
+        job_id="job-1",
+        skill_name="create-drift-skill",
+        outcome="succeeded",
+        result={
+            "one_line": "检查了后台技能",
+            "next": "等待新的长期任务",
+            "message_result": "silent",
+        },
+        completed_at=NOW + timedelta(minutes=1),
+    )
+
+    drift = repository.list_drift_history("feishu:chat-1")[0]
+    assert drift["outcome"] == "succeeded"
+    assert drift["skill_name"] == "create-drift-skill"
+    assert drift["reason"] == "silent"
+    assert json.loads(drift["trace_json"])["next"] == "等待新的长期任务"

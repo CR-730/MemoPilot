@@ -627,6 +627,8 @@ async def build_runtime_bundle(
             ),
             drift_selector=DriftSkillSelector(provider, active_skills),
             drift_workspace=settings.workspace,
+            drift_builtin_skills=_BUILTIN_SKILLS_DIR,
+            drift_repository=proactive_repository,
             shared_tools=registry,
             connected_mcp_servers=lambda: frozenset(mcp_registry.connected_server_ids),
         )

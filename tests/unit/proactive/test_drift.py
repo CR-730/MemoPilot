@@ -95,3 +95,5 @@ def test_drift_prompt_keeps_prototype_finish_contract() -> None:
     assert "message_push 成功后不要再调用 recall_memory" in DRIFT_SYSTEM_PROMPT
     assert "必须调用 finish_drift" in DRIFT_SYSTEM_PROMPT
     assert "message_result" in DRIFT_SYSTEM_PROMPT
+    assert "skills/<skill_name>/SKILL.md" in DRIFT_SYSTEM_PROMPT
+    assert "explore-curiosity" not in DRIFT_SYSTEM_PROMPT

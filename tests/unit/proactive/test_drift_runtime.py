@@ -126,3 +126,33 @@ async def test_drift_reuses_shared_public_tools(tmp_path: Path) -> None:
         shared_tools=shared,
     )
     assert registry.has_tool("recall_memory")
+
+
+@pytest.mark.asyncio
+async def test_read_file_falls_back_to_builtin_skill_but_workspace_overrides_it(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    builtin = tmp_path / "builtin"
+    workspace.mkdir()
+    builtin_skill = builtin / "background"
+    builtin_skill.mkdir(parents=True)
+    (builtin_skill / "SKILL.md").write_text("builtin", encoding="utf-8")
+    registry = build_drift_tool_registry(
+        workspace=workspace,
+        builtin_skills_dir=builtin,
+        state=DriftRunState(frozenset({"background"})),
+    )
+
+    fallback = await registry.execute(
+        FunctionCall("1", "read_file", {"path": "skills/background/SKILL.md"})
+    )
+    assert fallback.result == "builtin"
+
+    workspace_skill = workspace / "skills" / "background"
+    workspace_skill.mkdir(parents=True)
+    (workspace_skill / "SKILL.md").write_text("workspace", encoding="utf-8")
+    override = await registry.execute(
+        FunctionCall("2", "read_file", {"path": "skills/background/SKILL.md"})
+    )
+    assert override.result == "workspace"
