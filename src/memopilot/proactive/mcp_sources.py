@@ -31,6 +31,7 @@ class ProactiveSourceConfig:
     channel: ProactiveChannel
     get_tool: str
     ack_tool: str = ""
+    poll_tool: str = ""
     fetch_timeout_seconds: float = 30.0
     ack_timeout_seconds: float = 30.0
 
@@ -172,6 +173,13 @@ class ProactiveSourceGateway:
         caller = self._caller_for_server(config.server)
         try:
             async with asyncio.timeout(config.fetch_timeout_seconds):
+                if config.poll_tool:
+                    poll_result = await caller.call_tool(config.poll_tool, {})
+                    if not poll_result.ok:
+                        raise McpInvocationError(
+                            "proactive_source_error",
+                            poll_result.error_message or "主动信息源轮询失败",
+                        )
                 result = await caller.call_tool(
                     config.get_tool,
                     {},
@@ -237,6 +245,7 @@ def _parse_source(raw: object) -> ProactiveSourceConfig:
         channel=channel,  # type: ignore[arg-type]
         get_tool=str(raw.get("get_tool") or raw.get("fetch_tool") or ""),
         ack_tool=str(raw.get("ack_tool") or ""),
+        poll_tool=str(raw.get("poll_tool") or ""),
         fetch_timeout_seconds=float(raw.get("fetch_timeout_seconds", 30)),
         ack_timeout_seconds=float(raw.get("ack_timeout_seconds", 30)),
     )
@@ -249,8 +258,10 @@ def _parse_fetch_result(
     fetched_at: datetime,
 ) -> ProactiveFetchResult:
     data = _decode_tool_result(result)
-    if config.channel == "context" and isinstance(data, dict):
-        raw_events: object = [data]
+    if isinstance(data, dict) and isinstance(data.get("events"), list):
+        raw_events: object = data["events"]
+    elif config.channel == "context" and isinstance(data, dict):
+        raw_events = [data]
     else:
         raw_events = data
     if not isinstance(raw_events, list):

@@ -422,13 +422,13 @@ class AgentTick:
         self._assert_current()
         response = await self._provider.complete(messages=messages, tools=CONTENT_TOOL_SCHEMAS)
         self._assert_current()
-        if len(response.tool_calls) != 1:
+        if not response.tool_calls:
             return False
         call = response.tool_calls[0]
         messages.append(
             ChatMessage.assistant(
                 content=response.content,
-                tool_calls=response.tool_calls,
+                tool_calls=(call,),
                 provider_fields=response.provider_fields,
             )
         )

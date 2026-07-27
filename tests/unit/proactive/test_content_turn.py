@@ -33,6 +33,17 @@ class _Provider:
         return ModelResponse(None, (call,), finish_reason="tool_calls")
 
 
+class _ResponseProvider:
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        self.responses = list(responses)
+        self.messages = []
+
+    async def complete(self, *, messages, tools=()):
+        del tools
+        self.messages.append(tuple(messages))
+        return self.responses.pop(0)
+
+
 class _Memory:
     def __init__(self) -> None:
         self.requests = []
@@ -203,6 +214,56 @@ async def test_content_turn_prefetches_bodies_then_runs_old_react_tool_chain() -
     assert "正文:https://example.com/a" not in provider.messages[0][-1].content
     assert provider.messages[3][-1].role == "tool"
     assert "正文:https://example.com/a" in (provider.messages[3][-1].content or "")
+
+
+@pytest.mark.asyncio
+async def test_agent_tick_uses_first_tool_when_provider_returns_parallel_calls() -> None:
+    recall = _call(1, "recall_memory", {"query": "用户是否关注 Agent"})
+    speculative_get = _call(2, "get_content", {"item_ids": ["feed:a"]})
+    provider = _ResponseProvider(
+        [
+            ModelResponse(
+                None,
+                (recall, speculative_get),
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(
+                None,
+                (_call(3, "mark_interesting", {"item_ids": ["feed:a"]}),),
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(
+                None,
+                (
+                    _call(
+                        4,
+                        "message_push",
+                        {"message": "值得看", "evidence": ["feed:a"]},
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(
+                None,
+                (_call(5, "finish_turn", {"decision": "reply"}),),
+                finish_reason="tool_calls",
+            ),
+        ]
+    )
+    turn = ContentTurn(
+        provider,
+        ContentTurnDeps(memory=_Memory(), content_fetcher=_Fetcher()),
+        max_steps=8,
+    )
+
+    result = await turn.run((_candidate("a"),), session_key="feishu:u1", now=NOW)
+
+    assert result.action == "reply"
+    assert result.interesting_item_ids == frozenset({"feed:a"})
+    assistant = provider.messages[1][-2]
+    assert assistant.role == "assistant"
+    assert assistant.tool_calls == (recall,)
+    assert provider.messages[1][-1].tool_call_id == recall.id
 
 
 @pytest.mark.asyncio

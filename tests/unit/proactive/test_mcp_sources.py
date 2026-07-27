@@ -59,11 +59,23 @@ class _Caller:
 
 
 class _PrototypeFeedCaller:
-    def __init__(self) -> None:
+    def __init__(self, *, poll_ok: bool = True) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.poll_ok = poll_ok
 
     async def call_tool(self, name: str, arguments: dict[str, object]) -> McpCallResult:
         self.calls.append((name, arguments))
+        if name == "poll_feeds":
+            if not self.poll_ok:
+                return McpCallResult(ok=False, error_message="feed poll failed")
+            return McpCallResult(
+                content=(
+                    {
+                        "type": "text",
+                        "text": json.dumps({"polled": 2, "inserted": 1}),
+                    },
+                )
+            )
         if name == "get_proactive_events":
             payload = [
                 {
@@ -94,6 +106,35 @@ class _PrototypeFeedCaller:
         )
 
 
+class _WrappedEventsCaller:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, object],
+    ) -> McpCallResult:
+        del name, arguments
+        return McpCallResult(
+            content=(
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "events": [
+                                {
+                                    "event_id": "fitness-alert-1",
+                                    "kind": "alert",
+                                    "occurred_at": NOW.isoformat(),
+                                    "title": "心率提醒",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            )
+        )
+
+
 def _repository(tmp_path: Path) -> ProactiveRepository:
     database = tmp_path / "proactive.db"
     migrate_database(database, DatabaseKind.PROACTIVE)
@@ -112,6 +153,7 @@ def test_load_proactive_sources_from_workspace_json(tmp_path: Path) -> None:
                         "channel": "content",
                         "get_tool": "fetch_news",
                         "ack_tool": "ack_news",
+                        "poll_tool": "poll_news",
                     }
                 ]
             }
@@ -127,6 +169,7 @@ def test_load_proactive_sources_from_workspace_json(tmp_path: Path) -> None:
     assert sources[0].channel == "content"
     assert sources[0].get_tool == "fetch_news"
     assert sources[0].ack_tool == "ack_news"
+    assert sources[0].poll_tool == "poll_news"
 
 
 def test_load_prototype_sources_without_id_derives_stable_channel_id(
@@ -249,6 +292,7 @@ async def test_gateway_accepts_prototype_feed_text_json_contract(tmp_path: Path)
                         "channel": "content",
                         "get_tool": "get_proactive_events",
                         "ack_tool": "acknowledge_events",
+                        "poll_tool": "poll_feeds",
                     }
                 ]
             }
@@ -270,7 +314,83 @@ async def test_gateway_accepts_prototype_feed_text_json_contract(tmp_path: Path)
     assert [(item.source_event_id, item.kind) for item in stored] == [("fmcp_article_1", "content")]
     assert stored[0].occurred_at == NOW.isoformat()
     assert stored[0].payload["title"] == "示例文章"
-    assert caller.calls == [("get_proactive_events", {})]
+    assert caller.calls == [
+        ("poll_feeds", {}),
+        ("get_proactive_events", {}),
+    ]
+
+
+async def test_gateway_does_not_read_stale_feed_events_when_poll_fails(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "proactive_sources.json"
+    path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "id": "feed",
+                        "server": "feed-mcp",
+                        "channel": "content",
+                        "poll_tool": "poll_feeds",
+                        "get_tool": "get_proactive_events",
+                        "ack_tool": "acknowledge_events",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    caller = _PrototypeFeedCaller(poll_ok=False)
+    repository = _repository(tmp_path)
+    gateway = ProactiveSourceGateway(
+        repository,
+        config_path=path,
+        caller_for_server=lambda _server: caller,
+    )
+
+    with pytest.raises(RuntimeError, match="全部 Proactive Source 拉取失败"):
+        await gateway.collect(session_key="feishu:chat-1", fetched_at=NOW)
+
+    assert caller.calls == [("poll_feeds", {})]
+    assert repository.list_unconsumed("feishu:chat-1") == ()
+
+
+async def test_gateway_accepts_events_envelope_returned_by_real_mcp_source(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "proactive_sources.json"
+    path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "id": "fitness-alert",
+                        "server": "mi-fitness",
+                        "channel": "alert",
+                        "get_tool": "get_proactive_events",
+                        "ack_tool": "acknowledge_events",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    repository = _repository(tmp_path)
+    gateway = ProactiveSourceGateway(
+        repository,
+        config_path=path,
+        caller_for_server=lambda _server: _WrappedEventsCaller(),
+    )
+
+    report = await gateway.collect(session_key="feishu:chat-1", fetched_at=NOW)
+
+    assert report.succeeded == ("fitness-alert",)
+    assert report.failed == {}
+    stored = repository.list_unconsumed("feishu:chat-1")
+    assert [(item.source_event_id, item.kind) for item in stored] == [
+        ("fitness-alert-1", "alert")
+    ]
 
 
 async def test_gateway_replays_persisted_ack_ttl_to_mcp(tmp_path: Path) -> None:
