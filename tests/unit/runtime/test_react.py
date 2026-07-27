@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from typing import Any
 
@@ -110,6 +111,62 @@ async def test_react_executes_function_and_returns_observation_to_model() -> Non
     assert second_messages[-2].tool_calls == (call,)
     assert second_messages[-1].role == "tool"
     assert second_messages[-1].tool_call_id == "c1"
+
+
+async def test_react_logs_prototype_style_steps_and_token_budget(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    call = FunctionCall(id="c1", name="echo", arguments={"text": "hello"})
+    provider = _FakeProvider(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(call,),
+                finish_reason="tool_calls",
+                prompt_tokens=120,
+                completion_tokens=8,
+            ),
+            ModelResponse(
+                content="工具调用完成",
+                tool_calls=(),
+                finish_reason="stop",
+                prompt_tokens=150,
+                completion_tokens=12,
+            ),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="memopilot.runtime.react"):
+        await ReActEngine(
+            provider,
+            _registry(),
+            session_key="feishu:chat-1",
+        ).run((ChatMessage.user("回显 hello"),))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("[LLM调用] 第1轮" in message and "input_tokens~=" in message for message in messages)
+    assert any("[LLM决策→工具] 第1轮，调用: ['echo']" in message for message in messages)
+    assert any("[工具执行→] echo" in message and "hello" in message for message in messages)
+    assert any("[工具结果←] echo" in message and "result_len=" in message for message in messages)
+    assert any("[LLM调用] 第2轮" in message and "input_tokens~=" in message for message in messages)
+    assert any("[LLM决策→回复] 第2轮，共调用工具1次: ['echo']" in message for message in messages)
+    assert any(
+        "react_context: session_key=feishu:chat-1"
+        in message
+        and "iteration_count=2"
+        in message
+        and "turn_input_sum_tokens~="
+        in message
+        and "turn_input_peak_tokens~="
+        in message
+        and "final_call_input_tokens~="
+        in message
+        and "prompt_tokens=270"
+        in message
+        and "completion_tokens=20"
+        in message
+        for message in messages
+    )
 
 
 async def test_react_appends_multimodal_tool_blocks_as_user_message() -> None:
@@ -439,7 +496,9 @@ async def test_react_emits_distinct_denied_and_error_tool_statuses(
     await bus.aclose()
 
 
-async def test_react_forces_tool_free_natural_language_summary_at_limit() -> None:
+async def test_react_forces_tool_free_natural_language_summary_at_limit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     call = FunctionCall(id="c1", name="echo", arguments={"text": "hello"})
     provider = _FakeProvider(
         [
@@ -448,15 +507,17 @@ async def test_react_forces_tool_free_natural_language_summary_at_limit() -> Non
         ]
     )
 
-    result = await ReActEngine(provider, _registry(), max_iterations=1).run(
-        (ChatMessage.user("执行复杂任务"),)
-    )
+    with caplog.at_level(logging.INFO, logger="memopilot.runtime.react"):
+        result = await ReActEngine(provider, _registry(), max_iterations=1).run(
+            (ChatMessage.user("执行复杂任务"),)
+        )
 
     assert result.reply.startswith("目前")
     assert result.exit_reason == "max_iterations"
     assert len(provider.calls) == 2
     assert provider.calls[-1]["tools"] == ()
     assert provider.calls[-1]["messages"][-1].role == "system"
+    assert sum("react_context:" in record.getMessage() for record in caplog.records) == 1
 
 
 async def test_react_executes_multiple_calls_and_closes_the_tool_chain() -> None:
@@ -477,11 +538,15 @@ async def test_react_executes_multiple_calls_and_closes_the_tool_chain() -> None
     ]
 
 
-async def test_provider_failure_returns_explicit_degraded_result() -> None:
-    result = await ReActEngine(_FailingProvider(), _registry()).run(
-        (ChatMessage.user("hello"),)
-    )
+async def test_provider_failure_returns_explicit_degraded_result(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="memopilot.runtime.react"):
+        result = await ReActEngine(_FailingProvider(), _registry()).run(
+            (ChatMessage.user("hello"),)
+        )
 
     assert result.exit_reason == "provider_error"
     assert result.infrastructure_error == "TimeoutError"
     assert result.reply
+    assert sum("react_context:" in record.getMessage() for record in caplog.records) == 1

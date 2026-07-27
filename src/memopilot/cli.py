@@ -7,6 +7,7 @@ import asyncio
 import ctypes
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any, cast
@@ -32,7 +33,10 @@ def _configure_logging() -> None:
     """保留运行状态日志，隐藏 HTTP SDK 的握手细节，避免污染终端 CLI。"""
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+        force=True,
     )
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)

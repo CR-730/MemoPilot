@@ -52,6 +52,10 @@ async def test_default_run_starts_service_terminal_without_embedded_tui(
 def test_configure_logging_hides_http_handshake_noise() -> None:
     cli._configure_logging()
 
+    handler = logging.getLogger().handlers[0]
+    assert handler.formatter is not None
+    assert handler.formatter._fmt == "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+    assert handler.formatter.datefmt == "%H:%M:%S"
     assert logging.getLogger("httpx").level >= logging.WARNING
     assert logging.getLogger("httpcore").level >= logging.WARNING
 
