@@ -4,7 +4,7 @@
 
 ### 会记忆、会判断，也会主动行动的个人 AI Agent
 
-一个面向 AI 后端与 Agent 工程实践的 Python 项目：以可追踪的 ReAct Runtime 为核心，把长期记忆、主动信息筛选、定时任务和工具扩展组织成一条可恢复的执行链路。
+一个面向 AI 后端与 Agent 工程实践的 Python 项目：以可追踪的 ReAct Runtime 为核心，把长期记忆、主动信息筛选、定时任务和工具扩展组织成职责清晰的执行链路。
 
 <p>
   <a href="#核心能力">核心能力</a> ·
@@ -21,7 +21,7 @@
 
 </div>
 
-> MemoPilot 的重点不是“把模型接进聊天框”，而是把一次 Agent Turn 变成可观察、可审计、可恢复的后端执行过程。
+> MemoPilot 的重点不是“把模型接进聊天框”，而是让对话、记忆、主动任务和工具调用形成职责清晰、可观察的 Agent 系统。
 
 ## 项目简介
 
@@ -30,7 +30,7 @@
 - **理解问题**：外层 Phase Pipeline 管理上下文、记忆、推理和响应阶段；内层 ReAct 循环负责逐步决定是否调用工具。
 - **记住重要信息**：短期对话、Markdown 长期记忆和 SQLite 向量记忆分层保存，检索使用向量、关键词和 RRF 融合。
 - **主动发现内容**：Scheduler 周期性触发主动链路，由 MCP Source 获取 Alert、Content 和 Context，再由同一个 Agent Runtime 判断是否值得打扰用户。
-- **可靠地执行**：SQLite 保存事实与审计记录，Redis 负责排队、优先级、Lease 和跨进程协调；外部发送使用 Outbox 与幂等键避免重复副作用。
+- **可靠地执行**：SQLite 保存会话、记忆、定时与主动决策等业务事实；Redis 负责后台任务、优先级、Lease 和用户抢占；主动决策、ACK 与定时执行状态用于避免重复处理。
 - **保持可扩展**：工具、Prompt、PhaseModule、Event Handler、Tool Hook、Skills 和 MCP stdio Server 均可在不改核心循环的情况下扩展能力。
 
 ## 核心能力
@@ -41,7 +41,7 @@
 | 分层记忆 | 短期会话、`MEMORY.md` / `SELF.md` 等 Markdown 记忆、SQLite + sqlite-vec 向量记忆 |
 | 主动链路 | 固定 Tick、MCP Source、Alert / Content / Context 分类、内容去重与 ACK |
 | 任务调度 | `at`、`after`、`every` 三种触发方式，支持固定消息和 Agent 任务两种执行模式 |
-| 可靠投递 | SQLite 事实源、Transactional Outbox、Redis Streams、Lease / Fencing、发送记录 |
+| 任务协调 | Redis Streams、P0～P3 优先级、Lease / Fencing、用户消息抢占与 Pending 接管 |
 | 扩展机制 | `@tool`、`@on_tool_pre`、Event Handler、PhaseModule、Skills、MCP stdio |
 | 飞书接入 | 飞书私聊长连接、流式思考卡片、工具过程展示和最终消息独立投递 |
 
@@ -49,14 +49,14 @@
 
 ```mermaid
 flowchart LR
-    U[飞书私聊] --> A["Gateway<br/>Inbound / Outbox"]
-    S["Scheduler<br/>Tick / 定时任务"] --> DB[("SQLite<br/>事实源与审计")]
-    A --> DB
-    DB --> R[(Redis
+    U[飞书私聊] --> G["Gateway<br/>Channel / MessageBus"]
+    G --> L["AgentLoop<br/>被动回复"]
+    L --> P[Phase Pipeline]
+    S["Scheduler<br/>主动 / 定时 / 记忆 Tick"] --> R[(Redis
 Streams / Lease / Priority)]
-    S --> R
-    R --> W["Runner<br/>Agent Runtime"]
-    W --> P[Phase Pipeline]
+    R --> W["BackgroundTaskLoop<br/>后台任务"]
+    W --> P
+    W --> DB[("SQLite<br/>业务事实")]
     P --> X["ReAct<br/>Function Calling"]
     X --> E[Tools / Plugins / Skills / MCP]
     X --> M[("分层记忆<br/>Markdown / sqlite-vec")]
@@ -64,28 +64,29 @@ Streams / Lease / Priority)]
     F --> U
 ```
 
-系统在一个 Python 进程中运行三个异步服务：
+系统在一个 Python 进程中运行四个异步协作单元：
 
-| 进程 | 职责 |
+| 异步单元 | 职责 |
 | --- | --- |
-| `Gateway` 协程 | 接收飞书私聊事件、写入 Inbox、创建用户消息 Job，并负责外发 Outbox |
-| `Scheduler` 协程 | 生成固定 Tick、扫描用户定时任务、提交记忆维护任务 |
-| `Runner` 协程 | 获取会话 Lease，执行 Agent Runtime、工具调用、记忆检索和最终回复 |
+| `Gateway` 协程 | 维护飞书长连接，把私聊消息和最终回复接入双向 MessageBus |
+| `AgentLoop` 协程 | 直接处理被动回复，并在完成后保存会话消息、发布记忆维护任务 |
+| `Scheduler` 协程 | 生成主动 Tick、扫描定时任务并向 Redis 发布轻量后台任务 |
+| `BackgroundTaskLoop` | 获取会话 Lease，按优先级执行主动、定时、Drift 和记忆后台任务 |
 
-用户消息使用 P0 优先级，主动检查使用 P2。调度器发现会话已有排队或运行任务时会跳过本轮主动检查；Drift 只会在空闲的主动轮次内直接执行。所有路径共享同一个会话 Lease，因此主动消息不会插入正在进行的用户回复。
+用户消息不进入后台队列：它会直接请求正在执行的后台任务停止，并由 AgentLoop 优先处理。定时任务、主动检查和记忆维护分别进入 Redis 优先级队列；所有后台路径共享会话 Lease，因此主动消息不会插入正在进行的用户回复。
 
 ## 一次对话如何运行
 
 ```text
 飞书事件
   │
-  ├─ SQLite 事务：Inbox + AgentJob + Outbox
-  ├─ Redis：发布可恢复的执行副本
-  ├─ Runner：Lease + Fencing 校验
+  ├─ MessageBus：投递 InboundMessage
+  ├─ AgentLoop：会话协调与用户消息抢占
   ├─ Phase Pipeline：准备上下文 → ReAct → 响应后处理
   ├─ ReAct：检索记忆 / 调用工具 / 处理 Observation
-  ├─ 回复：幂等地发送最终消息
-  └─ 异步任务：Consolidation / Post-response / 向量写入
+  ├─ MessageBus：投递 OutboundMessage
+  ├─ SQLite：保存最终对话
+  └─ Redis 后台任务：Consolidation / Post-response / 向量写入
 ```
 
 工具失败不会直接让整个 Agent Turn 崩溃：Runtime 会把结构化错误交回模型，由模型决定修正参数、重试、换工具或向用户解释失败。只有启动配置错误、失权和无法恢复的基础设施错误才会提前终止执行。
@@ -140,11 +141,11 @@ MEMOPILOT_FEISHU_ALLOW_FROM=["允许的 open_id"]
 
 ### 3. 配置 MCP
 
-MCP 第一版使用 stdio。将服务器定义放在 `workspace/mcp_servers.json`，主动信息源映射放在 `workspace/proactive_sources.json`。MCP 环境变量使用 `${变量名}` 引用，不要把真实密钥写进 JSON。
+MCP 第一版使用 stdio。运行时工作区默认位于 `~/.memopilot/memopilot-workspace`；将服务器定义放在其中的 `mcp_servers.json`，主动信息源映射放在其中的 `proactive_sources.json`。MCP 环境变量使用 `${变量名}` 引用，不要把真实密钥写进 JSON。
 
 ### 4. 启动 MemoPilot
 
-一个命令即可启动 Gateway、Scheduler 和 Runner。它们在同一个 `asyncio` 事件循环中协作：
+一个命令即可启动 `AppRuntime`。其中的 MessageBus、AgentLoop、SchedulerService、ProactiveLoop 和后台任务循环在同一个 `asyncio` 事件循环中协作：
 
 ```bash
 uv run python main.py
@@ -157,7 +158,7 @@ uv run python main.py
 也可以显式使用包入口：
 
 ```bash
-uv run memopilot run --config config.toml --workspace workspace
+uv run memopilot run --config config.toml --workspace D:/path/to/workspace
 ```
 
 请直接填写 MemoPilot 根目录现有的 `config.toml`，不要覆盖复制其他项目的完整配置文件。只迁移当前配置模板中真实存在的同名字段；未出现在模板中的旧频道、旧 Provider 或旧主动链路字段不会生效。
@@ -209,7 +210,7 @@ MemoPilot/
 ## 设计边界
 
 - 第一版只支持飞书私聊，不引入多渠道和独立 Dashboard。
-- Gateway、Scheduler 和 Runner 默认运行在同一个异步进程中；内部模块边界保留，后续有扩展需求时再拆分部署。
+- 全部运行模块默认由 `AppRuntime` 在一个异步进程中管理；Redis 负责后台任务优先级、会话互斥、用户抢占和异常恢复。
 - 核心编排保持显式可追踪，不使用 LangChain 或 LangGraph 替代 Agent Loop。
 - SQLite 是持久化事实源；Redis 负责队列、优先级、Lease 和运行时协调。
 - 外部 MCP 只通过 stdio 接入；工具、插件和 Skills 仍受统一审计与权限边界约束。
