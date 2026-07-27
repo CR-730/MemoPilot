@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
+import memopilot.redis_runtime as redis_runtime
 from memopilot.redis_runtime import RedisRuntime, RedisStartupError
 
 
@@ -108,6 +110,26 @@ async def test_local_redis_startup_failure_is_reported() -> None:
             ping=ping,
             launch=launch,
         )
+
+
+@pytest.mark.asyncio
+async def test_managed_redis_uses_user_runtime_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_create_subprocess_exec(*args: object, **kwargs: object) -> FakeProcess:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(redis_runtime, "_redis_runtime_directory", lambda: tmp_path)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    await redis_runtime._launch(Path("redis-server.exe"), "127.0.0.1", 6379)
+
+    assert captured["kwargs"]["cwd"] == str(tmp_path)  # type: ignore[index]
 
 
 async def _completed_sleep() -> None:

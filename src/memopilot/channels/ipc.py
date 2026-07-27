@@ -70,7 +70,7 @@ class IPCServerChannel:
         chat_id: str,
         message: str,
         *,
-        provider_uuid: str,
+        provider_uuid: str | None = None,
         metadata: Mapping[str, object] | None = None,
     ) -> SendReceipt:
         writer = self._writers.get(chat_id)
@@ -81,7 +81,7 @@ class IPCServerChannel:
             payload["metadata"] = dict(metadata)
         writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
         await writer.drain()
-        return SendReceipt(message_id=provider_uuid)
+        return SendReceipt(message_id=provider_uuid or uuid4().hex)
 
 
 __all__ = ["IPCServerChannel"]

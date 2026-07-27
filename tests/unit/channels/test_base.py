@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+from memopilot.bus.events import InboundMessage
 from memopilot.channels.base import AttachmentStore, MessageDeduper, SessionIdentityIndex
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
-from memopilot.tasks.operational import InboundCommand, OperationalRepository
+from memopilot.tasks.operational import OperationalRepository
 
 NOW = datetime(2026, 7, 14, 9, 0, tzinfo=UTC)
 
@@ -38,15 +39,14 @@ def test_message_deduper_evicts_oldest_key() -> None:
 
 def test_identity_index_rebuilds_and_persists_all_feishu_ids(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
-    repository.accept_inbound(
-        InboundCommand(
-            event_id="event-1",
-            message_id="message-1",
-            session_key="feishu:chat-1",
-            channel="feishu",
-            chat_id="chat-1",
-            payload={"text": "你好"},
-            received_at=NOW,
+    repository.record_inbound_activity(
+        InboundMessage(
+            "feishu",
+            "user",
+            "chat-1",
+            "你好",
+            timestamp=NOW,
+            metadata={"event_id": "event-1", "message_id": "message-1"},
         )
     )
     repository.remember_session_identities(

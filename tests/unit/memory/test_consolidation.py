@@ -7,10 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from memopilot.bus.events import InboundMessage
 from memopilot.memory.consolidation import ConsolidationService
 from memopilot.memory.markdown import MarkdownMemoryStore
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
-from memopilot.tasks.operational import InboundCommand, LostLeaseError, OperationalRepository
+from memopilot.tasks.operational import LostLeaseError, OperationalRepository
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
@@ -95,28 +96,21 @@ def _committed_turn(
     user: str,
     assistant: str,
 ) -> None:
-    accepted = repository.accept_inbound(
-        InboundCommand(
-            event_id=f"event-{index}",
-            message_id=f"inbound-{index}",
-            session_key="feishu:chat-1",
-            channel="feishu",
-            chat_id="chat-1",
-            payload={"text": user},
-            received_at=NOW,
-        )
+    message = InboundMessage(
+        "feishu",
+        "user",
+        "chat-1",
+        user,
+        timestamp=NOW,
+        metadata={
+            "event_id": f"event-{index}",
+            "message_id": f"inbound-{index}",
+        },
     )
-    owner = f"worker-{index}"
-    epoch = repository.allocate_fence("feishu:chat-1", owner_id=owner, now=NOW)
-    lease = SimpleNamespace(session_key="feishu:chat-1", owner_id=owner, epoch=epoch)
-    claim = repository.claim_job(accepted.job_id, lease=lease, now=NOW)
-    assert claim is not None
-    repository.commit_successful_turn(
-        claim.run_id,
-        lease=lease,
-        user_content=user,
+    repository.record_inbound_activity(message)
+    repository.commit_turn(
+        message,
         assistant_content=assistant,
-        now=NOW,
     )
 
 
@@ -253,9 +247,9 @@ async def test_history_entries_are_single_source_for_history_and_journal(tmp_pat
     assert "[2026-07-14 20:30] 用户完成了阶段四验收。" in journal
     with connect_database(database) as connection:
         output = json.loads(
-            connection.execute(
-                "SELECT model_output_json FROM consolidation_manifests"
-            ).fetchone()[0]
+            connection.execute("SELECT model_output_json FROM consolidation_manifests").fetchone()[
+                0
+            ]
         )
     assert output["history_entries"][0]["emotional_weight"] == 6
     assert "memories" not in output
@@ -299,12 +293,6 @@ async def test_manifest_resumes_only_missing_artifact_and_publishes_vectorize_on
         manifest = connection.execute("SELECT * FROM consolidation_manifests").fetchone()
         assert manifest["state"] == "writing"
         assert json.loads(manifest["artifact_states_json"])["HISTORY.md"] == "written"
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) FROM agent_jobs WHERE kind = 'memory.vectorize'"
-            ).fetchone()[0]
-            == 0
-        )
 
     resumed = ConsolidationService(
         database,
@@ -322,26 +310,6 @@ async def test_manifest_resumes_only_missing_artifact_and_publishes_vectorize_on
     with connect_database(database) as connection:
         manifest = connection.execute("SELECT * FROM consolidation_manifests").fetchone()
         assert manifest["state"] == "committed"
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) FROM agent_jobs WHERE kind = 'memory.vectorize'"
-            ).fetchone()[0]
-            == 1
-        )
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) FROM outbox_events "
-                "WHERE json_extract(payload_json, '$.kind') = 'memory.vectorize' "
-                "AND event_type = 'agent.job.queued'"
-            ).fetchone()[0]
-            == 1
-        )
-        vector_job_id = str(
-            connection.execute(
-                "SELECT job_id FROM agent_jobs WHERE kind = 'memory.vectorize'"
-            ).fetchone()[0]
-        )
-    assert OperationalRepository(database).get_outbox_for_job(vector_job_id).state == "pending"
 
 
 @pytest.mark.asyncio
@@ -400,12 +368,4 @@ async def test_consolidation_rechecks_fence_inside_final_transaction(tmp_path: P
             "feishu:chat-1",
             assert_current=lambda: None,
             lease=stale_lease,
-        )
-
-    with connect_database(database) as connection:
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) FROM agent_jobs WHERE kind = 'memory.vectorize'"
-            ).fetchone()[0]
-            == 0
         )

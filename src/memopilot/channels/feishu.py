@@ -17,6 +17,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
@@ -102,6 +103,9 @@ class FeishuChannel:
         self._ws_start_error: BaseException | None = None
         self._ws_event_timeout_seconds = ws_event_timeout_seconds
         self._ws_stop_timeout_seconds = ws_stop_timeout_seconds
+
+    def set_interrupt_controller(self, controller: InterruptController | None) -> None:
+        self._interrupt_controller = controller
 
     async def start(self) -> None:
         self._identity_index.rebuild()
@@ -189,7 +193,7 @@ class FeishuChannel:
             sender=sender,
             chat_id=chat_id,
             content=text,
-            media=tuple(media),
+            media=list(media),
             metadata=metadata,
         )
         self._identity_index.remember(
@@ -236,7 +240,7 @@ class FeishuChannel:
         chat_id: str,
         message: str,
         *,
-        provider_uuid: str,
+        provider_uuid: str | None = None,
         metadata: Mapping[str, object] | None = None,
     ) -> SendReceipt:
         del metadata
@@ -245,7 +249,7 @@ class FeishuChannel:
             "receive_id": str(chat_id),
             "msg_type": "text",
             "content": json.dumps({"text": message}, ensure_ascii=False),
-            "uuid": provider_uuid,
+            "uuid": provider_uuid or uuid4().hex,
         }
         data = await self._api_request(
             "POST",
@@ -714,10 +718,7 @@ def _flatten_post(content: dict[str, Any]) -> str:
 
 def _sender_identity(sender_ids: dict[str, Any]) -> str:
     return str(
-        sender_ids.get("open_id")
-        or sender_ids.get("user_id")
-        or sender_ids.get("union_id")
-        or ""
+        sender_ids.get("open_id") or sender_ids.get("user_id") or sender_ids.get("union_id") or ""
     )
 
 

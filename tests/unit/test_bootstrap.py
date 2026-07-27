@@ -4,25 +4,17 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from memopilot.app.service import AppService
-from memopilot.bootstrap import (
-    build_app,
-    build_effects,
-    build_runtime_bundle,
-    build_scheduler,
-    build_worker,
-)
+from memopilot.bootstrap import AppRuntime, build_runtime_bundle
 from memopilot.config import MemoPilotSettings
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.mcp import McpServerConfig
 from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse, ToolSchema
 from memopilot.runtime.engine import TurnInput
 from memopilot.runtime.tools import ToolRegistry
-from memopilot.scheduling.runner import SchedulerProcess, SystemScheduler
-from memopilot.worker.service import WorkerService
 
 FAKE_MCP_SERVER = Path(__file__).parents[1] / "fixtures" / "fake_mcp_server.py"
 
@@ -59,7 +51,38 @@ class _Embedder:
         return [1.0, 0.0]
 
 
-async def test_runtime_bundle_rolls_back_extensions_when_executor_construction_fails(
+async def test_app_runtime_connects_mcp_before_scheduler_can_start() -> None:
+    events: list[str] = []
+
+    class Lifecycle:
+        async def start(self) -> None:
+            events.append("channel")
+
+    class Registry:
+        diagnostics: tuple[str, ...] = ()
+
+        async def load_and_connect_all(self) -> None:
+            events.append("mcp")
+
+    app = AppRuntime(
+        gateway=Lifecycle(),  # type: ignore[arg-type]
+        scheduler=object(),  # type: ignore[arg-type]
+        background_tasks=object(),  # type: ignore[arg-type]
+        agent_loop=object(),  # type: ignore[arg-type]
+        redis=object(),  # type: ignore[arg-type]
+        bus=object(),  # type: ignore[arg-type]
+        repository=object(),  # type: ignore[arg-type]
+        channel=object(),  # type: ignore[arg-type]
+        console=Lifecycle(),  # type: ignore[arg-type]
+        runtime=SimpleNamespace(mcp_registry=Registry()),  # type: ignore[arg-type]
+    )
+
+    await app.start()
+
+    assert events == ["channel", "channel", "mcp"]
+
+
+async def test_runtime_bundle_rolls_back_extensions_when_background_construction_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -105,7 +128,7 @@ class RollbackPlugin(Plugin):
 
     monkeypatch.setattr("memopilot.bootstrap.ToolRegistry", CapturingRegistry)
     monkeypatch.setattr("memopilot.bootstrap.EventBus", CapturingBus)
-    monkeypatch.setattr("memopilot.bootstrap.RuntimeJobExecutor", fail_executor)
+    monkeypatch.setattr("memopilot.bootstrap.BackgroundTaskDispatcher", fail_executor)
     settings = MemoPilotSettings(
         workspace=tmp_path,
         embedding_base_url="https://embedding.example/v1",
@@ -119,6 +142,7 @@ class RollbackPlugin(Plugin):
             settings,
             chat_provider=_ChatProvider(),  # type: ignore[arg-type]
             embedder=_Embedder(),  # type: ignore[arg-type]
+            outbound=object(),  # type: ignore[arg-type]
         )
 
     assert (tmp_path / "terminated.txt").read_text(encoding="utf-8") == "yes"
@@ -170,9 +194,8 @@ async def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(
     assert any("shell_restore" in hook_id for hook_id in bundle.hook_ids)
     assert any("shell_safety" in hook_id for hook_id in bundle.hook_ids)
     assert bundle.runtime is not None
-    assert bundle.executor is not None
-    assert bundle.executor._system_jobs is not None
-    assert bundle.memory_jobs.repository is bundle.repository
+    assert bundle.background_dispatcher is None
+    assert bundle.memory_tasks.repository is bundle.repository
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
     assert "主动推送" in (settings.workspace / "PROACTIVE_CONTEXT.md").read_text(
@@ -377,7 +400,7 @@ required_tools: [search]
     await bundle.close_extensions()
 
 
-async def test_builds_separate_app_and_worker_without_starting_scheduler(
+async def test_runtime_bundle_builds_background_dispatcher_when_outbound_is_available(
     tmp_path: Path,
 ) -> None:
     settings = MemoPilotSettings(
@@ -392,53 +415,25 @@ async def test_builds_separate_app_and_worker_without_starting_scheduler(
         _env_file=None,
     )
 
-    app = build_app(settings)
-    worker = await build_worker(settings)
-
-    assert isinstance(app.service, AppService)
-    assert isinstance(worker.service, WorkerService)
+    bundle = await build_runtime_bundle(
+        settings,
+        chat_provider=_ChatProvider(),  # type: ignore[arg-type]
+        embedder=_Embedder(),  # type: ignore[arg-type]
+        outbound=object(),  # type: ignore[arg-type]
+    )
     assert "recall_memory" in {
-        schema["function"]["name"] for schema in worker.runtime.tools.schemas()
+        schema["function"]["name"] for schema in bundle.tools.schemas()
     }
-    assert worker.runtime.memory_jobs.repository is worker.runtime.repository
-    assert worker.runtime.executor._system_jobs is not None
-    assert worker.runtime.executor._system_jobs.proactive_handler is not None
+    assert bundle.memory_tasks.repository is bundle.repository
+    assert bundle.background_dispatcher is not None
+    assert bundle.background_dispatcher.proactive is not None
+    assert bundle.background_dispatcher.drift is not None
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
-    assert not hasattr(app, "scheduler")
-    assert not hasattr(worker, "scheduler")
-    await app.close()
-    await worker.close()
+    await bundle.close_extensions()
 
 
-async def test_effects_process_does_not_require_model_credentials(tmp_path: Path) -> None:
-    settings = MemoPilotSettings(
-        workspace=tmp_path / "workspace",
-        feishu_app_id="cli-app",
-        feishu_app_secret="feishu-secret",
-        _env_file=None,
-    )
-
-    effects = build_effects(settings)
-
-    assert effects.service is not None
-    await effects.close()
-
-
-async def test_scheduler_builds_system_tick_and_outbox_process_without_model_credentials(
-    tmp_path: Path,
-) -> None:
-    settings = MemoPilotSettings(workspace=tmp_path / "workspace", _env_file=None)
-
-    bundle = build_scheduler(settings)
-
-    assert isinstance(bundle.service, SchedulerProcess)
-    assert isinstance(bundle.service.scheduler, SystemScheduler)
-    assert bundle.service.scheduler.proactive_tick_seconds == 1800
-    await bundle.close()
-
-
-async def test_worker_starts_local_mcp_tools_without_blocking_core_runtime(
+async def test_runtime_starts_local_mcp_tools_without_blocking_core_runtime(
     tmp_path: Path,
 ) -> None:
     skill = tmp_path / "workspace" / "skills" / "mcp_research"
@@ -474,21 +469,24 @@ required_tools: [mcp_fake__echo]
         ),
         _env_file=None,
     )
-    worker = await build_worker(settings)
+    runner = await build_runtime_bundle(
+        settings,
+        chat_provider=_ChatProvider(),  # type: ignore[arg-type]
+        embedder=_Embedder(),  # type: ignore[arg-type]
+    )
     try:
         assert [
-            skill.name for skill in worker.runtime.skills.background_candidates()
+            skill.name for skill in runner.skills.background_candidates()
         ] == ["create-drift-skill"]
-        await worker.start_extensions()
-        await worker.start_extensions()
+        runner.mcp_registry.start_connect_all_background()
         for _ in range(100):
-            if "mcp_fake__echo" in worker.runtime.tools.tool_names:
+            if "mcp_fake__echo" in runner.tools.tool_names:
                 break
             await asyncio.sleep(0.02)
-        assert "mcp_fake__echo" in worker.runtime.tools.tool_names
+        assert "mcp_fake__echo" in runner.tools.tool_names
         assert [
-            skill.name for skill in worker.runtime.skills.background_candidates()
+            skill.name for skill in runner.skills.background_candidates()
         ] == ["create-drift-skill", "mcp_research"]
-        assert worker.mcp_diagnostics == []
+        assert runner.mcp_registry.diagnostics == ()
     finally:
-        await worker.close()
+        await runner.close_extensions()

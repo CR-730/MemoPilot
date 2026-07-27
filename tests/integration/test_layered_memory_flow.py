@@ -4,13 +4,13 @@ import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
 
+from memopilot.bus.events import InboundMessage
 from memopilot.memory.consolidation import ConsolidationService
 from memopilot.memory.contracts import MemoryQuery
 from memopilot.memory.engine import LayeredMemoryEngine
@@ -18,16 +18,13 @@ from memopilot.memory.markdown import MarkdownMemoryStore
 from memopilot.memory.optimizer import MemoryOptimizer
 from memopilot.memory.retrieval import MemoryRetriever
 from memopilot.memory.store import MemoryStore
+from memopilot.memory.tasks import MemoryTaskRouter
 from memopilot.memory.vectorization import VectorizationService
-from memopilot.memory.worker import MemoryJobRouter
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
-from memopilot.runtime.engine import TurnInput
-from memopilot.runtime.worker import RuntimeJobExecutor
+from memopilot.runtime.background_task_loop import BackgroundTaskLoop
 from memopilot.tasks.lease import SessionLeaseManager
-from memopilot.tasks.operational import InboundCommand, OperationalRepository
-from memopilot.tasks.outbox import OutboxDispatcher
+from memopilot.tasks.operational import OperationalRepository
 from memopilot.tasks.redis_queue import RedisTaskQueue
-from memopilot.worker.service import WorkerService
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
@@ -67,11 +64,6 @@ class _OptimizerModel:
         return memory or "# 长期记忆", self_text or "# MemoPilot"
 
 
-class _NeverRuntime:
-    async def run(self, turn: TurnInput, **kwargs: Any) -> None:
-        raise AssertionError("记忆 Job 不应进入 Agent Runtime")
-
-
 class _PostResponse:
     async def run(
         self,
@@ -81,6 +73,21 @@ class _PostResponse:
         **kwargs: Any,
     ) -> tuple[str, ...]:
         return ()
+
+
+class _MemoryBackgroundExecutor:
+    def __init__(self, router: MemoryTaskRouter) -> None:
+        self.router = router
+
+    async def execute(self, message, *, payload, lease, now) -> str:
+        del now
+        await self.router.execute(
+            kind=message.kind,
+            session_key=message.session_key,
+            payload=payload,
+            lease=lease,
+        )
+        return "succeeded"
 
 
 @pytest.mark.asyncio
@@ -93,33 +100,24 @@ async def test_turn_to_async_archive_vector_and_next_turn_recall(
     migrate_database(operational, DatabaseKind.OPERATIONAL)
     migrate_database(memory_database, DatabaseKind.MEMORY)
     repository = OperationalRepository(operational)
-    accepted = repository.accept_inbound(
-        InboundCommand(
-            event_id="event-1",
-            message_id="message-1",
-            session_key="feishu:chat-1",
-            channel="feishu",
-            chat_id="chat-1",
-            payload={"text": "始终使用中文提交"},
-            received_at=NOW,
-        )
+    message = InboundMessage(
+        "feishu",
+        "user",
+        "chat-1",
+        "始终使用中文提交",
+        timestamp=NOW,
+        metadata={"message_id": "message-1"},
     )
-    epoch = repository.allocate_fence("feishu:chat-1", owner_id="seed", now=NOW)
-    lease = SimpleNamespace(session_key="feishu:chat-1", owner_id="seed", epoch=epoch)
-    claim = repository.claim_job(accepted.job_id, lease=lease, now=NOW)
-    assert claim is not None
-    repository.commit_successful_turn(
-        claim.run_id,
-        lease=lease,
-        user_content="始终使用中文提交",
+    repository.record_inbound_activity(message)
+    tasks = repository.commit_turn(
+        message,
         assistant_content="我会记住。",
-        now=NOW,
     )
 
     markdown = MarkdownMemoryStore(tmp_path / "markdown")
     store = MemoryStore(memory_database, dimension=2, vector_enabled=False)
     embedder = _Embedder()
-    router = MemoryJobRouter(
+    router = MemoryTaskRouter(
         ConsolidationService(
             operational,
             markdown,
@@ -134,31 +132,19 @@ async def test_turn_to_async_archive_vector_and_next_turn_recall(
     )
     queue = RedisTaskQueue(memory_redis)
     await queue.ensure_consumer_groups()
-    dispatcher = OutboxDispatcher(repository, queue, owner_id="app-memory")
-    worker = WorkerService(
-        repository,
+    for task in tasks:
+        assert await queue.publish_task_once(task) is not None
+    runner = BackgroundTaskLoop(
         queue,
         SessionLeaseManager(memory_redis, repository, ttl=timedelta(seconds=2)),
-        RuntimeJobExecutor(
-            repository,
-            _NeverRuntime(),  # type: ignore[arg-type]
-            memory_jobs=router,
-        ),
-        owner_id="worker-memory",
+        _MemoryBackgroundExecutor(router),
+        owner_id="runner-memory",
         clock=lambda: NOW + timedelta(seconds=1),
         heartbeat_interval=0.05,
     )
 
-    # 原 Agent Job 的旧 Outbox 会先被清理，随后真正异步执行 Consolidation。
-    assert await dispatcher.dispatch_one(now=NOW) is True
-    assert await dispatcher.dispatch_one(now=NOW) is True
-    assert await dispatcher.dispatch_one(now=NOW) is True
-    assert await worker.run_once() is True
-    assert await worker.run_once() is True
-    assert await worker.run_once() is True
-    # Consolidation 提交后才产生 vectorize Outbox。
-    assert await dispatcher.dispatch_one(now=datetime.now(UTC) + timedelta(seconds=1)) is True
-    assert await worker.run_once() is True
+    assert await runner.run_once() is True
+    assert await runner.run_once() is True
 
     engine = LayeredMemoryEngine(
         MemoryRetriever(store, embedder, score_threshold=0.0)  # type: ignore[arg-type]

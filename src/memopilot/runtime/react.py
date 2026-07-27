@@ -557,6 +557,13 @@ class ReActEngine:
         completion_tokens: int,
     ) -> ReActResult:
         reply = "模型服务暂时不可用，当前请求未能完成，请稍后重试。"
+        logger.warning(
+            "[llm.error] session=%s iteration=%d err=%s: %s",
+            self._session_key,
+            iteration,
+            type(error).__name__,
+            error,
+        )
         failure = ModelResponse(
             content=reply,
             tool_calls=(),

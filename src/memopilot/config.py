@@ -35,7 +35,9 @@ class MemoPilotSettings(BaseSettings):
         extra="ignore",
     )
 
-    workspace: Path = Path("workspace")
+    workspace: Path = Field(
+        default_factory=lambda: Path.home() / ".memopilot" / "memopilot-workspace"
+    )
     data_dir: Path = Path("data")
     memory_dir: Path = Path("memory")
     journal_dir: Path = Path("journal")
@@ -149,6 +151,17 @@ class MemoPilotSettings(BaseSettings):
             raise ValueError("飞书 owner allowlist 必须是 ID 列表或逗号分隔字符串")
         return tuple(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
 
+    @field_validator("redis_url")
+    @classmethod
+    def _normalize_local_redis_host(cls, value: str) -> str:
+        return re.sub(
+            r"^(rediss?://)localhost(?=[:/]|$)",
+            r"\g<1>127.0.0.1",
+            value,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
     @model_validator(mode="after")
     def _resolve_bounded_paths(self) -> Self:
         if self.proactive_active_start_hour >= self.proactive_active_end_hour:
@@ -223,36 +236,6 @@ class MemoPilotSettings(BaseSettings):
             missing.append("channels.feishu.receive_mode=ws")
         if missing:
             raise ValueError("App 启动配置不完整，缺少或不支持: " + ", ".join(missing))
-
-    def validate_worker_ready(self) -> None:
-        missing = []
-        if not self.chat_api_key.get_secret_value():
-            missing.append("MEMOPILOT_CHAT_API_KEY")
-        if not self.embedding_base_url:
-            missing.append("MEMOPILOT_EMBEDDING_BASE_URL")
-        if not self.embedding_model:
-            missing.append("MEMOPILOT_EMBEDDING_MODEL")
-        if not self.embedding_api_key.get_secret_value():
-            missing.append("MEMOPILOT_EMBEDDING_API_KEY")
-        if not self.embedding_dimension:
-            missing.append("MEMOPILOT_EMBEDDING_DIMENSION")
-        if not self.feishu_app_id:
-            missing.append("MEMOPILOT_FEISHU_APP_ID")
-        if not self.feishu_app_secret.get_secret_value():
-            missing.append("MEMOPILOT_FEISHU_APP_SECRET")
-        if missing:
-            raise ValueError("Worker 启动配置不完整，缺少: " + ", ".join(missing))
-
-    def validate_effects_ready(self) -> None:
-        """Effects 进程只校验自身发送飞书消息需要的配置。"""
-        missing = []
-        if not self.feishu_app_id:
-            missing.append("MEMOPILOT_FEISHU_APP_ID")
-        if not self.feishu_app_secret.get_secret_value():
-            missing.append("MEMOPILOT_FEISHU_APP_SECRET")
-        if missing:
-            raise ValueError("Effects 启动配置不完整，缺少: " + ", ".join(missing))
-
 
 def load_settings(
     config_path: str | Path,

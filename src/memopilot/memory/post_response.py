@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import sqlite3
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
@@ -109,6 +107,7 @@ class OperationalPostResponseService:
         *,
         turn_id: str,
         session_key: str,
+        protected_ids: set[str] | None = None,
         assert_current: Callable[[], None] | None = None,
         fenced_write: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> tuple[str, ...]:
@@ -118,7 +117,6 @@ class OperationalPostResponseService:
                 "ORDER BY turn_position LIMIT 1",
                 (turn_id,),
             ).fetchone()
-            protected_ids = _explicitly_memorized_ids(connection, turn_id)
         if row is None:
             return ()
         return await self.worker.run(
@@ -128,24 +126,4 @@ class OperationalPostResponseService:
             assert_current=assert_current,
             fenced_write=fenced_write,
         )
-
-
-def _explicitly_memorized_ids(connection: sqlite3.Connection, run_id: str) -> set[str]:
-    rows = connection.execute(
-        "SELECT observation_json FROM steps WHERE run_id = ? AND tool_name = 'memorize' "
-        "AND state = 'succeeded' AND observation_json IS NOT NULL",
-        (run_id,),
-    ).fetchall()
-    result: set[str] = set()
-    for row in rows:
-        try:
-            observation = json.loads(str(row["observation_json"]))
-        except (json.JSONDecodeError, TypeError):
-            continue
-        payload = observation.get("result") if isinstance(observation, dict) else None
-        if isinstance(payload, dict) and str(payload.get("item_id") or "").strip():
-            result.add(str(payload["item_id"]))
-    return result
-
-
 __all__ = ["OperationalPostResponseService", "PostResponseMemoryWorker", "PostResponseModel"]

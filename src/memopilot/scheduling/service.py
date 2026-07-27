@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import cast
+from zoneinfo import ZoneInfo
 
 from memopilot.scheduling.contracts import (
     CreateSchedule,
@@ -43,6 +44,11 @@ class ScheduleService:
             raise ValueError("instant 模式必须提供 message")
         if execution_mode == "agent" and not (prompt or "").strip():
             raise ValueError("agent 模式必须提供 prompt")
+        received_at = (
+            received_at.replace(tzinfo=ZoneInfo(timezone))
+            if received_at.tzinfo is None
+            else received_at
+        )
         current = now or datetime.now(UTC)
         next_run_at = compute_fire_at(
             schedule_kind,

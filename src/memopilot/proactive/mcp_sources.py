@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
     from memopilot.proactive.store import ProactiveRepository
 
 ProactiveChannel = Literal["alert", "context", "content"]
+logger = logging.getLogger(__name__)
 
 
 class McpCaller(Protocol):
@@ -127,8 +129,8 @@ class ProactiveSourceGateway:
         results = await asyncio.gather(*(fetch_one(config) for config in configs))
         succeeded = tuple(source_id for source_id, inserted, _ in results if inserted is not None)
         failed = {source_id: error for source_id, _, error in results if error is not None}
-        if results and not succeeded:
-            raise RuntimeError(f"全部 Proactive Source 拉取失败: {failed}")
+        for source_id, error in failed.items():
+            logger.warning("Proactive Source 拉取失败 %s: %s", source_id, error)
         return CollectionReport(
             succeeded=succeeded,
             failed=failed,

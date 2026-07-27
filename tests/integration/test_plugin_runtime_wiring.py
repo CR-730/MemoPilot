@@ -201,8 +201,8 @@ class PrototypeRuntimePlugin(Plugin):
     await runtime.run(TurnInput("feishu:user-b", "乙的问题", system_prompt="核心"))
 
     first, second = provider.calls
-    assert first[-1].content == "已改写：甲的问题"
-    assert second[-1].content == "已改写：乙的问题"
+    assert (first[-1].content or "").endswith("已改写：甲的问题")
+    assert (second[-1].content or "").endswith("已改写：乙的问题")
     assert first[0].content == (
         "插件身份\n\n核心\n\n当前会话=feishu:user-a;当前问题=已改写：甲的问题"
     )

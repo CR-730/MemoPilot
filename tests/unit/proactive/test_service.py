@@ -120,7 +120,6 @@ def _commit_confirmed_send(
     )
     assert repository.finalize_confirmed(
         decision.decision_id,
-        is_effect_confirmed=lambda _operation_id: True,
         committed_at=committed_at,
     )
 
@@ -464,17 +463,17 @@ async def test_execution_ownership_is_checked_before_external_gateway_calls(
 
 
 @pytest.mark.asyncio
-async def test_drift_runs_inside_current_proactive_job_without_p3_enqueue(
+async def test_drift_runs_inside_current_proactive_task_without_p3_enqueue(
     tmp_path: Path,
 ) -> None:
     service, repository, _, _ = _service(
         tmp_path, skills=SkillCatalog((_skill(),))
     )
 
-    outcome = await service.execute("job", SESSION, "chat-1", 1, NOW)
+    outcome = await service.execute("task", SESSION, "chat-1", 1, NOW)
 
     assert outcome.action == "drift"
-    assert outcome.drift_job_id == "job"
+    assert outcome.drift_task_id == "task"
     assert repository.load_last_drift_at(SESSION) == NOW
 
 

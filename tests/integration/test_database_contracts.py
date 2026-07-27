@@ -17,7 +17,6 @@ from memopilot.persistence.migrations import (
     connect_database,
     migrate_all_databases,
 )
-from memopilot.persistence.states import EffectState, JobState, OutboxState, RunState
 
 
 def test_migrate_all_databases_uses_configured_workspace(tmp_path: Path) -> None:
@@ -25,7 +24,7 @@ def test_migrate_all_databases_uses_configured_workspace(tmp_path: Path) -> None
 
     reports = migrate_all_databases(settings)
 
-    assert [report.to_version for report in reports] == [5, 3, 7]
+    assert [report.to_version for report in reports] == [8, 3, 9]
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
     assert settings.proactive_database.exists()
@@ -76,7 +75,7 @@ def test_migrate_all_databases_adopts_legacy_wake_v1_database(tmp_path: Path) ->
 
     reports = migrate_all_databases(settings)
 
-    assert reports[-1].to_version == 7
+    assert reports[-1].to_version == 9
     assert settings.proactive_database.exists()
     assert not legacy.exists()
     with connect_database(settings.proactive_database) as connection:
@@ -100,7 +99,7 @@ def test_migrate_all_databases_adopts_legacy_wake_v1_database(tmp_path: Path) ->
         )
 
 
-def test_operational_status_check_matches_code_enums(tmp_path: Path) -> None:
+def test_operational_schema_has_no_job_run_or_outbox_tables(tmp_path: Path) -> None:
     settings = MemoPilotSettings(workspace=tmp_path, _env_file=None)
     migrate_all_databases(settings)
     now = datetime.now(UTC).isoformat()
@@ -111,35 +110,20 @@ def test_operational_status_check_matches_code_enums(tmp_path: Path) -> None:
             "VALUES (?, ?, ?, ?, ?)",
             ("feishu:chat", "feishu", "chat", now, now),
         )
-        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
-            connection.execute(
-                """
-                INSERT INTO agent_jobs(
-                    job_id, kind, priority, session_key, idempotency_key, state,
-                    activity_version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                ("job", "turn", 0, "feishu:chat", "inbound:event", "invalid", 1, now, now),
-            )
-
-    assert {state.value for state in JobState} == {
-        "queued",
-        "running",
-        "succeeded",
-        "skipped",
-        "failed",
-        "cancelled",
-        "needs_review",
-    }
-    assert "recovering" in {state.value for state in RunState}
-    assert {state.value for state in OutboxState} == {
-        "pending",
-        "publishing",
-        "published",
-        "dead",
-    }
-    assert "unknown" in {state.value for state in EffectState}
-
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert {
+        "agent_jobs",
+        "runs",
+        "run_attempts",
+        "steps",
+        "outbox_events",
+        "outbound_effects",
+    }.isdisjoint(tables)
 
 def test_memory_source_ref_and_proactive_source_event_are_idempotency_keys(tmp_path: Path) -> None:
     settings = MemoPilotSettings(workspace=tmp_path, _env_file=None)

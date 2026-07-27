@@ -549,4 +549,8 @@ async def test_provider_failure_returns_explicit_degraded_result(
     assert result.exit_reason == "provider_error"
     assert result.infrastructure_error == "TimeoutError"
     assert result.reply
+    assert any(
+        "[llm.error]" in record.getMessage() and "TimeoutError" in record.getMessage()
+        for record in caplog.records
+    )
     assert sum("react_context:" in record.getMessage() for record in caplog.records) == 1

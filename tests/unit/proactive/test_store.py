@@ -17,10 +17,7 @@ from memopilot.proactive.mcp_sources import (
     stable_ack_operation_id,
 )
 from memopilot.proactive.service import _decision_id
-from memopilot.proactive.store import (
-    ProactiveRepository,
-    stable_proactive_effect_operation_id,
-)
+from memopilot.proactive.store import ProactiveRepository
 
 NOW = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
 
@@ -155,7 +152,6 @@ def test_alert_event_id_remains_permanently_deduplicated(tmp_path: Path) -> None
     )
     repository.finalize_confirmed(
         decision.decision_id,
-        is_effect_confirmed=lambda _operation_id: True,
         committed_at=NOW,
     )
     pending = repository.list_pending_acknowledgements(NOW)[0]
@@ -214,13 +210,13 @@ def test_proactive_audit_records_observation_and_drift(tmp_path: Path) -> None:
     )
     repository.mark_drift_started(
         session_key="feishu:chat-1",
-        job_id="job-1",
+        task_id="task-1",
         started_at=NOW,
     )
 
     assert repository.list_observations("feishu:chat-1")[0]["subject_id"] == "decision-1"
     drift = repository.list_drift_history("feishu:chat-1")[0]
-    assert drift["job_id"] == "job-1"
+    assert drift["task_id"] == "task-1"
     assert drift["outcome"] == "running"
 
 
@@ -265,7 +261,7 @@ def test_confirmed_finish_only_consumes_decision_events_and_queues_stable_ack(
         result=ProactiveFetchResult((_event("e1"), _event("e2"), _event("e3"))),
         fetched_at=NOW,
     )
-    decision = repository.create_decision(
+    repository.create_decision(
         decision_id="decision-1",
         session_key="feishu:chat-1",
         trigger_kind="content",
@@ -277,10 +273,8 @@ def test_confirmed_finish_only_consumes_decision_events_and_queues_stable_ack(
         decided_at=NOW,
     )
 
-    assert decision.effect_operation_id == stable_proactive_effect_operation_id("decision-1")
     assert repository.finalize_confirmed(
         "decision-1",
-        is_effect_confirmed=lambda operation_id: operation_id == decision.effect_operation_id,
         committed_at=NOW + timedelta(seconds=1),
     )
 
@@ -292,7 +286,7 @@ def test_confirmed_finish_only_consumes_decision_events_and_queues_stable_ack(
     ]
 
 
-def test_unconfirmed_effect_does_not_consume_or_queue_ack(tmp_path: Path) -> None:
+def test_non_send_decision_cannot_be_finalized_as_send(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     repository.commit_fetch(
         session_key="feishu:chat-1",
@@ -304,14 +298,14 @@ def test_unconfirmed_effect_does_not_consume_or_queue_ack(tmp_path: Path) -> Non
         decision_id="decision-1",
         session_key="feishu:chat-1",
         trigger_kind="content",
-        action="share",
+        action="skip",
         source_events=(("news", "e1"),),
         activity_version=1,
         decided_at=NOW,
     )
 
     assert not repository.finalize_confirmed(
-        "decision-1", is_effect_confirmed=lambda _: False, committed_at=NOW
+        "decision-1", committed_at=NOW
     )
     assert len(repository.list_unconsumed("feishu:chat-1")) == 1
     assert repository.list_pending_acknowledgements(NOW) == ()
@@ -395,7 +389,7 @@ def test_decision_cannot_claim_another_sessions_event(tmp_path: Path) -> None:
         raise AssertionError("Decision 不应消费其他会话的事件")
 
 
-def test_skip_consumes_only_selected_events_without_waiting_for_effect(
+def test_skip_consumes_only_selected_events(
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
@@ -444,7 +438,7 @@ def test_context_decision_consumes_without_creating_pending_ack(tmp_path: Path) 
     assert repository.list_pending_acknowledgements(NOW) == ()
 
 
-def test_share_decision_cannot_bypass_effect_confirmation(tmp_path: Path) -> None:
+def test_share_decision_cannot_be_committed_as_skip(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     repository.commit_fetch(
         session_key="feishu:chat-1",
@@ -467,7 +461,7 @@ def test_share_decision_cannot_bypass_effect_confirmation(tmp_path: Path) -> Non
     except ValueError as exc:
         assert "share" in str(exc)
     else:
-        raise AssertionError("share 决策不能绕过 Effect confirmed")
+        raise AssertionError("share 决策不能按 skip 提交")
 
     assert len(repository.list_unconsumed("feishu:chat-1")) == 1
 
@@ -579,7 +573,7 @@ def test_drift_progress_survives_repository_restart(tmp_path: Path) -> None:
     repository = ProactiveRepository(database)
     repository.mark_drift_started(
         session_key="feishu:chat-1",
-        job_id="job-1",
+        task_id="task-1",
         started_at=NOW,
     )
 
@@ -592,13 +586,13 @@ def test_drift_finish_persists_result_for_audit(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     repository.mark_drift_started(
         session_key="feishu:chat-1",
-        job_id="job-1",
+        task_id="task-1",
         started_at=NOW,
     )
 
     repository.complete_drift(
         session_key="feishu:chat-1",
-        job_id="job-1",
+        task_id="task-1",
         skill_name="create-drift-skill",
         outcome="succeeded",
         result={

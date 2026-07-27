@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 from typing import Any, cast
 
-from memopilot.bootstrap import build_app, build_scheduler, build_worker
+from memopilot.bootstrap import AppRuntime, build_app_runtime
 from memopilot.channels.cli_tui import run_tui_async
 from memopilot.config import load_settings
 from memopilot.redis_runtime import RedisRuntime
@@ -71,10 +71,8 @@ async def run_all(
 ) -> None:
     """在同一个 asyncio 事件循环中运行全部常驻服务。"""
     redis_runtime: RedisRuntime | None = None
-    app_bundle: Any = None
-    scheduler_bundle: Any = None
-    worker_bundle: Any = None
-    service_tasks: list[asyncio.Task[Any]] = []
+    runtime: AppRuntime | None = None
+    runtime_task: asyncio.Task[Any] | None = None
     cli_task: asyncio.Task[Any] | None = None
     shutdown_task: asyncio.Task[Any] | None = None
     try:
@@ -83,34 +81,18 @@ async def run_all(
             logger.info("本地 Redis 未运行，已由 MemoPilot 自动启动")
         else:
             logger.info("检测到可用 Redis，直接复用现有服务")
-        app_bundle = build_app(settings)
-        scheduler_bundle = build_scheduler(settings)
-        if hasattr(app_bundle, "console"):
-            console = app_bundle.console
-            worker_bundle = await build_worker(settings, console_transport=console)
-        else:
-            console = None
-            worker_bundle = await build_worker(settings)
-        await worker_bundle.start_extensions()
-        for diagnostic in worker_bundle.mcp_diagnostics:
+        runtime = await build_app_runtime(settings)
+        await runtime.start()
+        for diagnostic in runtime.mcp_diagnostics:
             logger.warning("MCP Server 不可用，核心 Runtime 继续启动: %s", diagnostic)
         if not settings.feishu_allow_from:
             logger.warning("飞书 allowlist 为空：当前允许所有私聊用户访问")
-        if console is not None:
-            await console.start()
-        await app_bundle.service.start()
-        logger.info("MemoPilot 已启动：Gateway、Scheduler、Runner 运行于同一 asyncio 事件循环")
-        service_tasks = [
-            asyncio.create_task(
-                scheduler_bundle.service.run_forever(),
-                name="memopilot-scheduler",
-            ),
-            asyncio.create_task(
-                worker_bundle.service.run_forever(),
-                name="memopilot-worker",
-            ),
-        ]
-        wait_tasks: set[asyncio.Task[Any]] = set(service_tasks)
+        logger.info(
+            "MemoPilot 已启动：MessageBus、AgentLoop、SchedulerService、ProactiveLoop "
+            "运行于同一 asyncio 事件循环"
+        )
+        runtime_task = asyncio.create_task(runtime.run_forever(), name="memopilot-runtime")
+        wait_tasks: set[asyncio.Task[Any]] = {runtime_task}
         if interactive:
             cli_task = asyncio.create_task(
                 run_tui_async(),
@@ -128,16 +110,15 @@ async def run_all(
                 wait_tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            completed_services = [task for task in service_tasks if task in done]
-            for task in completed_services:
-                await task
-                raise RuntimeError(f"常驻服务意外退出: {task.get_name()}")
+            if runtime_task in done:
+                await runtime_task
+                raise RuntimeError("MemoPilot 常驻服务意外退出")
             if cli_task is not None and cli_task in done:
                 await cli_task
         else:
-            await asyncio.gather(*service_tasks)
+            await runtime_task
     finally:
-        tasks_to_close = [*service_tasks]
+        tasks_to_close = [task for task in (runtime_task,) if task is not None]
         if cli_task is not None:
             tasks_to_close.append(cli_task)
         if shutdown_task is not None:
@@ -146,12 +127,8 @@ async def run_all(
             task.cancel()
         if tasks_to_close:
             await asyncio.gather(*tasks_to_close, return_exceptions=True)
-        if worker_bundle is not None:
-            await worker_bundle.close()
-        if scheduler_bundle is not None:
-            await scheduler_bundle.close()
-        if app_bundle is not None:
-            await app_bundle.close()
+        if runtime is not None:
+            await runtime.close()
         if redis_runtime is not None:
             await redis_runtime.close()
 
@@ -222,7 +199,12 @@ def _parser() -> argparse.ArgumentParser:
 
 def _add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
-    parser.add_argument("--workspace", type=Path, default=Path("workspace"))
+    parser.add_argument("--workspace", type=Path, default=_default_workspace())
+
+
+def _default_workspace() -> Path:
+    """使用用户级运行时工作区，并与本机旧原型数据隔离。"""
+    return Path.home() / ".memopilot" / "memopilot-workspace"
 
 
 if __name__ == "__main__":

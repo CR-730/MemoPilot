@@ -128,6 +128,8 @@ def _find_redis_server() -> Path | None:
 
 async def _launch(executable: Path, host: str, port: int) -> RedisProcess:
     creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+    runtime_directory = _redis_runtime_directory()
+    runtime_directory.mkdir(parents=True, exist_ok=True)
     return await asyncio.create_subprocess_exec(
         str(executable),
         "--bind",
@@ -143,7 +145,12 @@ async def _launch(executable: Path, host: str, port: int) -> RedisProcess:
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
         creationflags=creationflags,
+        cwd=str(runtime_directory),
     )
+
+
+def _redis_runtime_directory() -> Path:
+    return Path.home() / ".memopilot" / "runtime" / "redis"
 
 
 __all__ = ["RedisRuntime", "RedisStartupError"]

@@ -12,6 +12,9 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
 
     settings = MemoPilotSettings(_env_file=None)
 
+    assert settings.workspace == (
+        Path.home() / ".memopilot" / "memopilot-workspace"
+    ).resolve()
     assert settings.chat_base_url == "https://api.deepseek.com"
     assert settings.chat_model == "deepseek-v4-flash"
     assert settings.proactive_tick_seconds == 1800
@@ -72,6 +75,15 @@ def test_environment_overrides_dotenv(
     assert settings.proactive_tick_seconds == 1800
     assert settings.drift_min_interval_hours == 3
     assert settings.redis_url == "redis://dotenv:6379/0"
+
+
+def test_localhost_redis_is_normalized_to_ipv4_for_windows_asyncio() -> None:
+    settings = MemoPilotSettings(
+        redis_url="redis://localhost:6379/0",
+        _env_file=None,
+    )
+
+    assert settings.redis_url == "redis://127.0.0.1:6379/0"
 
 
 def test_feishu_allowlist_accepts_comma_separated_environment_value(
@@ -212,7 +224,7 @@ channel_name = "feishu_work"
     assert settings.feishu_channel_name == "feishu_work"
 
 
-def test_phase3_process_validation_is_split_and_empty_allowlist_is_allowed(
+def test_app_runtime_validation_allows_empty_allowlist(
     tmp_path: Path,
 ) -> None:
     app = MemoPilotSettings(
@@ -222,8 +234,8 @@ def test_phase3_process_validation_is_split_and_empty_allowlist_is_allowed(
         feishu_allow_from=(),
         _env_file=None,
     )
-    worker = MemoPilotSettings(
-        workspace=tmp_path / "worker",
+    runtime = MemoPilotSettings(
+        workspace=tmp_path / "runtime",
         chat_api_key="chat-secret",
         embedding_base_url="https://embedding.example/v1",
         embedding_model="embedding-model",
@@ -235,10 +247,10 @@ def test_phase3_process_validation_is_split_and_empty_allowlist_is_allowed(
     )
 
     app.validate_app_ready()
-    worker.validate_worker_ready()
+    runtime.validate_runtime_ready()
 
 
-def test_worker_validation_requires_embedding_provider(tmp_path: Path) -> None:
+def test_runtime_validation_requires_embedding_provider(tmp_path: Path) -> None:
     settings = MemoPilotSettings(
         workspace=tmp_path / "worker",
         chat_api_key="chat-secret",
@@ -248,7 +260,7 @@ def test_worker_validation_requires_embedding_provider(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError) as exc_info:
-        settings.validate_worker_ready()
+        settings.validate_runtime_ready()
 
     message = str(exc_info.value)
     assert "MEMOPILOT_EMBEDDING_BASE_URL" in message

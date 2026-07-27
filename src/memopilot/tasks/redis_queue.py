@@ -8,10 +8,29 @@ from typing import cast
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
+from memopilot.tasks.background import BackgroundTask
+
+_PUBLISH_ONCE = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return ''
+end
+redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+local message_id = redis.call(
+  'XADD', KEYS[2], '*',
+  'task_id', ARGV[2],
+  'kind', ARGV[3],
+  'priority', ARGV[4],
+  'session_key', ARGV[5],
+  'payload_json', ARGV[6]
+)
+redis.call('SADD', KEYS[3], ARGV[2])
+return message_id
+"""
+
 
 @dataclass(frozen=True, slots=True)
-class PublishedJob:
-    job_id: str
+class PublishedTask:
+    task_id: str
     kind: str
     priority: int
     session_key: str
@@ -22,12 +41,11 @@ class PublishedJob:
 class QueueMessage:
     stream: str
     message_id: str
-    job_id: str
+    task_id: str
     kind: str
     priority: int
     session_key: str
     payload_json: str
-
 
 @dataclass(frozen=True, slots=True)
 class PendingEntry:
@@ -36,7 +54,7 @@ class PendingEntry:
 
 
 class RedisTaskQueue:
-    """只保存可重建的队列副本，SQLite 仍是事实源。"""
+    """后台任务的优先级队列与短期执行状态。"""
 
     def __init__(
         self,
@@ -48,12 +66,12 @@ class RedisTaskQueue:
         self.redis = redis
         self.namespace = namespace
         self.group = group
-        self.queued_job_ids_key = f"{namespace}:queued:job_ids"
+        self.queued_task_ids_key = f"{namespace}:queued:task_ids"
 
     def stream_key(self, priority: int) -> str:
         if priority not in range(4):
             raise ValueError("priority 必须位于 0 到 3")
-        return f"{self.namespace}:jobs:p{priority}"
+        return f"{self.namespace}:tasks:p{priority}"
 
     async def ensure_consumer_groups(self) -> None:
         for priority in range(4):
@@ -68,22 +86,56 @@ class RedisTaskQueue:
                 if "BUSYGROUP" not in str(exc):
                     raise
 
-    async def publish(self, job: PublishedJob) -> str:
-        stream = self.stream_key(job.priority)
+    async def publish(self, task: PublishedTask) -> str:
+        stream = self.stream_key(task.priority)
         message_id = await self.redis.xadd(
             stream,
             {
-                "job_id": job.job_id,
-                "kind": job.kind,
-                "priority": str(job.priority),
-                "session_key": job.session_key,
-                "payload_json": job.payload_json,
+                "task_id": task.task_id,
+                "kind": task.kind,
+                "priority": str(task.priority),
+                "session_key": task.session_key,
+                "payload_json": task.payload_json,
             },
         )
-        await self.redis.sadd(self.queued_job_ids_key, job.job_id)
+        await self.redis.sadd(self.queued_task_ids_key, task.task_id)
         return _text(message_id)
 
+    async def publish_task_once(
+        self, task: BackgroundTask, *, ttl_seconds: int = 86400
+    ) -> str | None:
+        """以任务 ID 做 Redis 幂等，避免 Scheduler 重启重复投递同一时间桶。"""
+        key = f"{self.namespace}:task:{task.task_id}"
+        result = await self.redis.eval(
+            _PUBLISH_ONCE,
+            3,
+            key,
+            self.stream_key(task.priority),
+            self.queued_task_ids_key,
+            ttl_seconds,
+            task.task_id,
+            task.kind,
+            task.priority,
+            task.session_key,
+            task.payload_json,
+        )
+        message_id = _text(result)
+        return message_id or None
+
     async def read_next(self, *, consumer_id: str) -> QueueMessage | None:
+        try:
+            return await self._read_next_from_existing_groups(consumer_id=consumer_id)
+        except ResponseError as exc:
+            if "NOGROUP" not in str(exc):
+                raise
+            await self.ensure_consumer_groups()
+            return await self._read_next_from_existing_groups(consumer_id=consumer_id)
+
+    async def _read_next_from_existing_groups(
+        self,
+        *,
+        consumer_id: str,
+    ) -> QueueMessage | None:
         for priority in range(4):
             stream = self.stream_key(priority)
             response = cast(
@@ -107,7 +159,7 @@ class RedisTaskQueue:
             return QueueMessage(
                 stream=stream,
                 message_id=_text(message_id),
-                job_id=_field(fields, "job_id"),
+                task_id=_field(fields, "task_id"),
                 kind=_field(fields, "kind"),
                 priority=int(_field(fields, "priority")),
                 session_key=_field(fields, "session_key"),
@@ -119,24 +171,28 @@ class RedisTaskQueue:
         async with self.redis.pipeline(transaction=True) as pipeline:
             pipeline.xack(message.stream, self.group, message.message_id)
             pipeline.xdel(message.stream, message.message_id)
-            pipeline.srem(self.queued_job_ids_key, message.job_id)
+            pipeline.srem(self.queued_task_ids_key, message.task_id)
             await pipeline.execute()
 
     async def acknowledge_requeued(self, message: QueueMessage) -> None:
-        """移除当前投递，但保留同业务 Job 的 Redis 镜像标记。"""
+        """移除当前投递，但保留同业务任务的 Redis 镜像标记。"""
         async with self.redis.pipeline(transaction=True) as pipeline:
             pipeline.xack(message.stream, self.group, message.message_id)
             pipeline.xdel(message.stream, message.message_id)
             await pipeline.execute()
 
-    async def missing_mirrors(self, job_ids: tuple[str, ...]) -> tuple[str, ...]:
-        if not job_ids:
+    async def missing_tasks(self, task_ids: tuple[str, ...]) -> tuple[str, ...]:
+        if not task_ids:
             return ()
         async with self.redis.pipeline(transaction=False) as pipeline:
-            for job_id in job_ids:
-                pipeline.sismember(self.queued_job_ids_key, job_id)
+            for task_id in task_ids:
+                pipeline.sismember(self.queued_task_ids_key, task_id)
             present = await pipeline.execute()
-        return tuple(job_id for job_id, exists in zip(job_ids, present, strict=True) if not exists)
+        return tuple(
+            task_id
+            for task_id, exists in zip(task_ids, present, strict=True)
+            if not exists
+        )
 
     async def pending_entries(
         self,
@@ -230,7 +286,7 @@ def _queue_message(
     return QueueMessage(
         stream=stream,
         message_id=_text(message_id),
-        job_id=_field(fields, "job_id"),
+        task_id=_field(fields, "task_id"),
         kind=_field(fields, "kind"),
         priority=int(_field(fields, "priority")),
         session_key=_field(fields, "session_key"),
@@ -238,4 +294,4 @@ def _queue_message(
     )
 
 
-__all__ = ["PendingEntry", "PublishedJob", "QueueMessage", "RedisTaskQueue"]
+__all__ = ["PendingEntry", "PublishedTask", "QueueMessage", "RedisTaskQueue"]

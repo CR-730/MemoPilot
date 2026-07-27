@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
+from memopilot.proactive.loop import ProactiveLoop
+from memopilot.proactive.service import ProactiveOutcome
+from memopilot.runtime.outbound import OutboundDispatch
+
+NOW = datetime(2026, 7, 21, 12, tzinfo=UTC)
+
+
+class _ProactiveService:
+    def __init__(self, outcome: ProactiveOutcome) -> None:
+        self.outcome = outcome
+        self.finalized: list[ProactiveOutcome] = []
+        self.failed: list[ProactiveOutcome] = []
+
+    async def execute(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.execute_kwargs = kwargs
+        return self.outcome
+
+    def finalize_confirmed(self, outcome, *, confirmed_at=None):  # type: ignore[no-untyped-def]
+        del confirmed_at
+        self.finalized.append(outcome)
+        return True
+
+    def finalize_failed(self, outcome, *, failed_at=None):  # type: ignore[no-untyped-def]
+        del failed_at
+        self.failed.append(outcome)
+        return True
+
+
+class _Outbound:
+    def __init__(self, sent: bool) -> None:
+        self.sent = sent
+        self.calls: list[OutboundDispatch] = []
+
+    async def dispatch(self, outbound: OutboundDispatch) -> bool:
+        self.calls.append(outbound)
+        return self.sent
+
+
+def _loop(proactive: _ProactiveService, outbound: _Outbound) -> ProactiveLoop:
+    return ProactiveLoop(
+        service_factory=lambda session, activity, lease: proactive,
+        outbound=outbound,
+    )
+
+
+async def test_proactive_reply_dispatches_then_commits_decision() -> None:
+    proactive = _ProactiveService(
+        ProactiveOutcome(
+            "send",
+            session_key="feishu:chat-1",
+            trigger_kind="alert",
+            message="警报",
+            decision_id="decision-1",
+            decided_at=NOW,
+        )
+    )
+    outbound = _Outbound(True)
+
+    result = await _loop(proactive, outbound).execute_task(
+        task_id="proactive-1",
+        session_key="feishu:chat-1",
+        payload={"channel": "cli", "chat_id": "chat-1", "activity_version": 4},
+        lease=SimpleNamespace(),
+        now=NOW,
+    )
+
+    assert result == "succeeded"
+    assert outbound.calls == [
+        OutboundDispatch(channel="cli", chat_id="chat-1", content="警报")
+    ]
+    assert proactive.finalized == [proactive.outcome]
+
+
+async def test_proactive_send_failure_runs_failure_path() -> None:
+    proactive = _ProactiveService(
+        ProactiveOutcome(
+            "send",
+            session_key="feishu:chat-1",
+            message="无法发送的提醒",
+            decision_id="decision-1",
+            decided_at=NOW,
+        )
+    )
+
+    result = await _loop(proactive, _Outbound(False)).execute_task(
+        task_id="proactive-1",
+        session_key="feishu:chat-1",
+        payload={"channel": "cli", "chat_id": "chat-1", "activity_version": 4},
+        lease=SimpleNamespace(),
+        now=NOW,
+    )
+
+    assert result == "failed"
+    assert proactive.failed == [proactive.outcome]

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
-import sqlite3
 from contextlib import nullcontext
 from typing import Any
 
 import pytest
 
-from memopilot.memory.post_response import PostResponseMemoryWorker, _explicitly_memorized_ids
+from memopilot.memory.post_response import PostResponseMemoryWorker
 
 
 class _Store:
@@ -76,7 +74,6 @@ async def test_post_response_model_failure_is_contained() -> None:
 
     assert result == ()
     assert store.superseded == ()
-
 
 @pytest.mark.asyncio
 async def test_post_response_semantic_threshold_cannot_be_bypassed_by_hotness() -> None:
@@ -147,26 +144,3 @@ async def test_post_response_never_supersedes_memory_created_in_same_turn() -> N
 
     assert result == ()
     assert store.superseded == ()
-
-
-def test_explicit_memory_protection_is_reconstructed_from_step_audit() -> None:
-    connection = sqlite3.connect(":memory:")
-    connection.row_factory = sqlite3.Row
-    connection.execute(
-        "CREATE TABLE steps(run_id TEXT, tool_name TEXT, state TEXT, observation_json TEXT)"
-    )
-    connection.executemany(
-        "INSERT INTO steps VALUES (?, ?, ?, ?)",
-        [
-            (
-                "run-1",
-                "memorize",
-                "succeeded",
-                json.dumps({"ok": True, "result": {"item_id": "mem-new"}}),
-            ),
-            ("run-1", "memorize", "failed", json.dumps({"result": {"item_id": "bad"}})),
-            ("run-2", "memorize", "succeeded", json.dumps({"result": {"item_id": "other"}})),
-        ],
-    )
-
-    assert _explicitly_memorized_ids(connection, "run-1") == {"mem-new"}

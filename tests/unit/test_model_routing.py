@@ -94,11 +94,11 @@ async def test_runtime_routes_lightweight_memory_tasks_to_fast_provider(
 
     assert bundle.runtime._provider is main
     assert bundle.memory_engine.hypothesis_provider.provider is fast
-    assert bundle.memory_jobs.consolidation.extractor.provider is main
-    assert bundle.memory_jobs.consolidation.recent_context.provider is fast
-    assert bundle.memory_jobs.vectorization.implicit_extractor.provider is main
-    assert bundle.memory_jobs.vectorization.memorizer.procedure_tagger.provider is fast
-    assert bundle.memory_jobs.post_response.worker.model.provider is fast
+    assert bundle.memory_tasks.consolidation.extractor.provider is main
+    assert bundle.memory_tasks.consolidation.recent_context.provider is fast
+    assert bundle.memory_tasks.vectorization.implicit_extractor.provider is main
+    assert bundle.memory_tasks.vectorization.memorizer.procedure_tagger.provider is fast
+    assert bundle.memory_tasks.post_response.worker.model.provider is fast
     await bundle.close_extensions()
 
 
@@ -121,8 +121,8 @@ async def test_runtime_falls_back_to_main_when_fast_provider_is_missing(
     )
 
     assert bundle.memory_engine.hypothesis_provider.provider is main
-    assert bundle.memory_jobs.consolidation.recent_context.provider is main
-    assert bundle.memory_jobs.post_response.worker.model.provider is main
+    assert bundle.memory_tasks.consolidation.recent_context.provider is main
+    assert bundle.memory_tasks.post_response.worker.model.provider is main
     await bundle.close_extensions()
 
 

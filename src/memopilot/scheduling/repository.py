@@ -20,13 +20,18 @@ from memopilot.scheduling.contracts import (
     ScheduleKind,
 )
 from memopilot.scheduling.time_rules import advance_every, is_cron_expr, parse_duration
-from memopilot.tasks.operational import OperationalRepository
+from memopilot.tasks.background import BackgroundTask
 
 
 class ScheduleRepository:
     """以短事务创建、查询、取消并投递到期定时任务。"""
 
-    def __init__(self, database: Path, *, busy_timeout_seconds: float = 5) -> None:
+    def __init__(
+        self,
+        database: Path,
+        *,
+        busy_timeout_seconds: float = 5,
+    ) -> None:
         self.database = Path(database)
         self.busy_timeout_seconds = busy_timeout_seconds
 
@@ -128,21 +133,21 @@ class ScheduleRepository:
             raise ValueError("必须提供 task_id 或 name")
         updated_at = _as_utc(now or datetime.now(UTC)).isoformat()
         condition = (
-            "task.task_id = ?"
-            if task_id
-            else "json_extract(task.schedule_json, '$.name') = ?"
+            "task.task_id = ?" if task_id else "json_extract(task.schedule_json, '$.name') = ?"
         )
         value = task_id or name
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                pending_clause = (
+                    "EXISTS (SELECT 1 FROM scheduled_executions AS execution "
+                    "WHERE execution.task_id = task.task_id "
+                    "AND execution.state IN ('queued', 'running'))"
+                )
                 rows = connection.execute(
                     f"SELECT task_id FROM scheduled_tasks AS task "  # noqa: S608
-                    f"WHERE session_key = ? AND {condition} AND (enabled = 1 OR EXISTS ("
-                    "SELECT 1 FROM scheduled_executions AS execution "
-                    "JOIN agent_jobs AS job ON job.job_id = execution.job_id "
-                    "WHERE execution.task_id = task.task_id "
-                    "AND execution.state = 'queued' AND job.state = 'queued'))",
+                    f"WHERE session_key = ? AND {condition} "
+                    f"AND (enabled = 1 OR {pending_clause})",
                     (session_key, value),
                 ).fetchall()
                 identifiers = tuple(str(row["task_id"]) for row in rows)
@@ -155,18 +160,10 @@ class ScheduleRepository:
                         (updated_at, *identifiers),
                     )
                     connection.execute(
-                        f"UPDATE agent_jobs SET state = 'cancelled', "  # noqa: S608
-                        "heartbeat_at = ?, finished_at = ?, updated_at = ? "
-                        "WHERE state = 'queued' AND job_id IN ("
-                        "SELECT job_id FROM scheduled_executions "
-                        f"WHERE task_id IN ({placeholders}) AND state = 'queued')",
-                        (updated_at, updated_at, updated_at, *identifiers),
-                    )
-                    connection.execute(
                         f"UPDATE scheduled_executions SET state = 'cancelled', "  # noqa: S608
                         f"updated_at = ? WHERE task_id IN ({placeholders}) "
-                        "AND state = 'queued'",
-                        (updated_at, *identifiers),
+                        "AND state IN (?, ?)",
+                        (updated_at, *identifiers, "queued", "running"),
                     )
                 connection.execute("COMMIT")
                 return identifiers
@@ -223,6 +220,7 @@ class ScheduleRepository:
                         failpoint=failpoint,
                     )
                 )
+            queued = list(self._pending_direct_executions(connection))
             connection.execute("COMMIT")
             return DueScanResult(tuple(queued), tuple(missed))
         except Exception:
@@ -243,8 +241,8 @@ class ScheduleRepository:
         connection.execute(
             """
             INSERT OR IGNORE INTO scheduled_executions(
-                execution_id, task_id, scheduled_at, state, job_id, created_at, updated_at
-            ) VALUES (?, ?, ?, 'skipped', NULL, ?, ?)
+                execution_id, task_id, scheduled_at, state, created_at, updated_at
+            ) VALUES (?, ?, ?, 'skipped', ?, ?)
             """,
             (
                 execution_id,
@@ -255,7 +253,7 @@ class ScheduleRepository:
             ),
         )
         self._finish_or_advance(connection, task, now)
-        return ScheduledExecution(execution_id, task.task_id, task.next_run_at, "skipped", None)
+        return ScheduledExecution(execution_id, task.task_id, task.next_run_at, "skipped")
 
     def _queue_execution(
         self,
@@ -269,60 +267,51 @@ class ScheduleRepository:
         assert task.next_run_at is not None
         effective_scheduled_at = scheduled_at or task.next_run_at
         execution_id = _execution_id(task.task_id, effective_scheduled_at)
-        job_id = _stable_id("job", f"schedule:{execution_id}")
-        activity_row = connection.execute(
-            "SELECT activity_version FROM session_activity WHERE session_key = ?",
-            (task.session_key,),
-        ).fetchone()
-        activity_version = int(activity_row["activity_version"]) if activity_row else 0
         session_row = connection.execute(
-            "SELECT chat_id FROM sessions WHERE session_key = ?",
+            "SELECT channel, chat_id FROM sessions WHERE session_key = ?",
             (task.session_key,),
         ).fetchone()
         if session_row is None:
             raise KeyError(task.session_key)
-        OperationalRepository._insert_queued_job_with_outbox(
-            connection,
-            job_id=job_id,
-            kind="schedule.run",
-            priority=1,
-            session_key=task.session_key,
-            idempotency_key=f"schedule-execution:{execution_id}",
-            activity_version=activity_version,
-            payload={
-                "execution_id": execution_id,
-                "execution_mode": task.execution_mode,
-                "payload": dict(task.payload),
-                "chat_id": str(session_row["chat_id"]),
-                "scheduled_at": effective_scheduled_at.isoformat(),
-                "task_id": task.task_id,
-            },
-            now_text=now.isoformat(),
-        )
-        if failpoint is not None:
-            failpoint("after_job_outbox")
+        payload = {
+            "execution_id": execution_id,
+            "execution_mode": task.execution_mode,
+            "payload": dict(task.payload),
+            "channel": str(session_row["channel"]),
+            "chat_id": str(session_row["chat_id"]),
+            "scheduled_at": effective_scheduled_at.isoformat(),
+            "task_id": task.task_id,
+            "task_name": task.name,
+            "activity_version": self._activity_version(connection, task.session_key),
+        }
         connection.execute(
-            """
-            INSERT INTO scheduled_executions(
-                execution_id, task_id, scheduled_at, state, job_id, created_at, updated_at
-            ) VALUES (?, ?, ?, 'queued', ?, ?, ?)
-            """,
-            (
-                execution_id,
-                task.task_id,
-                effective_scheduled_at.isoformat(),
-                job_id,
-                now.isoformat(),
-                now.isoformat(),
-            ),
-        )
+                """
+                INSERT INTO scheduled_executions(
+                    execution_id, task_id, scheduled_at, state, created_at, updated_at
+                ) VALUES (?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    execution_id,
+                    task.task_id,
+                    effective_scheduled_at.isoformat(),
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
         self._finish_or_advance(connection, task, now)
         return ScheduledExecution(
-            execution_id,
-            task.task_id,
-            effective_scheduled_at,
-            "queued",
-            job_id,
+                execution_id,
+                task.task_id,
+                effective_scheduled_at,
+                "queued",
+                BackgroundTask(
+                    task_id=execution_id,
+                    kind="schedule.run",
+                    priority=1,
+                    session_key=task.session_key,
+                    payload=payload,
+                    created_at=now,
+                ),
         )
 
     @staticmethod
@@ -357,10 +346,70 @@ class ScheduleRepository:
                 (now.isoformat(), task.task_id),
             )
 
+    def _pending_direct_executions(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[ScheduledExecution, ...]:
+        rows = connection.execute(
+            """
+            SELECT execution.execution_id, execution.task_id,
+                   execution.scheduled_at, execution.state, execution.created_at,
+                   task.session_key, task.execution_mode, task.payload_json,
+                   task.schedule_json, session.channel, session.chat_id,
+                   COALESCE(activity.activity_version, 0) AS activity_version
+            FROM scheduled_executions AS execution
+            JOIN scheduled_tasks AS task ON task.task_id = execution.task_id
+            JOIN sessions AS session ON session.session_key = task.session_key
+            LEFT JOIN session_activity AS activity
+                   ON activity.session_key = task.session_key
+            WHERE execution.state = 'queued'
+            ORDER BY execution.scheduled_at, execution.execution_id
+            """
+        ).fetchall()
+        pending: list[ScheduledExecution] = []
+        for row in rows:
+            schedule = json.loads(str(row["schedule_json"]))
+            task_payload = json.loads(str(row["payload_json"]))
+            scheduled_at = _required_datetime(row["scheduled_at"])
+            payload = {
+                "execution_id": str(row["execution_id"]),
+                "execution_mode": str(row["execution_mode"]),
+                "payload": task_payload,
+                "channel": str(row["channel"]),
+                "chat_id": str(row["chat_id"]),
+                "scheduled_at": scheduled_at.isoformat(),
+                "task_id": str(row["task_id"]),
+                "task_name": schedule.get("name"),
+                "activity_version": int(row["activity_version"]),
+            }
+            pending.append(
+                ScheduledExecution(
+                    str(row["execution_id"]),
+                    str(row["task_id"]),
+                    scheduled_at,
+                    str(row["state"]),
+                    BackgroundTask(
+                        task_id=str(row["execution_id"]),
+                        kind="schedule.run",
+                        priority=1,
+                        session_key=str(row["session_key"]),
+                        payload=payload,
+                        created_at=_required_datetime(row["created_at"]),
+                    ),
+                )
+            )
+        return tuple(pending)
+
     def _connect(self) -> sqlite3.Connection:
-        return connect_database(
-            self.database, busy_timeout_seconds=self.busy_timeout_seconds
-        )
+        return connect_database(self.database, busy_timeout_seconds=self.busy_timeout_seconds)
+
+    @staticmethod
+    def _activity_version(connection: sqlite3.Connection, session_key: str) -> int:
+        row = connection.execute(
+            "SELECT activity_version FROM session_activity WHERE session_key = ?",
+            (session_key,),
+        ).fetchone()
+        return 0 if row is None else int(row["activity_version"])
 
 
 def _task_from_row(row: sqlite3.Row) -> ScheduledTask:

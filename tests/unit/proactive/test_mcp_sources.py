@@ -276,8 +276,10 @@ async def test_gateway_raises_when_every_configured_source_fails(tmp_path: Path)
         caller_for_server=lambda _server: _Caller(fail=True),
     )
 
-    with pytest.raises(RuntimeError, match="全部 Proactive Source 拉取失败"):
-        await gateway.collect(session_key="feishu:chat-1", fetched_at=NOW)
+    report = await gateway.collect(session_key="feishu:chat-1", fetched_at=NOW)
+
+    assert report.succeeded == ()
+    assert "bad" in report.failed
 
 
 async def test_gateway_accepts_prototype_feed_text_json_contract(tmp_path: Path) -> None:
@@ -349,10 +351,10 @@ async def test_gateway_does_not_read_stale_feed_events_when_poll_fails(
         caller_for_server=lambda _server: caller,
     )
 
-    with pytest.raises(RuntimeError, match="全部 Proactive Source 拉取失败"):
-        await gateway.collect(session_key="feishu:chat-1", fetched_at=NOW)
+    report = await gateway.collect(session_key="feishu:chat-1", fetched_at=NOW)
 
     assert caller.calls == [("poll_feeds", {})]
+    assert "feed" in report.failed
     assert repository.list_unconsumed("feishu:chat-1") == ()
 
 
@@ -491,7 +493,6 @@ async def test_alert_ack_does_not_expand_old_mcp_contract_with_content_ttl(
     )
     repository.finalize_confirmed(
         decision.decision_id,
-        is_effect_confirmed=lambda _operation_id: True,
         committed_at=NOW,
     )
     caller = _PrototypeFeedCaller()

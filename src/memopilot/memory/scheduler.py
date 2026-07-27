@@ -7,7 +7,8 @@ import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
-from memopilot.tasks.operational import EnqueueResult, OperationalRepository
+from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.operational import OperationalRepository
 
 logger = logging.getLogger(__name__)
 
@@ -28,13 +29,24 @@ class MemoryMaintenanceScheduler:
         self.interval = interval
         self.clock = clock or (lambda: datetime.now(UTC))
 
-    def tick(self, *, now: datetime | None = None) -> EnqueueResult | None:
+    def tick(self, *, now: datetime | None = None) -> BackgroundTask | None:
         current = now or self.clock()
-        self.repository.requeue_failed_memory_jobs(now=current)
         if not self.enabled:
             return None
         bucket = int(current.timestamp() // self.interval.total_seconds())
-        return self.repository.enqueue_memory_optimizer(bucket=bucket, now=current)
+        self.repository.ensure_system_session(
+            "system:memory",
+            chat_id="memory",
+            now=current,
+        )
+        return BackgroundTask(
+            task_id=f"memory.optimize:{bucket}",
+            kind="memory.optimize",
+            priority=3,
+            session_key="system:memory",
+            payload={"bucket": bucket},
+            created_at=current,
+        )
 
     async def run_forever(self) -> None:
         while True:

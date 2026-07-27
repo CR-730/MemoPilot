@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from memopilot.persistence.migrations import (
     DatabaseKind,
@@ -66,6 +67,32 @@ async def test_schedule_tool_uses_trusted_session_and_received_at(tmp_path) -> N
     schedule_schema = schedule_tool.parameters
     assert "session_key" not in schedule_schema["properties"]
     assert "received_at" not in schedule_schema["properties"]
+
+
+async def test_schedule_tool_localizes_naive_cli_timestamp(tmp_path) -> None:
+    registry, repository = _registry(tmp_path)
+    received_at = datetime(2026, 7, 21, 12, 0)
+    token = bind_schedule_tool_context("feishu:chat-1", received_at=received_at)
+    try:
+        observation = await registry.execute(
+            FunctionCall(
+                id="naive-cli",
+                name="schedule",
+                arguments={
+                    "schedule_kind": "after",
+                    "when": "1m",
+                    "execution_mode": "instant",
+                    "message": "CLI 提醒",
+                    "timezone": "Asia/Shanghai",
+                },
+            )
+        )
+    finally:
+        reset_schedule_tool_context(token)
+
+    assert observation.ok is True
+    expected = received_at.replace(tzinfo=ZoneInfo("Asia/Shanghai")) + timedelta(minutes=1)
+    assert repository.list_for_session("feishu:chat-1")[0].next_run_at == expected.astimezone(UTC)
 
 
 async def test_schedule_tool_validates_mode_payload(tmp_path) -> None:

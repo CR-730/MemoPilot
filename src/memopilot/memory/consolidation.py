@@ -161,9 +161,7 @@ class ConsolidationService:
         pending_items = _format_pending_items(output.get("pending_items"))
         artifacts = _validated_artifacts(output.get("artifacts"))
         if history_entries:
-            artifacts["HISTORY.md"] = "\n".join(
-                str(entry["summary"]) for entry in history_entries
-            )
+            artifacts["HISTORY.md"] = "\n".join(str(entry["summary"]) for entry in history_entries)
         if pending_items:
             artifacts["PENDING.md"] = pending_items
         artifacts.update(
@@ -303,55 +301,11 @@ class ConsolidationService:
         lease: FenceToken | None,
     ) -> None:
         now = datetime.now(UTC).isoformat()
-        job_id = str(uuid5(NAMESPACE_URL, f"memopilot:vectorize:{consolidation_id}"))
-        outbox_id = str(uuid5(NAMESPACE_URL, f"memopilot:outbox:{job_id}"))
         connection = connect_database(self.database)
         connection.execute("BEGIN IMMEDIATE")
         try:
             if lease is not None:
                 OperationalRepository.require_current_fence(connection, lease)
-            activity = connection.execute(
-                "SELECT activity_version FROM session_activity WHERE session_key = ?",
-                (session_key,),
-            ).fetchone()
-            activity_version = int(activity[0]) if activity is not None else 0
-            payload = {
-                "job_id": job_id,
-                "kind": "memory.vectorize",
-                "session_key": session_key,
-                "priority": 3,
-                "consolidation_id": consolidation_id,
-            }
-            connection.execute(
-                "INSERT OR IGNORE INTO agent_jobs("
-                "job_id, kind, priority, session_key, idempotency_key, state, activity_version, "
-                "payload_json, created_at, updated_at) VALUES (?, 'memory.vectorize', 3, ?, ?, "
-                "'queued', ?, ?, ?, ?)",
-                (
-                    job_id,
-                    session_key,
-                    f"vectorize:{consolidation_id}",
-                    activity_version,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                    now,
-                    now,
-                ),
-            )
-            connection.execute(
-                "INSERT OR IGNORE INTO outbox_events("
-                "outbox_id, event_type, aggregate_id, payload_json, idempotency_key, state, "
-                "next_attempt_at, created_at, updated_at) VALUES (?, 'agent.job.queued', ?, ?, ?, "
-                "'pending', ?, ?, ?)",
-                (
-                    outbox_id,
-                    job_id,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                    f"publish-job:{job_id}",
-                    now,
-                    now,
-                    now,
-                ),
-            )
             connection.execute(
                 "UPDATE sessions SET last_consolidated_position = MAX("
                 "last_consolidated_position, ?), updated_at = ? WHERE session_key = ?",
@@ -409,10 +363,7 @@ def _journal_artifacts_from_history_entries(entries: list[str]) -> dict[str, str
         except ValueError:
             raise ValueError(f"history_entry 日期无效: {match.group(1)}") from None
         by_date.setdefault(day, []).append(entry)
-    return {
-        f"journal/{day}.md": "\n".join(summaries)
-        for day, summaries in by_date.items()
-    }
+    return {f"journal/{day}.md": "\n".join(summaries) for day, summaries in by_date.items()}
 
 
 def _normalize_history_entries(value: object) -> list[dict[str, object]]:
@@ -461,9 +412,8 @@ def _format_pending_items(value: object) -> str:
 
 def _replace_recent_turns_block(old_context: str, recent_turns: str) -> str:
     marker = "\n## Recent Turns\n"
-    block = (
-        "## Recent Turns\n<!-- a-preview = assistant reply preview only -->\n"
-        + (recent_turns.strip() or "- none")
+    block = "## Recent Turns\n<!-- a-preview = assistant reply preview only -->\n" + (
+        recent_turns.strip() or "- none"
     )
     current = old_context.strip()
     if marker in current:

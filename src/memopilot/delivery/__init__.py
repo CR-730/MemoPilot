@@ -1,7 +1,5 @@
-"""可靠外部副作用。"""
+"""渠道实时展示组件。"""
 
-from memopilot.delivery.effects import EffectRepository
-from memopilot.delivery.feishu import FinalResponseDispatcher
-from memopilot.delivery.reconciliation import EffectReconciliationService
+from memopilot.delivery.feishu_live import FeishuLiveProgress
 
-__all__ = ["EffectReconciliationService", "EffectRepository", "FinalResponseDispatcher"]
+__all__ = ["FeishuLiveProgress"]

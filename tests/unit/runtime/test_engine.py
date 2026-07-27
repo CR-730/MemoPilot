@@ -639,7 +639,7 @@ async def test_runtime_prompt_render_preserves_system_history_and_user_order() -
         "assistant",
         "user",
     ]
-    assert provider.messages[-1].content == "new"
+    assert (provider.messages[-1].content or "").endswith("new")
 
 
 async def test_event_bus_preserves_typed_chat_history() -> None:
@@ -655,11 +655,11 @@ async def test_event_bus_preserves_typed_chat_history() -> None:
     )
 
     assert all(isinstance(message, ChatMessage) for message in provider.messages)
-    assert [message.content for message in provider.messages[-3:]] == [
+    assert [message.content for message in provider.messages[-3:-1]] == [
         "old",
         "answer",
-        "new",
     ]
+    assert (provider.messages[-1].content or "").endswith("new")
 
 
 async def test_runtime_records_symmetric_step_phases_when_provider_fails() -> None:
@@ -729,7 +729,9 @@ class _MemoryProfile:
         }[name]
 
 
-async def test_runtime_prerecall_uses_raw_context_query_and_injects_system_memory() -> None:
+async def test_runtime_prerecall_uses_raw_context_query_and_injects_context_frame(
+    tmp_path,
+) -> None:
     provider = _CapturingProvider()
     memory = _MemoryEngine()
     runtime = AgentRuntime(
@@ -737,17 +739,36 @@ async def test_runtime_prerecall_uses_raw_context_query_and_injects_system_memor
         ToolRegistry(),
         memory_engine=memory,  # type: ignore[arg-type]
         memory_profile=_MemoryProfile(),
+        prompt_workspace=tmp_path,
     )
 
-    result = await runtime.run(TurnInput(session_key="feishu:chat-1", content="原始问题"))
+    result = await runtime.run(
+        TurnInput(
+            session_key="feishu:chat-1",
+            content="原始问题",
+            received_at=datetime(2026, 7, 27, 12, 34, tzinfo=UTC),
+        )
+    )
 
     assert [(request.text, request.intent) for request in memory.requests] == [
         ("原始问题", "context")
     ]
     assert provider.messages[0].role == "system"
-    assert "先读文档" in (provider.messages[0].content or "")
-    assert "用户是 AI 工程师" in (provider.messages[0].content or "")
-    assert "当前正在重构项目" in (provider.messages[0].content or "")
+    assert "先读文档" not in (provider.messages[0].content or "")
+    context_frame = provider.messages[-2]
+    assert context_frame.role == "user"
+    assert context_frame.content.startswith(
+        '<system-reminder data-system-context-frame="true">'
+    )
+    assert "先读文档" in (context_frame.content or "")
+    assert "用户是 AI 工程师" in (context_frame.content or "")
+    assert "当前正在重构项目" in (context_frame.content or "")
+    assert "不是用户陈述，也不是助手结论" in (context_frame.content or "")
+    assert provider.messages[-1].role == "user"
+    assert "request_time=2026-07-27T12:34:00+00:00" in (
+        provider.messages[-1].content or ""
+    )
+    assert (provider.messages[-1].content or "").endswith("原始问题")
     assert any(
         entry.module_slot == "before_reasoning.memory_prerecall"
         for entry in result.phase_trace
@@ -1019,7 +1040,7 @@ async def test_lifecycle_gates_rewrite_real_provider_input_and_final_reply() -> 
 
     result = await runtime.run(TurnInput("feishu:1", "原始问题"))
 
-    assert provider.messages[-1].content == "Gate 改写后的问题"
+    assert (provider.messages[-1].content or "").endswith("Gate 改写后的问题")
     assert result.reply == "Gate 改写后的回复"
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,7 +35,6 @@ class ProactiveDecisionRecord:
     trigger_kind: str
     action: str
     source_events: tuple[tuple[str, str], ...]
-    effect_operation_id: str | None
     activity_version: int
     state: str
     message: str = ""
@@ -64,12 +63,8 @@ class StoredContext:
     updated_at: str
 
 
-def stable_proactive_effect_operation_id(decision_id: str) -> str:
-    return str(uuid5(NAMESPACE_URL, f"memopilot:proactive-effect:{decision_id}"))
-
-
 class ProactiveRepository:
-    """每个公开方法自带短事务，允许 Scheduler/Worker 分进程访问。"""
+    """每个公开方法自带短事务，允许调度与后台任务并发访问。"""
 
     def __init__(self, database: Path) -> None:
         self._database = Path(database)
@@ -297,12 +292,12 @@ class ProactiveRepository:
         self,
         *,
         session_key: str,
-        job_id: str,
+        task_id: str,
         started_at: datetime,
     ) -> None:
-        """记录当前主动 Job 已进入 Drift；沿用旧表保持数据库兼容。"""
+        """记录当前主动任务已进入 Drift。"""
         timestamp = _utc_iso(started_at)
-        drift_id = str(uuid5(NAMESPACE_URL, f"memopilot:drift:{session_key}:{job_id}"))
+        drift_id = str(uuid5(NAMESPACE_URL, f"memopilot:drift:{session_key}:{task_id}"))
         with connect_database(self._database) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -310,13 +305,13 @@ class ProactiveRepository:
                     """
                     INSERT OR REPLACE INTO drift_history(
                         drift_id, session_key, skill_name, drive_before, threshold,
-                        outcome, job_id, reason, created_at, updated_at, trace_json
+                        outcome, task_id, reason, created_at, updated_at, trace_json
                     ) VALUES (
                         ?, ?, NULL, 0, 0, 'running', ?,
                         'direct_proactive_fallback', ?, ?, '{}'
                     )
                     """,
-                    (drift_id, session_key, job_id, timestamp, timestamp),
+                    (drift_id, session_key, task_id, timestamp, timestamp),
                 )
                 connection.execute(
                     """
@@ -343,7 +338,7 @@ class ProactiveRepository:
         self,
         *,
         session_key: str,
-        job_id: str,
+        task_id: str,
         skill_name: str,
         outcome: str,
         result: dict[str, str],
@@ -360,7 +355,7 @@ class ProactiveRepository:
                 UPDATE drift_history
                 SET skill_name = ?, outcome = ?, reason = ?,
                     updated_at = ?, trace_json = ?
-                WHERE session_key = ? AND job_id = ? AND outcome = 'running'
+                WHERE session_key = ? AND task_id = ? AND outcome = 'running'
                 """,
                 (
                     skill_name,
@@ -369,11 +364,11 @@ class ProactiveRepository:
                     timestamp,
                     trace,
                     session_key,
-                    job_id,
+                    task_id,
                 ),
             ).rowcount
         if changed != 1:
-            raise KeyError(f"找不到运行中的 Drift: {session_key}/{job_id}")
+            raise KeyError(f"找不到运行中的 Drift: {session_key}/{task_id}")
 
     def _list_audit(
         self, table: str, session_key: str, order_column: str
@@ -404,11 +399,6 @@ class ProactiveRepository:
         selected = tuple((str(source), str(event)) for source, event in source_events)
         if not selected:
             raise ValueError("Decision 必须至少引用一个 Source Event")
-        effect_operation_id = (
-            stable_proactive_effect_operation_id(decision_id)
-            if action in {"share", "alert", "send_event"}
-            else None
-        )
         normalized_ack_ttls = {str(key): int(value) for key, value in (ack_ttl_hours or {}).items()}
         selected_keys = {f"{source}:{event}" for source, event in selected}
         if set(normalized_ack_ttls) - selected_keys:
@@ -449,9 +439,9 @@ class ProactiveRepository:
                     """
                     INSERT OR IGNORE INTO proactive_decisions(
                         decision_id, session_key, trigger_kind, action,
-                        source_events_json, effect_operation_id, activity_version,
+                        source_events_json, activity_version,
                         state, reason, decided_at, decision_payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                     """,
                     (
                         decision_id,
@@ -459,7 +449,6 @@ class ProactiveRepository:
                         trigger_kind,
                         action,
                         serialized_events,
-                        effect_operation_id,
                         activity_version,
                         reason,
                         _utc_iso(decided_at),
@@ -469,7 +458,7 @@ class ProactiveRepository:
                 row = connection.execute(
                     """
                     SELECT session_key, trigger_kind, action, source_events_json,
-                           effect_operation_id, activity_version, state,
+                           activity_version, state,
                            decision_payload_json
                     FROM proactive_decisions WHERE decision_id = ?
                     """,
@@ -480,14 +469,13 @@ class ProactiveRepository:
                     trigger_kind,
                     action,
                     serialized_events,
-                    effect_operation_id,
                     activity_version,
                 )
-                if row is None or tuple(row[:6]) != expected:
+                if row is None or tuple(row[:5]) != expected:
                     raise ValueError("decision_id 已被不同参数占用")
-                if str(row[7]) != decision_payload:
+                if str(row[6]) != decision_payload:
                     raise ValueError("decision_id 已被不同恢复 Payload 占用")
-                state = str(row[6])
+                state = str(row[5])
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")
@@ -498,7 +486,6 @@ class ProactiveRepository:
             trigger_kind=trigger_kind,
             action=action,
             source_events=selected,
-            effect_operation_id=effect_operation_id,
             activity_version=activity_version,
             state=state,
             message=str(message),
@@ -607,19 +594,17 @@ class ProactiveRepository:
     def commit_skip(self, decision_id: str, *, committed_at: datetime) -> None:
         decision = self._load_decision(decision_id)
         if decision.action not in {"skip", "skip_event"}:
-            raise ValueError(f"{decision.action} 决策必须等待 Effect confirmed，不能按 skip 提交")
+            raise ValueError(f"{decision.action} 发送决策不能按 skip 提交")
         self._commit_decision(decision_id, committed_at=committed_at)
 
     def finalize_confirmed(
         self,
         decision_id: str,
         *,
-        is_effect_confirmed: Callable[[str], bool],
         committed_at: datetime,
     ) -> bool:
         decision = self._load_decision(decision_id)
-        operation_id = decision.effect_operation_id
-        if operation_id is None or not is_effect_confirmed(operation_id):
+        if decision.action not in {"share", "alert", "send_event"}:
             return False
         self._commit_decision(decision_id, committed_at=committed_at)
         return True
@@ -635,7 +620,7 @@ class ProactiveRepository:
             row = connection.execute(
                 """
                 SELECT decision_id, session_key, trigger_kind, action,
-                       source_events_json, effect_operation_id, activity_version, state,
+                       source_events_json, activity_version, state,
                        decision_payload_json
                 FROM proactive_decisions WHERE decision_id = ?
                 """,
@@ -657,7 +642,7 @@ class ProactiveRepository:
             row = connection.execute(
                 """
                 SELECT decision_id, session_key, trigger_kind, action,
-                       source_events_json, effect_operation_id, activity_version, state,
+                       source_events_json, activity_version, state,
                        decision_payload_json
                 FROM proactive_decisions
                 WHERE session_key = ? AND state = 'pending'
@@ -1007,16 +992,15 @@ def _stored_context(row: Sequence[object]) -> StoredContext:
 
 
 def _proactive_decision(row: Sequence[object]) -> ProactiveDecisionRecord:
-    payload = json.loads(str(row[8]))
+    payload = json.loads(str(row[7]))
     return ProactiveDecisionRecord(
         decision_id=str(row[0]),
         session_key=str(row[1]),
         trigger_kind=str(row[2]),
         action=str(row[3]),
         source_events=tuple(tuple(item) for item in json.loads(str(row[4]))),
-        effect_operation_id=None if row[5] is None else str(row[5]),
-        activity_version=int(str(row[6])),
-        state=str(row[7]),
+        activity_version=int(str(row[5])),
+        state=str(row[6]),
         message=str(payload.get("message") or ""),
         evidence=tuple(str(item) for item in payload.get("evidence") or ()),
         reason=str(payload.get("reason") or ""),
@@ -1030,5 +1014,4 @@ __all__ = [
     "StoredContext",
     "ProactiveDecisionRecord",
     "ProactiveRepository",
-    "stable_proactive_effect_operation_id",
 ]

@@ -1,4 +1,4 @@
-"""旧原型 AgentTick 主动业务链的领域编排；外部发送仍由 Effect/Outbox 执行。"""
+"""AgentTick 主动业务链的领域编排。"""
 
 from __future__ import annotations
 
@@ -33,10 +33,9 @@ class ProactiveOutcome:
     message: str = ""
     reason: str = ""
     decision_id: str | None = None
-    effect_operation_id: str | None = None
     evidence_ids: tuple[str, ...] = ()
     source_events: tuple[tuple[str, str], ...] = ()
-    drift_job_id: str | None = None
+    drift_task_id: str | None = None
     decided_at: datetime | None = None
     delivery_key: str = ""
 
@@ -116,7 +115,7 @@ class ProactiveService:
 
     async def execute(
         self,
-        job_id: str,
+        task_id: str,
         session_key: str,
         chat_id: str,
         activity_version: int,
@@ -192,7 +191,7 @@ class ProactiveService:
             self._commit_context_snapshot(
                 session_key, contexts, activity_version=activity_version, now=now
             )
-            return self._handle_drift(job_id, session_key, now)
+            return self._handle_drift(task_id, session_key, now)
 
         self._assert_current()
         result = await self._agent_tick.run(
@@ -456,10 +455,8 @@ class ProactiveService:
         committed_at = confirmed_at or outcome.decided_at
         if committed_at is None:
             raise ValueError("confirmed outcome 缺少确认时间")
-        operation_id = outcome.effect_operation_id
         finalized = self._repository.finalize_confirmed(
             outcome.decision_id,
-            is_effect_confirmed=lambda value: operation_id is not None and value == operation_id,
             committed_at=committed_at,
         )
         if finalized and outcome.delivery_key:
@@ -516,7 +513,7 @@ class ProactiveService:
         return ""
 
     def _handle_drift(
-        self, job_id: str, session_key: str, now: datetime
+        self, task_id: str, session_key: str, now: datetime
     ) -> ProactiveOutcome:
         if not self._drift_enabled:
             return ProactiveOutcome("quiet", session_key=session_key, reason="drift_disabled")
@@ -527,10 +524,10 @@ class ProactiveService:
             return ProactiveOutcome("quiet", session_key=session_key, reason="drift_cooldown")
         self._assert_current()
         self._repository.mark_drift_started(
-            session_key=session_key, job_id=job_id, started_at=now
+            session_key=session_key, task_id=task_id, started_at=now
         )
         return ProactiveOutcome(
-            "drift", session_key=session_key, drift_job_id=job_id, decided_at=now
+            "drift", session_key=session_key, drift_task_id=task_id, decided_at=now
         )
 
     @staticmethod
@@ -548,7 +545,6 @@ class ProactiveService:
             message=result.message,
             reason=result.reason,
             decision_id=stored.decision_id,
-            effect_operation_id=stored.effect_operation_id,
             evidence_ids=result.cited_item_ids,
             source_events=stored.source_events,
             decided_at=now,
@@ -566,7 +562,6 @@ class ProactiveService:
                 message=decision.message,
                 reason=decision.reason,
                 decision_id=decision.decision_id,
-                effect_operation_id=decision.effect_operation_id,
                 evidence_ids=decision.evidence,
                 source_events=decision.source_events,
                 decided_at=now,

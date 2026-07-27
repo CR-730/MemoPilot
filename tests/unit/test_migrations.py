@@ -21,20 +21,12 @@ EXPECTED_TABLES = {
         "inbound_events",
         "sessions",
         "session_activity",
-        "agent_jobs",
-        "runs",
-        "run_attempts",
-        "steps",
         "session_fences",
-        "outbox_events",
-        "outbound_effects",
         "scheduled_tasks",
         "scheduled_executions",
         "consolidation_manifests",
         "messages",
         "session_identities",
-        "session_interrupts",
-        "turn_interrupt_snapshots",
     },
     DatabaseKind.MEMORY: {
         "memory_items",
@@ -72,9 +64,9 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
 
     assert report.from_version == 0
     expected_version = {
-        DatabaseKind.OPERATIONAL: 5,
+        DatabaseKind.OPERATIONAL: 8,
         DatabaseKind.MEMORY: 3,
-        DatabaseKind.PROACTIVE: 7,
+        DatabaseKind.PROACTIVE: 9,
     }[kind]
     assert report.to_version == expected_version
     assert report.backup_path is None
@@ -91,7 +83,7 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
-def test_operational_v1_upgrades_to_v5_without_losing_existing_rows(tmp_path: Path) -> None:
+def test_operational_v1_upgrades_without_losing_existing_rows(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
     v1_sql = files("memopilot.persistence.schema").joinpath("operational_v1.sql").read_text("utf-8")
     with sqlite3.connect(database) as connection:
@@ -105,17 +97,16 @@ def test_operational_v1_upgrades_to_v5_without_losing_existing_rows(tmp_path: Pa
     report = migrate_database(database, DatabaseKind.OPERATIONAL)
 
     assert report.from_version == 1
-    assert report.to_version == 5
-    assert report.applied_versions == (2, 3, 4, 5)
+    assert report.to_version == 8
+    assert report.applied_versions == (2, 3, 4, 5, 6, 7, 8)
     assert report.backup_path is not None
     with connect_database(database) as connection:
         session = connection.execute(
             "SELECT chat_id FROM sessions WHERE session_key = 'feishu:chat-1'"
         ).fetchone()
-        effect_columns = {
-            str(row[1])
-            for row in connection.execute("PRAGMA table_info(outbound_effects)").fetchall()
-        }
+        effect_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbound_effects'"
+        ).fetchone()
         session_columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
         }
@@ -123,18 +114,12 @@ def test_operational_v1_upgrades_to_v5_without_losing_existing_rows(tmp_path: Pa
             str(row[1]) for row in connection.execute("PRAGMA table_info(messages)").fetchall()
         }
     assert session is not None and session[0] == "chat-1"
-    assert {
-        "channel",
-        "chat_id",
-        "payload_json",
-        "last_attempt_at",
-        "cancel_on_activity",
-    } <= effect_columns
+    assert effect_table is None
     assert "last_consolidated_position" in session_columns
     assert "session_position" in message_columns
 
 
-def test_proactive_v1_upgrades_to_v7_without_losing_reservoir_rows(tmp_path: Path) -> None:
+def test_proactive_v1_upgrades_without_losing_reservoir_rows(tmp_path: Path) -> None:
     database = tmp_path / "proactive.db"
     v1_sql = files("memopilot.persistence.schema").joinpath("proactive_v1.sql").read_text("utf-8")
     with sqlite3.connect(database) as connection:
@@ -152,8 +137,8 @@ def test_proactive_v1_upgrades_to_v7_without_losing_reservoir_rows(tmp_path: Pat
     report = migrate_database(database, DatabaseKind.PROACTIVE)
 
     assert report.from_version == 1
-    assert report.to_version == 7
-    assert report.applied_versions == (2, 3, 4, 5, 6, 7)
+    assert report.to_version == 9
+    assert report.applied_versions == (2, 3, 4, 5, 6, 7, 8, 9)
     with connect_database(database) as connection:
         event = connection.execute(
             "SELECT source_event_id FROM source_events WHERE reservoir_id = 'r1'"
@@ -178,12 +163,13 @@ def test_proactive_v1_upgrades_to_v7_without_losing_reservoir_rows(tmp_path: Pat
     assert event is not None and event[0] == "e1"
     assert state_table is not None
     assert "decision_payload_json" in decision_columns
+    assert "effect_operation_id" not in decision_columns
     assert "ttl_hours" in ack_columns
     assert content_scores is None
     assert history_table is not None
 
 
-def test_operational_v4_upgrades_to_v5_without_losing_existing_rows(tmp_path: Path) -> None:
+def test_operational_v4_upgrades_without_losing_existing_rows(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
     with sqlite3.connect(database) as connection:
         for version in range(1, 5):
@@ -202,8 +188,8 @@ def test_operational_v4_upgrades_to_v5_without_losing_existing_rows(tmp_path: Pa
     report = migrate_database(database, DatabaseKind.OPERATIONAL)
 
     assert report.from_version == 4
-    assert report.to_version == 5
-    assert report.applied_versions == (5,)
+    assert report.to_version == 8
+    assert report.applied_versions == (5, 6, 7, 8)
     with connect_database(database) as connection:
         session = connection.execute(
             "SELECT chat_id, last_consolidated_position FROM sessions "
@@ -324,3 +310,13 @@ def test_busy_retry_is_bounded_and_only_retries_lock_errors() -> None:
             max_attempts=3,
             sleep=delays.append,
         )
+
+
+def test_connect_database_context_closes_connection(tmp_path: Path) -> None:
+    database = tmp_path / "closed.db"
+
+    with connect_database(database) as connection:
+        connection.execute("CREATE TABLE sample(value TEXT)")
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")

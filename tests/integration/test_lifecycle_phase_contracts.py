@@ -169,9 +169,8 @@ async def test_all_seven_prototype_phase_frames_flow_through_real_runtime(
         )
     )
 
-    assert [item.content for item in provider.calls[0] if item.role == "user"][-1] == (
-        "rewritten question"
-    )
+    rewritten = [item.content for item in provider.calls[0] if item.role == "user"][-1]
+    assert (rewritten or "").endswith("rewritten question")
     assert "outer hint" in (provider.calls[0][0].content or "")
     assert "prompt plugin" in (provider.calls[0][0].content or "")
     assert any("step hint" in (item.content or "") for item in provider.calls[0])

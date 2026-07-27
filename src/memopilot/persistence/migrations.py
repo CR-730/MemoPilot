@@ -10,7 +10,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.resources import files
 from pathlib import Path
-from typing import TYPE_CHECKING
+from types import TracebackType
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from memopilot.config import MemoPilotSettings
@@ -37,6 +38,21 @@ class Migration:
     sql: str
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """让数据库上下文同时管理事务和连接生命周期。"""
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        try:
+            return super().__exit__(exc_type, exc, traceback)
+        finally:
+            self.close()
+
+
 @dataclass(frozen=True, slots=True)
 class MigrationReport:
     database: Path
@@ -60,6 +76,7 @@ def connect_database(
         timeout=busy_timeout_seconds,
         isolation_level=None,
         check_same_thread=False,
+        factory=_ClosingConnection,
     )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -189,9 +206,9 @@ def _migrate_proactive_database(settings: MemoPilotSettings) -> MigrationReport:
 def _load_migrations(kind: DatabaseKind) -> tuple[Migration, ...]:
     schema = files("memopilot.persistence.schema")
     versions = {
-        DatabaseKind.OPERATIONAL: (1, 2, 3, 4, 5),
+        DatabaseKind.OPERATIONAL: (1, 2, 3, 4, 5, 6, 7, 8),
         DatabaseKind.MEMORY: (1, 2, 3),
-        DatabaseKind.PROACTIVE: (1, 2, 3, 4, 5, 6, 7),
+        DatabaseKind.PROACTIVE: (1, 2, 3, 4, 5, 6, 7, 8, 9),
     }[kind]
     return tuple(
         Migration(
