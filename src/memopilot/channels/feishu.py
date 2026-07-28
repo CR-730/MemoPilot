@@ -23,9 +23,9 @@ import httpx
 
 from memopilot.channels.base import AttachmentStore, MessageDeduper, SessionIdentityIndex
 from memopilot.channels.contracts import (
+    InboundHandler,
     InboundMessage,
-    InterruptController,
-    MessageBus,
+    InterruptAcknowledgement,
     SendReceipt,
 )
 
@@ -67,11 +67,10 @@ class FeishuChannel:
         *,
         app_id: str,
         app_secret: str,
-        bus: MessageBus,
+        inbound_handler: InboundHandler,
         identity_index: SessionIdentityIndex,
         attachment_store: AttachmentStore,
         allow_from: tuple[str, ...] = (),
-        interrupt_controller: InterruptController | None = None,
         channel_name: str = "feishu",
         client: httpx.AsyncClient | None = None,
         ws_event_timeout_seconds: float = 30,
@@ -81,11 +80,10 @@ class FeishuChannel:
             raise ValueError("飞书长连接事件与停止超时必须大于 0")
         self._app_id = app_id
         self._app_secret = app_secret
-        self._bus = bus
+        self._inbound_handler = inbound_handler
         self._identity_index = identity_index
         self._attachments = attachment_store
         self._allow_from = {str(value) for value in allow_from}
-        self._interrupt_controller = interrupt_controller
         self._channel = channel_name
         self._client = client or httpx.AsyncClient(timeout=30.0)
         self._owns_client = client is None
@@ -95,32 +93,16 @@ class FeishuChannel:
         self._ws_client: Any | None = None
         self._ws_thread: threading.Thread | None = None
         self._ws_stop_requested = threading.Event()
-        self._ws_ready = threading.Event()
         self._ws_receive_started = threading.Event()
         self._ws_receive_stopped = threading.Event()
         self._ws_ping_task: asyncio.Task[Any] | None = None
         self._ws_cache_task: asyncio.Task[Any] | None = None
-        self._ws_start_error: BaseException | None = None
         self._ws_event_timeout_seconds = ws_event_timeout_seconds
         self._ws_stop_timeout_seconds = ws_stop_timeout_seconds
-
-    def set_interrupt_controller(self, controller: InterruptController | None) -> None:
-        self._interrupt_controller = controller
 
     async def start(self) -> None:
         self._identity_index.rebuild()
         self._start_ws_client()
-        ready = await asyncio.to_thread(
-            self._ws_ready.wait,
-            self._ws_stop_timeout_seconds,
-        )
-        if not ready:
-            await self._stop_ws_client()
-            raise TimeoutError("飞书长连接初始化超时")
-        if self._ws_start_error is not None:
-            error = self._ws_start_error
-            await self._stop_ws_client()
-            raise RuntimeError("飞书长连接初始化失败") from error
 
     async def stop(self) -> None:
         try:
@@ -202,17 +184,16 @@ class FeishuChannel:
             identities={key: metadata[key] for key in ("open_id", "user_id", "union_id")},
         )
         if text.strip() == "/stop":
-            if self._interrupt_controller is None:
-                return {"ok": True, "ignored": "interrupt_unavailable"}
-            acknowledgement = await self._interrupt_controller.request_interrupt(inbound)
-            await self.send(
-                chat_id,
-                acknowledgement.message,
-                provider_uuid=acknowledgement.provider_uuid,
-            )
+            acknowledgement = await self._inbound_handler(inbound)
+            if isinstance(acknowledgement, InterruptAcknowledgement):
+                await self.send(
+                    chat_id,
+                    acknowledgement.message,
+                    provider_uuid=acknowledgement.provider_uuid,
+                )
             return {"ok": True}
 
-        await self._bus.publish_inbound(inbound)
+        await self._inbound_handler(inbound)
         return {"ok": True}
 
     async def _extract_message_media(self, message: dict[str, Any]) -> tuple[str, ...]:
@@ -364,12 +345,10 @@ class FeishuChannel:
         if self._ws_thread is not None and self._ws_thread.is_alive():
             return
         self._ws_stop_requested.clear()
-        self._ws_ready.clear()
         self._ws_receive_started.clear()
         self._ws_receive_stopped.clear()
         self._ws_ping_task = None
         self._ws_cache_task = None
-        self._ws_start_error = None
         self._main_loop = asyncio.get_running_loop()
         self._ws_thread = threading.Thread(
             target=self._run_ws_client,
@@ -405,19 +384,16 @@ class FeishuChannel:
             self._guard_receive_loop(client)
             self._guard_ping_loop(client)
 
-            async def connect_and_mark_ready() -> None:
+            async def connect_with_stop_guard() -> None:
                 await original_connect()
                 if self._ws_stop_requested.is_set():
                     client._auto_reconnect = False
                     raise RuntimeError("飞书长连接在首次握手期间收到停止请求")
                 client._auto_reconnect = True
-                self._ws_ready.set()
 
-            client._connect = connect_and_mark_ready
+            client._connect = connect_with_stop_guard
         except Exception as exc:
-            self._ws_start_error = exc
             logger.warning("[feishu] long connection initialization failed: %s", exc)
-            self._ws_ready.set()
             return
         if self._ws_stop_requested.is_set():
             return
@@ -429,8 +405,6 @@ class FeishuChannel:
         except Exception as exc:
             if self._ws_stop_requested.is_set():
                 return
-            self._ws_start_error = exc
-            self._ws_ready.set()
             logger.warning("[feishu] long connection exited: %s", exc)
         finally:
             sdk_logger.removeFilter(shutdown_filter)

@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from memopilot.channels.base import AttachmentStore, SessionIdentityIndex
-from memopilot.channels.contracts import InterruptAcknowledgement, MessageBus
+from memopilot.channels.contracts import InterruptAcknowledgement
 from memopilot.channels.feishu import FeishuApiError, FeishuChannel
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.tasks.operational import OperationalRepository
@@ -52,13 +52,42 @@ def _event(
     }
 
 
-def _channel(tmp_path: Path, **overrides: object) -> tuple[FeishuChannel, MessageBus]:
-    bus = MessageBus()
+class _InboundCollector:
+    def __init__(self) -> None:
+        self.messages: asyncio.Queue[object] = asyncio.Queue()
+        self.subscribers: list[object] = []
+
+    async def __call__(self, message: object) -> object:
+        for subscriber in self.subscribers:
+            await subscriber(message)  # type: ignore[operator]
+        await self.messages.put(message)
+        return object()
+
+    async def consume_inbound(self) -> object:
+        return await self.messages.get()
+
+    def subscribe_inbound(self, callback: object) -> None:
+        self.subscribers.append(callback)
+
+    @property
+    def inbound_size(self) -> int:
+        return self.messages.qsize()
+
+
+def _channel(tmp_path: Path, **overrides: object) -> tuple[FeishuChannel, _InboundCollector]:
+    bus = _InboundCollector()
+    interrupt = overrides.pop("interrupt_controller", None)
+    if interrupt is not None:
+        async def handle(message: object) -> object:
+            return await interrupt.request_interrupt(message)  # type: ignore[union-attr]
+        inbound_handler = handle
+    else:
+        inbound_handler = bus
     repository = _repository(tmp_path)
     values: dict[str, object] = {
         "app_id": "cli_test",
         "app_secret": "secret",
-        "bus": bus,
+        "inbound_handler": inbound_handler,
         "identity_index": SessionIdentityIndex(repository, channel="feishu"),
         "attachment_store": AttachmentStore(tmp_path / "uploads"),
         "allow_from": ("u_allowed",),
@@ -258,7 +287,6 @@ async def test_stop_during_ws_initialization_prevents_late_connection(tmp_path: 
 
     def delayed_start() -> None:
         initializing.set()
-        channel._ws_ready.set()
         threading.Event().wait(0.05)
         stop_requested = getattr(channel, "_ws_stop_requested", threading.Event())
         if not stop_requested.is_set():
@@ -275,52 +303,22 @@ async def test_stop_during_ws_initialization_prevents_late_connection(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_ws_initialization_failure_is_propagated_from_start(tmp_path: Path) -> None:
-    channel, _ = _channel(tmp_path)
-
-    def failed_start() -> None:
-        channel._ws_start_error = RuntimeError("sdk init failed")
-        channel._ws_ready.set()
-
-    channel._run_ws_client = failed_start  # type: ignore[method-assign]
-
-    with pytest.raises(RuntimeError, match="飞书长连接初始化失败"):
-        await channel.start()
-
-
-@pytest.mark.asyncio
-async def test_ws_handshake_failure_is_propagated_from_start(
+async def test_start_does_not_fail_while_long_connection_is_still_handshaking(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    channel, _ = _channel(tmp_path)
+    channel, _ = _channel(tmp_path, ws_stop_timeout_seconds=0.02)
+    started = threading.Event()
 
-    class _Builder:
-        def register_p2_im_message_receive_v1(self, callback: object) -> _Builder:
-            return self
+    def waiting_start() -> None:
+        started.set()
+        channel._ws_stop_requested.wait(1)
 
-        def build(self) -> object:
-            return object()
+    channel._run_ws_client = waiting_start  # type: ignore[method-assign]
 
-    class _Client:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            self._auto_reconnect = bool(kwargs["auto_reconnect"])
+    await channel.start()
+    assert await asyncio.to_thread(started.wait, 1)
 
-        async def _connect(self) -> None:
-            raise RuntimeError("invalid credentials")
-
-        def start(self) -> None:
-            asyncio.run(self._connect())
-
-    fake_lark = SimpleNamespace(
-        EventDispatcherHandler=SimpleNamespace(builder=lambda *_: _Builder()),
-        LogLevel=SimpleNamespace(WARNING="warning"),
-        ws=SimpleNamespace(Client=_Client),
-    )
-    monkeypatch.setitem(sys.modules, "lark_oapi", fake_lark)
-
-    with pytest.raises(RuntimeError, match="飞书长连接初始化失败"):
-        await channel.start()
+    await channel.stop()
 
 
 def test_ws_sdk_uses_log_level_that_does_not_print_connection_url(
@@ -399,7 +397,6 @@ def test_expected_sdk_shutdown_does_not_become_start_error_or_warning(
     with caplog.at_level(logging.WARNING, logger="memopilot.channels.feishu"):
         channel._run_ws_client()
 
-    assert channel._ws_start_error is None
     assert "long connection exited" not in caplog.text
 
 
