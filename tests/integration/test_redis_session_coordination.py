@@ -19,38 +19,15 @@ async def redis_client() -> AsyncIterator[Redis]:
 
 
 @pytest.mark.asyncio
-async def test_user_turn_preempts_background_work_and_releases_after_reply(
+async def test_stop_signal_uses_public_stable_key_and_can_be_cleared(
     redis_client: Redis,
 ) -> None:
     namespace = f"memopilot:test:{uuid4().hex}"
     coordinator = RedisSessionCoordinator(redis_client, namespace=namespace)
     session_key = "feishu:chat-1"
-
-    await coordinator.begin_user_turn(session_key, turn_id="turn-1")
-    assert await coordinator.user_turn_active(session_key) is True
 
     await coordinator.request_background_stop(session_key, reason="user_message")
     assert await coordinator.background_stop_requested(session_key) is True
-
-    await coordinator.end_user_turn(session_key, turn_id="turn-1")
-    assert await coordinator.user_turn_active(session_key) is False
+    assert await redis_client.exists(coordinator.stop_key(session_key))
     await coordinator.clear_background_stop(session_key)
     assert await coordinator.background_stop_requested(session_key) is False
-
-
-@pytest.mark.asyncio
-async def test_session_busy_covers_user_turn_and_background_lease(
-    redis_client: Redis,
-) -> None:
-    namespace = f"memopilot:test:{uuid4().hex}"
-    coordinator = RedisSessionCoordinator(redis_client, namespace=namespace)
-    session_key = "feishu:chat-1"
-
-    assert await coordinator.session_busy(session_key) is False
-    await coordinator.begin_user_turn(session_key, turn_id="turn-1")
-    assert await coordinator.session_busy(session_key) is True
-    await coordinator.end_user_turn(session_key, turn_id="turn-1")
-
-    digest = coordinator._digest(session_key)
-    await redis_client.set(f"{namespace}:lease:{digest}", "runner|epoch|1")
-    assert await coordinator.session_busy(session_key) is True

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
+from uuid import NAMESPACE_URL, uuid5
 
-from memopilot.bus.events import OutboundMessage
 from memopilot.runtime.common_tools.message_push import MessagePushTool
+
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 
 @dataclass
@@ -22,24 +24,8 @@ class OutboundPort(Protocol):
     async def dispatch(self, outbound: OutboundDispatch) -> bool: ...
 
 
-class BusOutboundPort:
-    def __init__(self, bus: Any) -> None:
-        self._bus = bus
-
-    async def dispatch(self, outbound: OutboundDispatch) -> bool:
-        maybe = self._bus.publish_outbound(
-            OutboundMessage(
-                channel=outbound.channel,
-                chat_id=outbound.chat_id,
-                content=outbound.content,
-                thinking=outbound.thinking,
-                metadata=dict(outbound.metadata or {}),
-                media=list(outbound.media or []),
-            )
-        )
-        if inspect.isawaitable(maybe):
-            await maybe
-        return True
+class DeliveryError(RuntimeError):
+    pass
 
 
 class PushToolOutboundPort:
@@ -49,16 +35,47 @@ class PushToolOutboundPort:
         self._message_push = message_push
 
     async def dispatch(self, outbound: OutboundDispatch) -> bool:
-        result = await self._message_push.execute(
-            channel=outbound.channel,
-            chat_id=outbound.chat_id,
-            message=outbound.content,
-        )
-        return "已发送" in result
+        results: list[str] = []
+        if outbound.content:
+            results.append(
+                await self._message_push.execute(
+                    channel=outbound.channel,
+                    chat_id=outbound.chat_id,
+                    message=outbound.content,
+                    provider_uuid=outbound.metadata.get("provider_uuid"),
+                )
+            )
+        base_uuid = str(outbound.metadata.get("provider_uuid") or "")
+        if not base_uuid:
+            base_uuid = "\0".join(
+                (
+                    outbound.channel,
+                    outbound.chat_id,
+                    outbound.content,
+                    *outbound.media,
+                )
+            )
+        for index, media in enumerate(outbound.media):
+            field = "image" if Path(media).suffix.lower() in _IMAGE_SUFFIXES else "file"
+            media_uuid = str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"memopilot:media:{base_uuid}:{index}:{media}",
+                )
+            )
+            results.append(
+                await self._message_push.execute(
+                    channel=outbound.channel,
+                    chat_id=outbound.chat_id,
+                    provider_uuid=media_uuid,
+                    **{field: media},
+                )
+            )
+        return bool(results) and all("已发送" in result for result in results)
 
 
 __all__ = [
-    "BusOutboundPort",
+    "DeliveryError",
     "OutboundDispatch",
     "OutboundPort",
     "PushToolOutboundPort",

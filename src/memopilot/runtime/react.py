@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from memopilot.extensions.events import EventBus
@@ -44,6 +44,8 @@ class ReActResult:
     exit_reason: str
     infrastructure_error: str | None = None
     thinking: str | None = None
+    prompt_tokens: int = 0
+    prompt_cache_hit_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +155,7 @@ class ReActEngine:
         safe_progress = _BestEffortProgress(progress) if progress is not None else None
         input_token_samples: list[int] = []
         prompt_tokens = 0
+        prompt_cache_hit_tokens = 0
         completion_tokens = 0
 
         for iteration in range(1, self._max_iterations + 1):
@@ -177,10 +180,11 @@ class ReActEngine:
                     iterations=iteration,
                     tool_chain=tuple(records),
                     exit_reason="early_stop",
-                ), self._session_key, input_token_samples, prompt_tokens, completion_tokens)
+                ), self._session_key, input_token_samples, prompt_tokens,
+                    prompt_cache_hit_tokens, completion_tokens)
             if self._assert_current is not None:
                 self._assert_current()
-            input_tokens = _estimate_messages_tokens(working)
+            input_tokens = estimate_messages_tokens(working)
             input_token_samples.append(input_tokens)
             logger.info(
                 "[LLM调用] 第%d轮，可见工具=%s input_tokens~=%d",
@@ -207,9 +211,11 @@ class ReActEngine:
                     error=exc,
                     input_token_samples=input_token_samples,
                     prompt_tokens=prompt_tokens,
+                    prompt_cache_hit_tokens=prompt_cache_hit_tokens,
                     completion_tokens=completion_tokens,
                 )
             prompt_tokens += response.prompt_tokens or 0
+            prompt_cache_hit_tokens += response.prompt_cache_hit_tokens or 0
             completion_tokens += response.completion_tokens or 0
             if response.tool_calls:
                 logger.info(
@@ -245,7 +251,8 @@ class ReActEngine:
                         tool_chain=tuple(records),
                         exit_reason="completed",
                         thinking=response.thinking,
-                    ), self._session_key, input_token_samples, prompt_tokens, completion_tokens)
+                    ), self._session_key, input_token_samples, prompt_tokens,
+                        prompt_cache_hit_tokens, completion_tokens)
                 return await self._finalize(
                     working,
                     records,
@@ -253,6 +260,7 @@ class ReActEngine:
                     exit_reason="empty_response",
                     input_token_samples=input_token_samples,
                     prompt_tokens=prompt_tokens,
+                    prompt_cache_hit_tokens=prompt_cache_hit_tokens,
                     completion_tokens=completion_tokens,
                 )
 
@@ -283,7 +291,8 @@ class ReActEngine:
                     tool_chain=tuple(records),
                     exit_reason=reason,
                     thinking=response.thinking,
-                ), self._session_key, input_token_samples, prompt_tokens, completion_tokens)
+                ), self._session_key, input_token_samples, prompt_tokens,
+                    prompt_cache_hit_tokens, completion_tokens)
 
         return await self._finalize(
             working,
@@ -292,6 +301,7 @@ class ReActEngine:
             exit_reason="max_iterations",
             input_token_samples=input_token_samples,
             prompt_tokens=prompt_tokens,
+            prompt_cache_hit_tokens=prompt_cache_hit_tokens,
             completion_tokens=completion_tokens,
         )
 
@@ -485,6 +495,7 @@ class ReActEngine:
         exit_reason: str,
         input_token_samples: list[int],
         prompt_tokens: int,
+        prompt_cache_hit_tokens: int,
         completion_tokens: int,
     ) -> ReActResult:
         working.append(ChatMessage.system(_SUMMARY_PROMPT))
@@ -509,12 +520,14 @@ class ReActEngine:
                 iterations=iterations,
                 tool_chain=tuple(records),
                 exit_reason="early_stop",
-            ), self._session_key, input_token_samples, prompt_tokens, completion_tokens)
-        input_token_samples.append(_estimate_messages_tokens(working))
+            ), self._session_key, input_token_samples, prompt_tokens,
+                prompt_cache_hit_tokens, completion_tokens)
+        input_token_samples.append(estimate_messages_tokens(working))
         try:
             response = await self._provider.complete(messages=working, tools=())
             reply = (response.content or "").strip()
             prompt_tokens += response.prompt_tokens or 0
+            prompt_cache_hit_tokens += response.prompt_cache_hit_tokens or 0
             completion_tokens += response.completion_tokens or 0
         except Exception as exc:
             reply = "模型暂时无法继续总结；已保留当前工具结果，请稍后重试。"
@@ -543,7 +556,8 @@ class ReActEngine:
             exit_reason="provider_error" if infrastructure_error else exit_reason,
             thinking=final_thinking,
             infrastructure_error=infrastructure_error,
-        ), self._session_key, input_token_samples, prompt_tokens, completion_tokens)
+        ), self._session_key, input_token_samples, prompt_tokens,
+            prompt_cache_hit_tokens, completion_tokens)
 
     async def _provider_failure(
         self,
@@ -554,6 +568,7 @@ class ReActEngine:
         error: Exception,
         input_token_samples: list[int],
         prompt_tokens: int,
+        prompt_cache_hit_tokens: int,
         completion_tokens: int,
     ) -> ReActResult:
         reply = "模型服务暂时不可用，当前请求未能完成，请稍后重试。"
@@ -581,7 +596,8 @@ class ReActEngine:
             tool_chain=tuple(records),
             exit_reason="provider_error",
             infrastructure_error=type(error).__name__,
-        ), self._session_key, input_token_samples, prompt_tokens, completion_tokens)
+        ), self._session_key, input_token_samples, prompt_tokens,
+            prompt_cache_hit_tokens, completion_tokens)
 
 
 def _multimodal_tool_message(
@@ -604,7 +620,7 @@ def _multimodal_tool_message(
     return ChatMessage.user_blocks(content)
 
 
-def _estimate_messages_tokens(messages: Sequence[ChatMessage]) -> int:
+def estimate_messages_tokens(messages: Sequence[ChatMessage]) -> int:
     if not messages:
         return 0
     payload = json.dumps(
@@ -647,6 +663,7 @@ def _logged_result(
     session_key: str,
     input_token_samples: Sequence[int],
     prompt_tokens: int,
+    prompt_cache_hit_tokens: int,
     completion_tokens: int,
 ) -> ReActResult:
     _log_react_context(
@@ -655,7 +672,11 @@ def _logged_result(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
     )
-    return result
+    return replace(
+        result,
+        prompt_tokens=prompt_tokens,
+        prompt_cache_hit_tokens=prompt_cache_hit_tokens,
+    )
 
 
 class _BestEffortProgress:
@@ -710,4 +731,5 @@ __all__ = [
     "ReActProgressObserver",
     "ReActResult",
     "ToolCallRecord",
+    "estimate_messages_tokens",
 ]

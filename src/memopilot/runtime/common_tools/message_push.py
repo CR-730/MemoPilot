@@ -53,16 +53,16 @@ class MessagePushTool(Tool):
     def register_channel(
         self,
         channel: str,
-        text: Callable[[str, str], Awaitable[None]] | None = None,
+        text: Callable[..., Awaitable[None]] | None = None,
         stream_text: Callable[[str, str], Awaitable[None]] | None = None,
-        file: Callable[[str, str, str | None], Awaitable[None]] | None = None,
-        image: Callable[[str, str], Awaitable[None]] | None = None,
+        file: Callable[..., Awaitable[None]] | None = None,
+        image: Callable[..., Awaitable[None]] | None = None,
     ) -> None:
         """注册渠道的各类 sender。
         - text(chat_id, message)
         - stream_text(chat_id, message)
-        - file(chat_id, file_path, name=None)
-        - image(chat_id, image_path_or_url)
+        - file(chat_id, file_path, name=None, provider_uuid=...)
+        - image(chat_id, image_path_or_url, provider_uuid=...)
         """
         self._senders[channel] = {}
         if text:
@@ -83,6 +83,7 @@ class MessagePushTool(Tool):
         message: str | None = kwargs.get("message")
         file: str | None = kwargs.get("file")
         image: str | None = kwargs.get("image")
+        provider_uuid = kwargs.get("provider_uuid")
 
         if not message and not file and not image:
             return "错误：message、file、image 至少提供一个"
@@ -95,7 +96,14 @@ class MessagePushTool(Tool):
         try:
             if message and "text" in senders:
                 sender_name = "stream_text" if "stream_text" in senders else "text"
-                await senders[sender_name](chat_id, message)
+                if provider_uuid:
+                    await senders[sender_name](
+                        chat_id,
+                        message,
+                        provider_uuid=str(provider_uuid),
+                    )
+                else:
+                    await senders[sender_name](chat_id, message)
                 preview = message[:60] + "..." if len(message) > 60 else message
                 logger.info(f"[message_push] {channel}:{chat_id} ← text: {preview!r}")
                 results.append("文本已发送")
@@ -107,7 +115,12 @@ class MessagePushTool(Tool):
                     import os
 
                     name = os.path.basename(file)
-                    await senders["file"](chat_id, file, name)
+                    await senders["file"](
+                        chat_id,
+                        file,
+                        name,
+                        provider_uuid=provider_uuid,
+                    )
                     logger.info(f"[message_push] {channel}:{chat_id} ← file: {file!r}")
                     results.append(f"文件 {name!r} 已发送")
 
@@ -115,7 +128,11 @@ class MessagePushTool(Tool):
                 if "image" not in senders:
                     results.append(f"渠道 {channel!r} 不支持发送图片")
                 else:
-                    await senders["image"](chat_id, image)
+                    await senders["image"](
+                        chat_id,
+                        image,
+                        provider_uuid=provider_uuid,
+                    )
                     logger.info(
                         f"[message_push] {channel}:{chat_id} ← image: {image!r}"
                     )

@@ -45,18 +45,34 @@
 | 扩展机制 | `@tool`、`@on_tool_pre`、Event Handler、PhaseModule、Skills、MCP stdio |
 | 飞书接入 | 飞书私聊长连接、流式思考卡片、工具过程展示和最终消息独立投递 |
 
+### 已迁移的内置插件
+
+当前内置运行时插件包括 `tool_loop_guard`、`context_pressure`、`citation`、`observe`、`status_commands`、`setup_helper`、`meme` 和 `plugin_undo`。它们沿用统一 Phase Pipeline、EventBus 和 MessagePush 链路，不建立插件专用执行旁路。
+
+| 命令 | 作用 |
+| --- | --- |
+| `/memorystatus` | 查看当前会话的记忆整理游标、消息数和待整理用户消息数 |
+| `/kvcache [N]` | 查看最近 N 轮真实 Prompt Cache 使用情况 |
+| `/chatid` 或 `/myid` | 查看当前 `channel` 和 `chat_id`；私聊目标会自动登记 |
+| `/undo` | 原子删除当前会话最近一轮完整对话并回退整理游标 |
+
+`/undo` 不撤回渠道上已经发送的历史消息，也不回滚已提炼进长期记忆的数据：当前 Schema 无法把已提炼记忆可靠关联回单轮消息，命令回复会明确提示这一限制。
+
+表情资源位于运行时工作区的 `memes/`：用 `memes/manifest.json` 声明启用分类，并将图片放入同名分类子目录。缺少 manifest 或可用图片时插件静默不发送媒体。
+
+被动回复的 assistant 媒体集合由 `operational_v9` 持久化到 `messages.media_json`；Redis Pending 重放会恢复同一媒体集合，持久化 JSON 损坏时明确失败且不 ACK，避免静默丢图。
+
 ## 系统架构
 
 ```mermaid
 flowchart LR
-    U[飞书私聊] --> G["Gateway<br/>Channel / MessageBus"]
-    G --> L["AgentLoop<br/>被动回复"]
-    L --> P[Phase Pipeline]
+    U[飞书私聊] --> C["Channel"]
+    C --> R
     S["Scheduler<br/>主动 / 定时 / 记忆 Tick"] --> R[(Redis
 Streams / Lease / Priority)]
-    R --> W["BackgroundTaskLoop<br/>后台任务"]
-    W --> P
-    W --> DB[("SQLite<br/>业务事实")]
+    R --> L["AgentLoop<br/>唯一任务消费者"]
+    L --> P[Phase Pipeline]
+    L --> DB[("SQLite<br/>业务事实")]
     P --> X["ReAct<br/>Function Calling"]
     X --> E[Tools / Plugins / Skills / MCP]
     X --> M[("分层记忆<br/>Markdown / sqlite-vec")]
@@ -68,23 +84,22 @@ Streams / Lease / Priority)]
 
 | 异步单元 | 职责 |
 | --- | --- |
-| `Gateway` 协程 | 维护飞书长连接，把私聊消息和最终回复接入双向 MessageBus |
-| `AgentLoop` 协程 | 直接处理被动回复，并在完成后保存会话消息、发布记忆维护任务 |
+| `Channel` 协程 | 维护飞书长连接，把私聊消息作为 P0 任务原子发布到 Redis |
+| `AgentLoop` 协程 | 统一消费被动、主动、定时、Drift 和记忆任务，共用 Lease、Fencing 与 Pending 接管 |
 | `Scheduler` 协程 | 生成主动 Tick、扫描定时任务并向 Redis 发布轻量后台任务 |
-| `BackgroundTaskLoop` | 获取会话 Lease，按优先级执行主动、定时、Drift 和记忆后台任务 |
 
-用户消息不进入后台队列：它会直接请求正在执行的后台任务停止，并由 AgentLoop 优先处理。定时任务、主动检查和记忆维护分别进入 Redis 优先级队列；所有后台路径共享会话 Lease，因此主动消息不会插入正在进行的用户回复。
+用户消息以 P0 进入统一队列，并在同一次 Redis Lua 调用中登记稳定任务 ID 与后台停止信号。定时任务、主动检查和记忆维护使用 P1～P3；所有路径共享会话 Lease。
 
 ## 一次对话如何运行
 
 ```text
 飞书事件
   │
-  ├─ MessageBus：投递 InboundMessage
-  ├─ AgentLoop：会话协调与用户消息抢占
+  ├─ Redis：原子发布 P0 与抢占信号
+  ├─ AgentLoop：统一获取 Lease 并执行被动 Turn
   ├─ Phase Pipeline：准备上下文 → ReAct → 响应后处理
   ├─ ReAct：检索记忆 / 调用工具 / 处理 Observation
-  ├─ MessageBus：投递 OutboundMessage
+  ├─ MessagePushTool：明确发送最终回复
   ├─ SQLite：保存最终对话
   └─ Redis 后台任务：Consolidation / Post-response / 向量写入
 ```
@@ -145,7 +160,7 @@ MCP 第一版使用 stdio。运行时工作区默认位于 `~/.memopilot/memopil
 
 ### 4. 启动 MemoPilot
 
-一个命令即可启动 `AppRuntime`。其中的 MessageBus、AgentLoop、SchedulerService、ProactiveLoop 和后台任务循环在同一个 `asyncio` 事件循环中协作：
+一个命令即可启动 `AppRuntime`。其中的 Channel、AgentLoop 和 SchedulerService 在同一个 `asyncio` 事件循环中协作：
 
 ```bash
 uv run python main.py

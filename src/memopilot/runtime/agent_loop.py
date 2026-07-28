@@ -1,235 +1,210 @@
-"""按原型 MessageBus 驱动被动 Agent Turn。"""
+"""统一消费 Redis 任务的 AgentLoop。"""
 
 from __future__ import annotations
 
 import asyncio
-import inspect
+import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import UTC, datetime
-from typing import Protocol
-from uuid import NAMESPACE_URL, uuid5
+from datetime import UTC, datetime, timedelta
 
-from memopilot.bus.events import InboundMessage, OutboundMessage
-from memopilot.bus.queue import MessageBus
-from memopilot.channels.contracts import InterruptAcknowledgement
-from memopilot.runtime.contracts import ChatMessage
-from memopilot.runtime.engine import AgentRuntime, TurnInput
-from memopilot.runtime.react import ReActProgressObserver
+from memopilot.runtime.background import CoreRunner
 from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.lease import SessionLease, SessionLeaseManager
+from memopilot.tasks.operational import LostLeaseError, StaleActivityError
+from memopilot.tasks.redis_queue import QueueMessage, RedisTaskQueue
 from memopilot.tasks.session_coordination import RedisSessionCoordinator
 
 logger = logging.getLogger(__name__)
 
 
-class HistoryRecord(Protocol):
-    role: str
-    content: str
-
-
-class PassiveTurnStore(Protocol):
-    def list_recent_messages(self, session_key: str, *, limit: int) -> Sequence[HistoryRecord]: ...
-
-    def record_inbound_activity(self, message: InboundMessage) -> int: ...
-
-    def commit_turn(
-        self,
-        message: InboundMessage,
-        *,
-        assistant_content: str,
-        cited_memory_ids: tuple[str, ...],
-        explicitly_memorized_ids: tuple[str, ...],
-    ) -> Sequence[BackgroundTask] | Awaitable[Sequence[BackgroundTask] | None] | None: ...
-
-
-class BackgroundTaskPublisher(Protocol):
-    async def publish_task_once(self, task: BackgroundTask) -> str | None: ...
-
-
 class AgentLoop:
-    """原型式的被动主循环：Bus → Runtime → Bus。"""
+    """所有 Agent 工作共用优先级、Lease、Fencing、Pending 与 ACK 边界。"""
 
     def __init__(
         self,
+        queue: RedisTaskQueue,
+        leases: SessionLeaseManager,
+        runner: CoreRunner,
         *,
-        bus: MessageBus,
-        runtime: AgentRuntime,
-        store: PassiveTurnStore,
-        short_term_message_limit: int = 12,
+        owner_id: str,
+        session_coordinator: RedisSessionCoordinator,
         clock: Callable[[], datetime] | None = None,
-        progress_factory: Callable[[InboundMessage], ReActProgressObserver | None] | None = None,
-        session_coordinator: RedisSessionCoordinator | None = None,
-        background_publisher: BackgroundTaskPublisher | None = None,
+        heartbeat_interval: float | None = None,
+        pending_min_idle: timedelta = timedelta(seconds=60),
+        pending_scan_interval: float = 5.0,
+        interrupt_poll_interval: float = 0.1,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
     ) -> None:
-        if short_term_message_limit < 1:
-            raise ValueError("短期消息窗口必须至少包含 1 条消息")
-        self.bus = bus
-        self.runtime = runtime
-        self.store = store
-        self.short_term_message_limit = short_term_message_limit
-        self.clock = clock or (lambda: datetime.now(UTC))
+        if pending_min_idle.total_seconds() <= 0:
+            raise ValueError("Pending 空闲阈值必须大于 0")
+        if interrupt_poll_interval <= 0 or pending_scan_interval <= 0:
+            raise ValueError("轮询间隔必须大于 0")
+        self._queue = queue
+        self._leases = leases
+        self._runner = runner
+        self._owner_id = owner_id
+        self._coordinator = session_coordinator
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._pending_min_idle = pending_min_idle
+        self._pending_scan_interval = pending_scan_interval
+        self._next_pending_scan_at = float("-inf")
+        self._heartbeat_interval = heartbeat_interval or max(0.05, leases.ttl_ms / 3000)
+        if self._heartbeat_interval <= 0:
+            raise ValueError("heartbeat_interval 必须大于 0")
+        self._interrupt_poll_interval = interrupt_poll_interval
+        self._monotonic = monotonic
+        self._sleep = sleep
         self._running = False
-        self._active: dict[str, asyncio.Task[None]] = {}
-        self._progress_factory = progress_factory
-        self._session_coordinator = session_coordinator
-        self._background_publisher = background_publisher
 
-    async def run_forever(self) -> None:
-        self._running = True
-        while self._running:
-            message = await self.bus.consume_inbound()
+    async def run_once(self) -> bool:
+        message = await self._queue.read_next(consumer_id=self._owner_id)
+        if message is None:
+            current = self._monotonic()
+            if current < self._next_pending_scan_at:
+                return False
+            self._next_pending_scan_at = current + self._pending_scan_interval
+            message = await self._reclaim_pending()
+            if message is None:
+                return False
+
+        lease = await self._leases.acquire(
+            message.session_key,
+            owner_id=self._owner_id,
+            now=self._clock(),
+        )
+        if lease is None:
+            return True
+
+        try:
+            payload = json.loads(message.payload_json)
+            if not isinstance(payload, dict):
+                raise ValueError("任务 payload 必须是 JSON 对象")
+            preview = " ".join(str(payload.get("content") or "").split())[:80]
+            logger.info(
+                "AgentLoop 处理消息 kind=%s session=%s preview=%r",
+                message.kind,
+                message.session_key,
+                preview,
+            )
+            if message.kind == "passive.turn":
+                await self._coordinator.clear_background_stop(message.session_key)
             try:
-                await self.process(message)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    "被动 Agent Turn 失败 session=%s，主循环继续等待下一条消息",
-                    message.session_key,
+                tasks, stop_reason = await self._execute_with_heartbeat(
+                    message,
+                    {str(key): value for key, value in payload.items()},
+                    lease,
                 )
+            except StaleActivityError:
+                if message.kind not in {"proactive.tick", "drift.run"}:
+                    raise
+                await self._queue.acknowledge(message)
+                return True
+            if stop_reason is not None:
+                if message.kind in {"proactive.tick", "drift.run"} or (
+                    message.kind == "passive.turn" and stop_reason == "user_stop"
+                ):
+                    await self._queue.acknowledge(message)
+                if stop_reason == "user_stop":
+                    await self._coordinator.clear_background_stop(message.session_key)
+                return True
+            for task in tasks:
+                await self._queue.publish_task_once(task)
+            await self._queue.acknowledge(message)
+            return True
+        finally:
+            await self._leases.release(lease)
+
+    async def run_forever(self, *, idle_interval: float = 0.25) -> None:
+        if idle_interval <= 0:
+            raise ValueError("idle_interval 必须大于 0")
+        await self._queue.ensure_consumer_groups()
+        self._running = True
+        logger.info("AgentLoop 启动")
+        try:
+            while self._running:
+                try:
+                    processed = await self.run_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Agent 任务处理失败，继续消费后续任务")
+                    processed = False
+                if not processed:
+                    await self._sleep(idle_interval)
+        finally:
+            logger.info("AgentLoop 停止")
 
     def stop(self) -> None:
         self._running = False
-        for task in tuple(self._active.values()):
-            task.cancel()
 
-    async def request_interrupt(self, message: InboundMessage) -> InterruptAcknowledgement:
-        """按原型在内存中取消当前会话的 Turn，不创建额外持久化任务。"""
-        task = self._active.get(message.session_key)
-        active = task is not None and not task.done()
-        if active:
-            assert task is not None
-            task.cancel()
-        return InterruptAcknowledgement(
-            message=(
-                "已收到停止请求，正在中断当前回复。" if active else "当前没有正在执行的回复。"
-            ),
-            provider_uuid=str(
-                uuid5(
-                    NAMESPACE_URL,
-                    "memopilot:interrupt:"
-                    f"{message.metadata.get('message_id') or message.session_key}",
+    async def _reclaim_pending(self) -> QueueMessage | None:
+        min_idle_ms = int(self._pending_min_idle.total_seconds() * 1000)
+        for priority in range(4):
+            pending_entries = await self._queue.pending_entries(
+                priority=priority,
+                min_idle_ms=min_idle_ms,
+            )
+            for pending in pending_entries:
+                message = await self._queue.load_message(
+                    priority=priority,
+                    message_id=pending.message_id,
                 )
-            ),
-        )
-
-    async def process(self, message: InboundMessage) -> None:
-        previous = self._active.get(message.session_key)
-        if previous is not None and not previous.done():
-            await previous
-        task = asyncio.create_task(
-            self._process_one(message),
-            name=f"memopilot-agent-loop:{message.session_key}",
-        )
-        self._active[message.session_key] = task
-        try:
-            try:
-                await task
-            except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None and current.cancelling():
-                    raise
-        finally:
-            if self._active.get(message.session_key) is task:
-                self._active.pop(message.session_key, None)
-
-    async def _process_one(self, message: InboundMessage) -> None:
-        self.store.record_inbound_activity(message)
-        turn_id = str(message.metadata.get("message_id") or message.session_key)
-        if self._session_coordinator is not None:
-            await self._session_coordinator.request_background_stop(
-                message.session_key,
-                reason="user_message",
-            )
-            await self._session_coordinator.begin_user_turn(
-                message.session_key,
-                turn_id=turn_id,
-            )
-        history = tuple(
-            ChatMessage.user(record.content)
-            if record.role == "user"
-            else ChatMessage.assistant(content=record.content)
-            for record in self.store.list_recent_messages(
-                message.session_key,
-                limit=self.short_term_message_limit,
-            )
-            if record.role in {"user", "assistant"}
-        )
-        progress = self._progress_factory(message) if self._progress_factory else None
-        try:
-            try:
-                result = await self.runtime.run(
-                    TurnInput(
-                        session_key=message.session_key,
-                        content=message.content,
-                        history=history,
-                        current_user_content=message.content,
-                        received_at=message.timestamp,
-                    ),
-                    progress=progress,
+                if message is None or not await self._leases.is_absent(message.session_key):
+                    continue
+                claimed = await self._queue.claim_pending(
+                    message,
+                    consumer_id=self._owner_id,
+                    min_idle_ms=min_idle_ms,
                 )
-            finally:
-                if progress is not None:
-                    finalize = getattr(progress, "finalize", None)
-                    if callable(finalize):
-                        await finalize()
-            committed = self.store.commit_turn(
+                if claimed is not None:
+                    return claimed
+        return None
+
+    async def _execute_with_heartbeat(
+        self,
+        message: QueueMessage,
+        payload: dict[str, object],
+        lease: SessionLease,
+    ) -> tuple[Sequence[BackgroundTask], str | None]:
+        execution = asyncio.create_task(
+            self._runner.execute(
                 message,
-                assistant_content=result.reply,
-                cited_memory_ids=result.cited_memory_ids,
-                explicitly_memorized_ids=_explicitly_memorized_ids(result.trace),
+                payload=payload,
+                lease=lease,
+                now=self._clock(),
             )
-            if inspect.isawaitable(committed):
-                committed = await committed
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=message.channel,
-                    chat_id=message.chat_id,
-                    content=result.reply,
-                    thinking=result.react.thinking,
-                    reply_to=str(message.metadata.get("message_id") or "") or None,
-                    metadata={
-                        "provider_uuid": str(
-                            uuid5(
-                                NAMESPACE_URL,
-                                "memopilot:reply:"
-                                f"{message.metadata.get('message_id') or message.session_key}",
-                            )
-                        )
-                    },
+        )
+        next_heartbeat = self._monotonic() + self._heartbeat_interval
+        try:
+            while True:
+                timeout = min(
+                    self._interrupt_poll_interval,
+                    max(0.0, next_heartbeat - self._monotonic()),
                 )
-            )
-            if committed and self._background_publisher is not None:
-                for background_task in committed:
-                    await self._background_publisher.publish_task_once(background_task)
-        finally:
-            if self._session_coordinator is not None:
-                await self._session_coordinator.end_user_turn(
-                    message.session_key,
-                    turn_id=turn_id,
-                )
-                await self._session_coordinator.clear_background_stop(message.session_key)
+                done, _ = await asyncio.wait({execution}, timeout=timeout)
+                if done:
+                    return await execution, None
+                stop_reason = await self._coordinator.stop_reason(message.session_key)
+                if stop_reason is not None and (
+                    message.kind != "passive.turn" or stop_reason == "user_stop"
+                ):
+                    execution.cancel()
+                    await asyncio.gather(execution, return_exceptions=True)
+                    return (), stop_reason
+                if self._monotonic() >= next_heartbeat:
+                    if not await self._leases.renew(lease, now=self._clock()):
+                        execution.cancel()
+                        await asyncio.gather(execution, return_exceptions=True)
+                        raise LostLeaseError("会话 Lease 续租失败，任务已停止提交")
+                    next_heartbeat = self._monotonic() + self._heartbeat_interval
+        except BaseException:
+            if not execution.done():
+                execution.cancel()
+                await asyncio.gather(execution, return_exceptions=True)
+            raise
 
 
-def _explicitly_memorized_ids(trace: Sequence[object]) -> tuple[str, ...]:
-    item_ids: list[str] = []
-    for event in trace:
-        if getattr(event, "tool_name", None) != "memorize":
-            continue
-        if getattr(event, "state", None) != "succeeded":
-            continue
-        observation = getattr(event, "observation", None)
-        result = observation.get("result") if isinstance(observation, dict) else None
-        item_id = result.get("item_id") if isinstance(result, dict) else None
-        if isinstance(item_id, str) and item_id.strip():
-            item_ids.append(item_id.strip())
-    return tuple(dict.fromkeys(item_ids))
-
-
-__all__ = [
-    "AgentLoop",
-    "BackgroundTaskPublisher",
-    "HistoryRecord",
-    "PassiveTurnStore",
-    "_explicitly_memorized_ids",
-]
+__all__ = ["AgentLoop"]

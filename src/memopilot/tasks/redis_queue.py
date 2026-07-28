@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import UTC
 from typing import cast
+from uuid import NAMESPACE_URL, uuid5
 
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
+from memopilot.bus.events import InboundMessage
 from memopilot.tasks.background import BackgroundTask
 
 _PUBLISH_ONCE = """
@@ -24,6 +28,24 @@ local message_id = redis.call(
   'payload_json', ARGV[6]
 )
 redis.call('SADD', KEYS[3], ARGV[2])
+return message_id
+"""
+
+_PUBLISH_INBOUND = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return ''
+end
+redis.call('SET', KEYS[4], 'user_message', 'EX', ARGV[2])
+redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+local message_id = redis.call(
+  'XADD', KEYS[2], '*',
+  'task_id', ARGV[3],
+  'kind', 'passive.turn',
+  'priority', '0',
+  'session_key', ARGV[4],
+  'payload_json', ARGV[5]
+)
+redis.call('SADD', KEYS[3], ARGV[3])
 return message_id
 """
 
@@ -122,6 +144,47 @@ class RedisTaskQueue:
         message_id = _text(result)
         return message_id or None
 
+    async def publish_inbound(
+        self,
+        message: InboundMessage,
+        *,
+        stop_key: str,
+        ttl_seconds: int = 86400,
+        preemption_ttl_seconds: int = 1800,
+    ) -> str | None:
+        identity = str(message.metadata.get("message_id") or "").strip()
+        if not identity:
+            identity = f"{message.session_key}:{message.timestamp.isoformat()}:{message.content}"
+        task_id = str(uuid5(NAMESPACE_URL, f"memopilot:passive:{identity}"))
+        payload_json = json.dumps(
+            {
+                "channel": message.channel,
+                "sender": message.sender,
+                "chat_id": message.chat_id,
+                "content": message.content,
+                "timestamp": message.timestamp.astimezone(UTC).isoformat(),
+                "media": list(message.media),
+                "metadata": dict(message.metadata),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        result = await self.redis.eval(
+            _PUBLISH_INBOUND,
+            4,
+            f"{self.namespace}:task:{task_id}",
+            self.stream_key(0),
+            self.queued_task_ids_key,
+            stop_key,
+            ttl_seconds,
+            preemption_ttl_seconds,
+            task_id,
+            message.session_key,
+            payload_json,
+        )
+        message_id = _text(result)
+        return message_id or None
+
     async def read_next(self, *, consumer_id: str) -> QueueMessage | None:
         try:
             return await self._read_next_from_existing_groups(consumer_id=consumer_id)
@@ -172,13 +235,6 @@ class RedisTaskQueue:
             pipeline.xack(message.stream, self.group, message.message_id)
             pipeline.xdel(message.stream, message.message_id)
             pipeline.srem(self.queued_task_ids_key, message.task_id)
-            await pipeline.execute()
-
-    async def acknowledge_requeued(self, message: QueueMessage) -> None:
-        """移除当前投递，但保留同业务任务的 Redis 镜像标记。"""
-        async with self.redis.pipeline(transaction=True) as pipeline:
-            pipeline.xack(message.stream, self.group, message.message_id)
-            pipeline.xdel(message.stream, message.message_id)
             await pipeline.execute()
 
     async def missing_tasks(self, task_ids: tuple[str, ...]) -> tuple[str, ...]:

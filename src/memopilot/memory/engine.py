@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from memopilot.memory.contracts import (
     HypothesisProvider,
@@ -14,6 +14,9 @@ from memopilot.memory.contracts import (
 )
 from memopilot.memory.retrieval import MemoryRetriever
 
+if TYPE_CHECKING:
+    from memopilot.extensions.events import EventBus
+
 
 class LayeredMemoryEngine:
     def __init__(
@@ -21,24 +24,31 @@ class LayeredMemoryEngine:
         retriever: MemoryRetriever,
         *,
         hypothesis_provider: HypothesisProvider | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.retriever = retriever
         self.hypothesis_provider = hypothesis_provider
+        self.event_bus = event_bus
 
     async def query(self, request: MemoryQuery) -> MemoryQueryResult:
         limit = max(1, min(request.limit, 200))
         scope_channel, _, scope_chat_id = request.session_key.partition(":")
         if request.intent == "timeline":
             if request.time_start is None or request.time_end is None:
-                return MemoryQueryResult(trace={"intent": "timeline", "missing_time": True})
-            hits = self.retriever.store.list_events(
-                time_start=request.time_start,
-                time_end=request.time_end,
-                limit=limit,
-                scope_channel=scope_channel,
-                scope_chat_id=scope_chat_id,
-            )
-            return self._result(request.intent, hits, aux_queries=())
+                result = MemoryQueryResult(
+                    trace={"intent": "timeline", "missing_time": True}
+                )
+            else:
+                hits = self.retriever.store.list_events(
+                    time_start=request.time_start,
+                    time_end=request.time_end,
+                    limit=limit,
+                    scope_channel=scope_channel,
+                    scope_chat_id=scope_chat_id,
+                )
+                result = self._result(request.intent, hits, aux_queries=())
+            await self._emit_retrieval(request, result, aux_queries=())
+            return result
 
         memory_types = request.memory_kinds
         if not memory_types and request.intent == "interest":
@@ -68,10 +78,34 @@ class LayeredMemoryEngine:
             scope_channel=scope_channel,
             scope_chat_id=scope_chat_id,
         )
-        return self._result(
+        result = self._result(
             request.intent,
             hits,
             aux_queries=aux_queries,
+        )
+        await self._emit_retrieval(request, result, aux_queries=aux_queries)
+        return result
+
+    async def _emit_retrieval(
+        self,
+        request: MemoryQuery,
+        result: MemoryQueryResult,
+        *,
+        aux_queries: tuple[str, ...],
+    ) -> None:
+        if self.event_bus is None:
+            return
+        from memopilot.memory.events import RetrievalCompleted
+
+        await self.event_bus.fanout(
+            RetrievalCompleted(
+                session_key=request.session_key,
+                query=request.text,
+                intent=request.intent,
+                records=result.records,
+                aux_queries=aux_queries,
+                injected_count=sum(record.injected for record in result.records),
+            )
         )
 
     def _result(

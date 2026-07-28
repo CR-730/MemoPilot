@@ -108,7 +108,7 @@ async def test_scheduler_process_publishes_each_background_task_once(tmp_path: P
     assert queue.ids[1].startswith("proactive.tick:")
 
 
-async def test_scheduler_skips_proactive_tick_when_session_is_busy(
+async def test_scheduler_publishes_proactive_without_duplicate_busy_gate(
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
@@ -122,17 +122,9 @@ async def test_scheduler_skips_proactive_tick_when_session_is_busy(
             self.ids.append(task.task_id)
             return task.task_id
 
-    class BusySessions:
-        async def session_busy(self, session_key: str) -> bool:
-            assert session_key == "feishu:chat-1"
-            return True
-
     queue = Queue()
-    process = SchedulerService(
-        _scheduler(repository),
-        queue,
-        session_coordinator=BusySessions(),  # type: ignore[arg-type]
-    )
+    process = SchedulerService(_scheduler(repository), queue)
 
-    assert await process.run_once(now=NOW) == 1
-    assert queue.ids == ["memory-1"]
+    assert await process.run_once(now=NOW) == 2
+    assert queue.ids[0] == "memory-1"
+    assert queue.ids[1].startswith("proactive.tick:")

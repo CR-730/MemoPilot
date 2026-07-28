@@ -6,7 +6,6 @@ import json
 import pytest
 
 import memopilot.channels.cli as cli
-from memopilot.channels.contracts import MessageBus
 from memopilot.channels.ipc import IPCServerChannel
 
 
@@ -17,15 +16,13 @@ async def test_ipc_server_copies_prototype_json_inbound_contract() -> None:
     probe.close()
     await probe.wait_closed()
 
-    bus = MessageBus()
     received = asyncio.Future()
 
     async def capture(message: object) -> None:
         if not received.done():
             received.set_result(message)
 
-    bus.subscribe_inbound(capture)
-    channel = IPCServerChannel(bus, f"127.0.0.1:{port}")
+    channel = IPCServerChannel(capture, f"127.0.0.1:{port}")
     await channel.start()
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     writer.write((json.dumps({"content": "你好"}, ensure_ascii=False) + "\n").encode())

@@ -6,11 +6,14 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from memopilot.memory.contracts import EmbeddingProvider
 from memopilot.memory.procedures import build_procedure_rule_schema, build_trigger_tags
 from memopilot.memory.store import MemoryStore
+
+if TYPE_CHECKING:
+    from memopilot.extensions.events import EventBus
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,10 +40,12 @@ class MemoryMemorizer:
         embedder: EmbeddingProvider,
         *,
         procedure_tagger: ProcedureTagger | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.store = store
         self.embedder = embedder
         self.procedure_tagger = procedure_tagger
+        self.event_bus = event_bus
 
     async def remember(
         self,
@@ -113,11 +118,19 @@ class MemoryMemorizer:
                         source_ref=source_ref,
                         emotional_weight=bounded_int(emotional_weight),
                     )
-                return MemoryMutationResult(
+                result = MemoryMutationResult(
                     str(duplicate["item_id"]),
                     "reinforced" if changed else "unchanged",
                     kind,
                 )
+                await self._emit_written(
+                    result,
+                    summary=text,
+                    source_ref=source_ref,
+                    scope_channel=scope_channel,
+                    scope_chat_id=scope_chat_id,
+                )
+                return result
 
         if kind == "procedure":
             requirement = optional_text(metadata.get("tool_requirement"))
@@ -137,7 +150,7 @@ class MemoryMemorizer:
                 merged_embedding = await self.embedder.embed(merged_summary)
                 guard()
                 with write_scope():
-                    result = self.store.merge_item(
+                    store_result = self.store.merge_item(
                         str(merge_target["item_id"]),
                         summary=merged_summary,
                         source_ref=source_ref,
@@ -146,7 +159,15 @@ class MemoryMemorizer:
                         happened_at=happened_at,
                         emotional_weight=bounded_int(emotional_weight),
                     )
-                return MemoryMutationResult(result.item_id, "merged", kind)
+                mutation = MemoryMutationResult(store_result.item_id, "merged", kind)
+                await self._emit_written(
+                    mutation,
+                    summary=merged_summary,
+                    source_ref=source_ref,
+                    scope_channel=scope_channel,
+                    scope_chat_id=scope_chat_id,
+                )
+                return mutation
 
         supersede_ids = supersede_candidates(
             self.store,
@@ -160,7 +181,7 @@ class MemoryMemorizer:
             supersede_ids = (*supersede_ids, explicit_supersedes)
         guard()
         with write_scope():
-            result = self.store.write_item(
+            store_result = self.store.write_item(
                 summary=text,
                 memory_type=kind,
                 source_ref=source_ref,
@@ -172,7 +193,48 @@ class MemoryMemorizer:
                 scope_channel=scope_channel,
                 scope_chat_id=scope_chat_id,
             )
-        return MemoryMutationResult(result.item_id, result.status, kind)
+        mutation = MemoryMutationResult(
+            store_result.item_id,
+            store_result.status,
+            kind,
+        )
+        await self._emit_written(
+            mutation,
+            summary=text,
+            source_ref=source_ref,
+            scope_channel=scope_channel,
+            scope_chat_id=scope_chat_id,
+        )
+        return mutation
+
+    async def _emit_written(
+        self,
+        result: MemoryMutationResult,
+        *,
+        summary: str,
+        source_ref: str,
+        scope_channel: str,
+        scope_chat_id: str,
+    ) -> None:
+        if self.event_bus is None:
+            return
+        from memopilot.memory.events import MemoryWritten
+
+        session_key = (
+            f"{scope_channel}:{scope_chat_id}"
+            if scope_channel or scope_chat_id
+            else ""
+        )
+        await self.event_bus.fanout(
+            MemoryWritten(
+                session_key=session_key,
+                source_ref=source_ref,
+                memory_type=result.actual_kind,
+                item_id=result.item_id,
+                status=result.status,
+                summary=summary,
+            )
+        )
 
 
 def _normalize_procedure(

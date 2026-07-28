@@ -206,7 +206,7 @@ def _migrate_proactive_database(settings: MemoPilotSettings) -> MigrationReport:
 def _load_migrations(kind: DatabaseKind) -> tuple[Migration, ...]:
     schema = files("memopilot.persistence.schema")
     versions = {
-        DatabaseKind.OPERATIONAL: (1, 2, 3, 4, 5, 6, 7, 8),
+        DatabaseKind.OPERATIONAL: (1, 2, 3, 4, 5, 6, 7, 8, 9),
         DatabaseKind.MEMORY: (1, 2, 3),
         DatabaseKind.PROACTIVE: (1, 2, 3, 4, 5, 6, 7, 8, 9),
     }[kind]

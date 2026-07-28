@@ -104,6 +104,7 @@ class ModelResponse:
     finish_reason: str | None = None
     response_id: str | None = None
     prompt_tokens: int | None = None
+    prompt_cache_hit_tokens: int | None = None
     completion_tokens: int | None = None
     thinking: str | None = None
     provider_fields: dict[str, Any] = field(default_factory=dict)

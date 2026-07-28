@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from memopilot.persistence.migrations import connect_database
@@ -41,11 +41,13 @@ class FenceToken(Protocol):
 
 class TurnMessage(Protocol):
     channel: str
-    session_key: str
     chat_id: str
     content: str
     timestamp: datetime
-    metadata: Mapping[str, object]
+    metadata: dict[str, Any]
+
+    @property
+    def session_key(self) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +75,14 @@ class MessageRecord:
     turn_id: str
     session_position: int
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class TurnCommitResult:
+    assistant_content: str
+    media: tuple[str, ...]
+    inserted: bool
+    background_tasks: tuple[BackgroundTask, ...]
 
 
 class OperationalRepository:
@@ -177,12 +187,16 @@ class OperationalRepository:
         self,
         message: TurnMessage,
         *,
-        assistant_content: str,
+        assistant_content: str | None = None,
+        assistant_media: tuple[str, ...] = (),
         cited_memory_ids: tuple[str, ...] = (),
         explicitly_memorized_ids: tuple[str, ...] = (),
-    ) -> tuple[BackgroundTask, ...]:
+        lease: FenceToken | None = None,
+    ) -> TurnCommitResult | None:
         content = message.content
-        if not content.strip() or not assistant_content.strip():
+        if not content.strip() or (
+            assistant_content is not None and not assistant_content.strip()
+        ):
             raise ValueError("Turn 的用户消息和助手回复不能为空")
         timestamp = message.timestamp
         metadata = message.metadata
@@ -197,6 +211,8 @@ class OperationalRepository:
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
         try:
+            if lease is not None:
+                self.require_current_fence(connection, lease)
             self._upsert_session(
                 connection,
                 session_key=session_key,
@@ -205,14 +221,40 @@ class OperationalRepository:
                 now_text=now_text,
             )
             existing = connection.execute(
-                "SELECT role, content FROM messages WHERE turn_id = ? ORDER BY turn_position",
+                "SELECT role, content, media_json FROM messages "
+                "WHERE turn_id = ? ORDER BY turn_position",
                 (turn_id,),
             ).fetchall()
-            expected = [("user", content), ("assistant", assistant_content)]
+            inserted = not existing
             if existing:
-                if [(str(row["role"]), str(row["content"])) for row in existing] != expected:
+                if (
+                    len(existing) != 2
+                    or (str(existing[0]["role"]), str(existing[0]["content"]))
+                    != ("user", content)
+                ):
                     raise ValueError("同一 Turn 不能以不同内容重复提交")
+                persisted_assistant = str(existing[1]["content"])
+                persisted_media = _parse_media_json(existing[1]["media_json"])
+                if assistant_content is not None and (
+                    str(existing[1]["role"]),
+                    persisted_assistant,
+                ) != (
+                    "assistant",
+                    assistant_content,
+                ):
+                    raise ValueError("同一 Turn 不能以不同内容重复提交")
+                if (
+                    assistant_content is not None
+                    and assistant_media
+                    and persisted_media != assistant_media
+                ):
+                    raise ValueError("同一 Turn 不能以不同媒体重复提交")
+            elif assistant_content is None:
+                connection.execute("COMMIT")
+                return None
             else:
+                persisted_assistant = assistant_content
+                persisted_media = assistant_media
                 position = int(
                     connection.execute(
                         "SELECT COALESCE(MAX(session_position), 0) + 1 "
@@ -224,11 +266,21 @@ class OperationalRepository:
                     """
                     INSERT INTO messages(
                         message_id, session_key, role, content, turn_id,
-                        turn_position, created_at, session_position
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        turn_position, created_at, session_position, media_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        (user_id, session_key, "user", content, turn_id, 0, now_text, position),
+                        (
+                            user_id,
+                            session_key,
+                            "user",
+                            content,
+                            turn_id,
+                            0,
+                            now_text,
+                            position,
+                            "[]",
+                        ),
                         (
                             assistant_id,
                             session_key,
@@ -238,6 +290,7 @@ class OperationalRepository:
                             1,
                             now_text,
                             position + 1,
+                            json.dumps(assistant_media, ensure_ascii=False),
                         ),
                     ),
                 )
@@ -288,7 +341,12 @@ class OperationalRepository:
                     timestamp,
                 )
             )
-        return tuple(tasks)
+        return TurnCommitResult(
+            persisted_assistant,
+            persisted_media,
+            inserted,
+            tuple(tasks),
+        )
 
     def list_recent_messages(
         self,
@@ -330,6 +388,109 @@ class OperationalRepository:
             )
             for row in rows
         )
+
+    def memory_status(
+        self,
+        session_key: str,
+    ) -> tuple[int, int, int, str]:
+        with self._connect() as connection:
+            session = connection.execute(
+                "SELECT last_consolidated_position FROM sessions "
+                "WHERE session_key = ?",
+                (session_key,),
+            ).fetchone()
+            last_position = (
+                int(session["last_consolidated_position"])
+                if session is not None
+                else 0
+            )
+            totals = connection.execute(
+                """
+                SELECT COUNT(*) AS total_messages,
+                       SUM(CASE WHEN role = 'user' AND session_position > ?
+                           THEN 1 ELSE 0 END) AS pending_user
+                FROM messages
+                WHERE session_key = ?
+                """,
+                (last_position, session_key),
+            ).fetchone()
+            last_user = connection.execute(
+                """
+                SELECT content FROM messages
+                WHERE session_key = ? AND role = 'user'
+                  AND session_position <= ?
+                ORDER BY session_position DESC
+                LIMIT 1
+                """,
+                (session_key, last_position),
+            ).fetchone()
+        return (
+            last_position,
+            int(totals["total_messages"] or 0),
+            int(totals["pending_user"] or 0),
+            str(last_user["content"]) if last_user is not None else "",
+        )
+
+    def undo_last_turn(
+        self,
+        session_key: str,
+    ) -> tuple[int, int, int] | None:
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            target = connection.execute(
+                """
+                SELECT user.message_id AS user_id,
+                       assistant.message_id AS assistant_id
+                FROM messages AS user
+                JOIN messages AS assistant
+                  ON assistant.turn_id = user.turn_id
+                 AND assistant.turn_position = 1
+                 AND assistant.role = 'assistant'
+                WHERE user.session_key = ?
+                  AND user.turn_position = 0
+                  AND user.role = 'user'
+                ORDER BY assistant.session_position DESC
+                LIMIT 1
+                """,
+                (session_key,),
+            ).fetchone()
+            session = connection.execute(
+                "SELECT last_consolidated_position FROM sessions "
+                "WHERE session_key = ?",
+                (session_key,),
+            ).fetchone()
+            if target is None or session is None:
+                connection.execute("COMMIT")
+                return None
+            old_cursor = int(session["last_consolidated_position"])
+            deleted = connection.execute(
+                "DELETE FROM messages WHERE message_id IN (?, ?)",
+                (str(target["user_id"]), str(target["assistant_id"])),
+            ).rowcount
+            if deleted != 2:
+                raise RuntimeError("撤销目标不再完整")
+            remaining = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(session_position), 0) FROM messages "
+                    "WHERE session_key = ?",
+                    (session_key,),
+                ).fetchone()[0]
+            )
+            new_cursor = min(old_cursor, remaining)
+            connection.execute(
+                "UPDATE sessions SET last_consolidated_position = ?, "
+                "updated_at = ? WHERE session_key = ?",
+                (new_cursor, datetime.now(UTC).isoformat(), session_key),
+            )
+            connection.execute("COMMIT")
+            return deleted, old_cursor, new_cursor
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
 
     def remember_session_identities(
         self,
@@ -649,6 +810,18 @@ def _utc_iso(value: datetime) -> str:
 
 def _stable_id(namespace: str, value: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"memopilot:{namespace}:{value}"))
+
+
+def _parse_media_json(value: object) -> tuple[str, ...]:
+    try:
+        decoded = json.loads(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("持久化消息的 media_json 不是合法 JSON") from exc
+    if not isinstance(decoded, list):
+        raise ValueError("持久化消息的 media_json 必须是列表")
+    if any(not isinstance(item, str) or not item.strip() for item in decoded):
+        raise ValueError("持久化消息的 media_json 只能包含非空字符串")
+    return tuple(decoded)
 
 
 __all__ = [

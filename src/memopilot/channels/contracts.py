@@ -6,11 +6,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol
 
-from memopilot.bus.events import InboundMessage, OutboundMessage
-from memopilot.bus.queue import MessageBus
+from memopilot.bus.events import InboundMessage
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,15 +23,12 @@ class InterruptAcknowledgement:
     provider_uuid: str
 
 
-class InterruptController(Protocol):
-    async def request_interrupt(self, message: InboundMessage) -> InterruptAcknowledgement: ...
+InboundHandler = Callable[[InboundMessage], Awaitable[object]]
 
 
 __all__ = [
     "InboundMessage",
     "InterruptAcknowledgement",
-    "InterruptController",
-    "MessageBus",
-    "OutboundMessage",
+    "InboundHandler",
     "SendReceipt",
 ]

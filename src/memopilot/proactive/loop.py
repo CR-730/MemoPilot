@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Protocol
 
 from memopilot.proactive.service import ProactiveOutcome
-from memopilot.runtime.outbound import OutboundDispatch, OutboundPort
+from memopilot.runtime.outbound import DeliveryError, OutboundDispatch, OutboundPort
 from memopilot.tasks.lease import SessionLease
 
 
@@ -24,11 +24,6 @@ class ProactiveExecutionService(Protocol):
     def finalize_confirmed(
         self, outcome: ProactiveOutcome, *, confirmed_at: datetime | None = None
     ) -> bool: ...
-
-    def finalize_failed(
-        self, outcome: ProactiveOutcome, *, failed_at: datetime | None = None
-    ) -> bool: ...
-
 
 ProactiveServiceFactory = Callable[
     [str, int, SessionLease],
@@ -78,8 +73,7 @@ class ProactiveLoop:
         if sent:
             service.finalize_confirmed(outcome, confirmed_at=now)
             return "succeeded"
-        service.finalize_failed(outcome, failed_at=now)
-        return "failed"
+        raise DeliveryError("主动消息未明确发送成功")
 
 
 def _required_text(payload: Mapping[str, object], key: str) -> str:

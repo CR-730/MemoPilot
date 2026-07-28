@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from memopilot.bootstrap import AppRuntime, build_runtime_bundle
+from memopilot.bootstrap import AppRuntime, build_app_runtime, build_runtime_bundle
 from memopilot.config import MemoPilotSettings
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.mcp import McpServerConfig
@@ -65,14 +65,11 @@ async def test_app_runtime_connects_mcp_before_scheduler_can_start() -> None:
             events.append("mcp")
 
     app = AppRuntime(
-        gateway=Lifecycle(),  # type: ignore[arg-type]
         scheduler=object(),  # type: ignore[arg-type]
-        background_tasks=object(),  # type: ignore[arg-type]
         agent_loop=object(),  # type: ignore[arg-type]
         redis=object(),  # type: ignore[arg-type]
-        bus=object(),  # type: ignore[arg-type]
         repository=object(),  # type: ignore[arg-type]
-        channel=object(),  # type: ignore[arg-type]
+        channel=Lifecycle(),  # type: ignore[arg-type]
         console=Lifecycle(),  # type: ignore[arg-type]
         runtime=SimpleNamespace(mcp_registry=Registry()),  # type: ignore[arg-type]
     )
@@ -80,6 +77,109 @@ async def test_app_runtime_connects_mcp_before_scheduler_can_start() -> None:
     await app.start()
 
     assert events == ["channel", "channel", "mcp"]
+
+
+async def test_app_runtime_registers_feishu_media_senders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_calls: list[tuple[str, str, str, str | None]] = []
+    captured: dict[str, object] = {}
+
+    class FakeRedis:
+        async def aclose(self) -> None:
+            return None
+
+    class FakeChannel:
+        async def send(
+            self,
+            chat_id: str,
+            message: str,
+            *,
+            provider_uuid: str | None = None,
+        ) -> None:
+            del chat_id, message, provider_uuid
+
+        async def send_image(
+            self,
+            chat_id: str,
+            image: str,
+            *,
+            provider_uuid: str,
+        ) -> None:
+            media_calls.append(("image", chat_id, image, provider_uuid))
+
+        async def send_file(
+            self,
+            chat_id: str,
+            file: str,
+            *,
+            provider_uuid: str,
+            name: str | None = None,
+        ) -> None:
+            media_calls.append(("file", chat_id, file, f"{provider_uuid}:{name}"))
+
+    async def stop_after_capture(*args: object, **kwargs: object) -> object:
+        del args
+        captured["message_push"] = kwargs["message_push"]
+        raise RuntimeError("captured")
+
+    monkeypatch.setattr(
+        "memopilot.bootstrap.Redis.from_url",
+        lambda *args, **kwargs: FakeRedis(),
+    )
+    monkeypatch.setattr(
+        "memopilot.bootstrap._feishu_channel",
+        lambda *args, **kwargs: FakeChannel(),
+    )
+    monkeypatch.setattr(
+        "memopilot.bootstrap.build_runtime_bundle",
+        stop_after_capture,
+    )
+    settings = MemoPilotSettings(
+        workspace=tmp_path,
+        chat_api_key="chat-key",
+        embedding_base_url="https://embedding.example/v1",
+        embedding_model="embedding-model",
+        embedding_api_key="embedding-key",
+        embedding_dimension=2,
+        feishu_enabled=True,
+        feishu_app_id="app-id",
+        feishu_app_secret="app-secret",
+        _env_file=None,
+    )
+
+    with pytest.raises(RuntimeError, match="captured"):
+        await build_app_runtime(settings)
+
+    push = captured["message_push"]
+    await push.execute(  # type: ignore[attr-defined]
+        channel="feishu",
+        chat_id="chat",
+        image="meme.png",
+        provider_uuid="image-uuid",
+    )
+    await push.execute(  # type: ignore[attr-defined]
+        channel="feishu",
+        chat_id="chat",
+        file="report.pdf",
+        provider_uuid="file-uuid",
+    )
+    cli_result = await push.execute(  # type: ignore[attr-defined]
+        channel="cli",
+        chat_id="chat",
+        image="meme.png",
+    )
+
+    assert [(kind, chat_id, path) for kind, chat_id, path, _ in media_calls] == [
+        ("image", "chat", "meme.png"),
+        ("file", "chat", "report.pdf"),
+    ]
+    assert [provider for *_, provider in media_calls] == [
+        "image-uuid",
+        "file-uuid:report.pdf",
+    ]
+    assert "不支持发送图片" in cli_result
 
 
 async def test_runtime_bundle_rolls_back_extensions_when_background_construction_fails(
@@ -128,7 +228,7 @@ class RollbackPlugin(Plugin):
 
     monkeypatch.setattr("memopilot.bootstrap.ToolRegistry", CapturingRegistry)
     monkeypatch.setattr("memopilot.bootstrap.EventBus", CapturingBus)
-    monkeypatch.setattr("memopilot.bootstrap.BackgroundTaskDispatcher", fail_executor)
+    monkeypatch.setattr("memopilot.bootstrap.CoreRunner", fail_executor)
     settings = MemoPilotSettings(
         workspace=tmp_path,
         embedding_base_url="https://embedding.example/v1",
@@ -194,7 +294,7 @@ async def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(
     assert any("shell_restore" in hook_id for hook_id in bundle.hook_ids)
     assert any("shell_safety" in hook_id for hook_id in bundle.hook_ids)
     assert bundle.runtime is not None
-    assert bundle.background_dispatcher is None
+    assert bundle.core_runner is None
     assert bundle.memory_tasks.repository is bundle.repository
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
@@ -400,7 +500,7 @@ required_tools: [search]
     await bundle.close_extensions()
 
 
-async def test_runtime_bundle_builds_background_dispatcher_when_outbound_is_available(
+async def test_runtime_bundle_builds_core_runner_when_outbound_is_available(
     tmp_path: Path,
 ) -> None:
     settings = MemoPilotSettings(
@@ -425,9 +525,9 @@ async def test_runtime_bundle_builds_background_dispatcher_when_outbound_is_avai
         schema["function"]["name"] for schema in bundle.tools.schemas()
     }
     assert bundle.memory_tasks.repository is bundle.repository
-    assert bundle.background_dispatcher is not None
-    assert bundle.background_dispatcher.proactive is not None
-    assert bundle.background_dispatcher.drift is not None
+    assert bundle.core_runner is not None
+    assert bundle.core_runner.proactive is not None
+    assert bundle.core_runner.drift is not None
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
     await bundle.close_extensions()

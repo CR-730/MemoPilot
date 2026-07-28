@@ -88,7 +88,7 @@ async def run_all(
         if not settings.feishu_allow_from:
             logger.warning("飞书 allowlist 为空：当前允许所有私聊用户访问")
         logger.info(
-            "MemoPilot 已启动：MessageBus、AgentLoop、SchedulerService、ProactiveLoop "
+            "MemoPilot 已启动：Channel、统一 AgentLoop 和 SchedulerService "
             "运行于同一 asyncio 事件循环"
         )
         runtime_task = asyncio.create_task(runtime.run_forever(), name="memopilot-runtime")

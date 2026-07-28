@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.hooks import HookContext, HookOutcome, ToolHook
+from memopilot.extensions.plugin_manager import PluginManager
 from memopilot.extensions.prompts import (
     PromptBlock,
     PromptRenderContext,
@@ -27,6 +30,14 @@ from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tool_search import ToolSearchTool
 from memopilot.runtime.tools import Tool, ToolRegistry
 from memopilot.scheduling.tool_context import current_schedule_tool_context
+
+CITATION_PLUGIN_DIR = (
+    Path(__file__).resolve().parents[3]
+    / "src"
+    / "memopilot"
+    / "builtin_plugins"
+    / "citation"
+)
 
 
 class _Provider(ChatProvider):
@@ -576,6 +587,49 @@ async def test_after_step_early_stop_keeps_tool_result_and_skips_next_provider_c
     assert any(message.role == "tool" for message in result.messages)
 
 
+async def test_step_phase_token_estimates_are_not_character_counts() -> None:
+    estimates: dict[str, int] = {}
+
+    class CaptureBeforeStep:
+        phase = LifecyclePhase.BEFORE_STEP
+        slot = "test.capture_before_step_tokens"
+        requires = ("before_step.build_ctx", "step:ctx")
+        produces = ()
+
+        async def run(self, context):
+            estimates["before"] = context.slots["step:ctx"].input_tokens_estimate
+            return {}
+
+    class CaptureAfterStep:
+        phase = LifecyclePhase.AFTER_STEP
+        slot = "test.capture_after_step_tokens"
+        requires = ("after_step.copy_input", "step:ctx")
+        produces = ()
+
+        async def run(self, context):
+            estimates["after"] = context.slots["step:ctx"].context_tokens_estimate
+            return {}
+
+    provider = _Provider(
+        [ModelResponse(content="done", tool_calls=(), finish_reason="stop")]
+    )
+    await AgentRuntime(
+        provider,
+        ToolRegistry(),
+        modules=(CaptureBeforeStep(), CaptureAfterStep()),
+    ).run(TurnInput("feishu:chat-1", "abcd", system_prompt="system"))
+
+    messages = provider.requests[0]
+    payload = json.dumps(
+        [message.to_openai(include_provider_fields=True) for message in messages],
+        ensure_ascii=False,
+    )
+    expected_tokens = max(1, len(payload) // 3)
+    character_count = sum(len(message.content or "") for message in messages)
+    assert expected_tokens != character_count
+    assert estimates == {"before": expected_tokens, "after": expected_tokens}
+
+
 async def test_runtime_audit_keeps_denied_status_and_structured_hook_details() -> None:
     class _DenyHook(ToolHook):
         async def run(self, context: HookContext) -> HookOutcome:
@@ -1070,6 +1124,11 @@ async def test_runtime_does_not_duplicate_recent_turns_from_markdown() -> None:
 
 
 async def test_runtime_strips_memory_citation_protocol_and_exposes_used_ids() -> None:
+    manager = PluginManager(
+        [CITATION_PLUGIN_DIR],
+        tool_registry=ToolRegistry(),
+    )
+    await manager.load_all()
     provider = _Provider(
         [
             ModelResponse(
@@ -1083,6 +1142,7 @@ async def test_runtime_strips_memory_citation_protocol_and_exposes_used_ids() ->
     result = await AgentRuntime(
         provider,
         ToolRegistry(),
+        modules=manager.phase_modules,
         memory_engine=_MemoryEngine(),  # type: ignore[arg-type]
     ).run(
         TurnInput(session_key="feishu:chat-1", content="我喜欢什么风格？")
@@ -1130,9 +1190,15 @@ async def test_candidate_not_injected_cannot_be_cited_or_reinforced() -> None:
     provider = _Provider(
         [ModelResponse(content="回答\n§cited:[p2]§", tool_calls=(), finish_reason="stop")]
     )
+    manager = PluginManager(
+        [CITATION_PLUGIN_DIR],
+        tool_registry=ToolRegistry(),
+    )
+    await manager.load_all()
     result = await AgentRuntime(
         provider,
         ToolRegistry(),
+        modules=manager.phase_modules,
         memory_engine=_CandidateOnlyMemory(),  # type: ignore[arg-type]
     ).run(TurnInput(session_key="feishu:chat-1", content="问题"))
 

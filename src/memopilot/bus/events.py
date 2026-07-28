@@ -41,17 +41,18 @@ class InboundMessage:
         return str(self.metadata.get("context_chat_id") or self.chat_id).strip()
 
 
-@dataclass
-class OutboundMessage:
-    """Agent 发出的消息。"""
-
+@dataclass(frozen=True, slots=True)
+class TurnCommitted:
+    session_key: str
     channel: str
     chat_id: str
-    content: str
-    thinking: str | None = None
-    reply_to: str | None = None
-    media: list[str] = field(default_factory=_empty_media)
-    metadata: dict[str, Any] = field(default_factory=_empty_metadata)
+    input_message: str
+    assistant_response: str
+    tools_used: list[str]
+    timestamp: datetime
+    tool_chain: tuple[dict[str, str], ...] = ()
+    react_cache_prompt_tokens: int = 0
+    react_cache_hit_tokens: int = 0
 
 
-__all__ = ["InboundMessage", "OutboundMessage"]
+__all__ = ["InboundMessage", "TurnCommitted"]

@@ -8,14 +8,18 @@ import logging
 from collections.abc import Mapping
 from uuid import uuid4
 
-from memopilot.channels.contracts import InboundMessage, MessageBus, SendReceipt
+from memopilot.channels.contracts import InboundHandler, InboundMessage, SendReceipt
 
 logger = logging.getLogger(__name__)
 
 
 class IPCServerChannel:
-    def __init__(self, bus: MessageBus, endpoint: str = "127.0.0.1:8765") -> None:
-        self._bus = bus
+    def __init__(
+        self,
+        inbound_handler: InboundHandler,
+        endpoint: str = "127.0.0.1:8765",
+    ) -> None:
+        self._inbound_handler = inbound_handler
         self._endpoint = endpoint
         self._writers: dict[str, asyncio.StreamWriter] = {}
         self._server: asyncio.AbstractServer | None = None
@@ -51,7 +55,7 @@ class IPCServerChannel:
                 content = str(payload.get("content", "")).strip()
                 if not content:
                     continue
-                await self._bus.publish_inbound(
+                await self._inbound_handler(
                     InboundMessage(
                         channel="cli",
                         sender="cli-user",

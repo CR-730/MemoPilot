@@ -46,7 +46,11 @@ async def test_provider_sends_tools_and_parses_function_calls() -> None:
                 ),
             )
         ],
-        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=4),
+        usage=SimpleNamespace(
+            prompt_tokens=10,
+            prompt_cache_hit_tokens=6,
+            completion_tokens=4,
+        ),
     )
     client, completions = _client(response)
     provider = OpenAICompatibleProvider(
@@ -76,6 +80,7 @@ async def test_provider_sends_tools_and_parses_function_calls() -> None:
     )
     assert result.finish_reason == "tool_calls"
     assert result.prompt_tokens == 10
+    assert result.prompt_cache_hit_tokens == 6
     assert completions.calls[0]["model"] == "deepseek-v4-flash"
     assert completions.calls[0]["tools"] == tools
     assert completions.calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
@@ -430,7 +435,11 @@ async def test_streaming_provider_emits_reasoning_and_content_deltas() -> None:
                         ),
                     )
                 ],
-                usage=SimpleNamespace(prompt_tokens=8, completion_tokens=5),
+                usage=SimpleNamespace(
+                    prompt_tokens=8,
+                    prompt_cache_hit_tokens=3,
+                    completion_tokens=5,
+                ),
             ),
         ]
     )
@@ -457,6 +466,7 @@ async def test_streaming_provider_emits_reasoning_and_content_deltas() -> None:
     assert result.provider_fields == {"reasoning_content": "先分析"}
     assert result.finish_reason == "stop"
     assert result.prompt_tokens == 8
+    assert result.prompt_cache_hit_tokens == 3
     assert result.completion_tokens == 5
     assert completions.calls[0]["stream"] is True
     assert completions.calls[0]["stream_options"] == {"include_usage": True}

@@ -275,6 +275,11 @@ class OpenAICompatibleProvider:
             finish_reason=choice.finish_reason,
             response_id=getattr(response, "id", None),
             prompt_tokens=getattr(usage, "prompt_tokens", None),
+            prompt_cache_hit_tokens=getattr(
+                usage,
+                "prompt_cache_hit_tokens",
+                None,
+            ),
             completion_tokens=getattr(usage, "completion_tokens", None),
             thinking=str(thinking) if thinking is not None else None,
             provider_fields=provider_fields,
@@ -318,6 +323,7 @@ class OpenAICompatibleProvider:
         response_id: str | None = None
         finish_reason: str | None = None
         prompt_tokens: int | None = None
+        prompt_cache_hit_tokens: int | None = None
         completion_tokens: int | None = None
 
         async for chunk in stream:
@@ -325,6 +331,11 @@ class OpenAICompatibleProvider:
             usage = getattr(chunk, "usage", None)
             if usage is not None:
                 prompt_tokens = getattr(usage, "prompt_tokens", prompt_tokens)
+                prompt_cache_hit_tokens = getattr(
+                    usage,
+                    "prompt_cache_hit_tokens",
+                    prompt_cache_hit_tokens,
+                )
                 completion_tokens = getattr(usage, "completion_tokens", completion_tokens)
             choices = getattr(chunk, "choices", None) or ()
             if not choices:
@@ -369,6 +380,7 @@ class OpenAICompatibleProvider:
             finish_reason=finish_reason,
             response_id=response_id,
             prompt_tokens=prompt_tokens,
+            prompt_cache_hit_tokens=prompt_cache_hit_tokens,
             completion_tokens=completion_tokens,
             thinking=thinking,
             provider_fields=provider_fields,

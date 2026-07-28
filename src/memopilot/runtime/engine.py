@@ -39,7 +39,6 @@ from memopilot.memory.tool_context import (
     reset_memory_tool_context,
 )
 from memopilot.runtime.contracts import ChatMessage, ModelResponse
-from memopilot.runtime.memory_citations import CITATION_PROTOCOL, extract_cited_ids
 from memopilot.runtime.phases import (
     LifecyclePhase,
     PhaseContext,
@@ -59,6 +58,7 @@ from memopilot.runtime.react import (
     ReActProgressObserver,
     ReActResult,
     ToolCallRecord,
+    estimate_messages_tokens,
 )
 from memopilot.runtime.tool_search import ToolDiscoveryState, format_deferred_tools_hint
 from memopilot.runtime.tools import ToolRegistry
@@ -156,6 +156,7 @@ class AgentRuntime:
         skills: SkillCatalog | None = None,
         tool_search_enabled: bool = False,
         prompt_workspace: Path | None = None,
+        context_window_tokens: int = 1_000_000,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -165,6 +166,9 @@ class AgentRuntime:
         self._event_bus = event_bus
         self._tool_search_enabled = tool_search_enabled
         self._prompt_workspace = prompt_workspace
+        if context_window_tokens <= 0:
+            raise ValueError("模型上下文窗口必须大于 0")
+        self._context_window_tokens = context_window_tokens
         self._tool_discovery = ToolDiscoveryState()
         prompt_renderer = PromptRenderer(tuple(prompt_blocks))
         if prompt_max_chars <= 0:
@@ -293,6 +297,7 @@ class AgentRuntime:
             step_sink,
             event_bus=self._event_bus,
             tools=active_tools,
+            context_window_tokens=self._context_window_tokens,
         )
         await execution.run_phase(LifecyclePhase.BEFORE_TURN)
         before_turn_ctx = cast(BeforeTurnCtx, context.slots["session:ctx"])
@@ -403,22 +408,22 @@ class AgentRuntime:
                 ],
                 self._tools.get_always_on_names(),
             )
-        cleaned_reply, cited_memory_ids = extract_cited_ids(react.reply)
-        allowed_memory_ids = _allowed_memory_ids(context, react)
-        cited_memory_ids = tuple(
-            item_id for item_id in cited_memory_ids if item_id in allowed_memory_ids
-        )
-        if cleaned_reply != react.reply:
-            messages = list(react.messages)
-            if messages and messages[-1].role == "assistant":
-                messages[-1] = replace(messages[-1], content=cleaned_reply)
-            react = replace(react, reply=cleaned_reply, messages=tuple(messages))
         context.slots["reasoning.result"] = react
         context.slots["after_reasoning.input"] = AfterReasoningInput(
             cast(BeforeTurnInput, context.slots["before_turn.input"]),
             react,
         )
         await execution.run_phase(LifecyclePhase.AFTER_REASONING)
+        raw_cited_ids = context.slots.get("persist:assistant:cited_memory_ids")
+        candidate_ids = (
+            tuple(str(item_id) for item_id in raw_cited_ids)
+            if isinstance(raw_cited_ids, (list, tuple))
+            else ()
+        )
+        allowed_memory_ids = _allowed_memory_ids(context, react)
+        cited_memory_ids = tuple(
+            item_id for item_id in candidate_ids if item_id in allowed_memory_ids
+        )
         await execution.run_phase(LifecyclePhase.AFTER_TURN)
         final_react = context.slots.get("turn.output")
         if not isinstance(final_react, ReActResult):
@@ -481,12 +486,14 @@ class _RuntimeExecution(ReActObserver):
         *,
         event_bus: EventBus | None = None,
         tools: ToolRegistry,
+        context_window_tokens: int,
     ) -> None:
         self._pipeline = pipeline
         self._context = context
         self._sink = sink
         self._event_bus = event_bus
         self._tools = tools
+        self._context_window_tokens = context_window_tokens
         self.phase_trace: list[PhaseTraceEntry] = []
         self.trace: list[RuntimeTraceEvent] = []
         self._iteration: int | None = None
@@ -632,7 +639,7 @@ class _RuntimeExecution(ReActObserver):
                 state.channel,
                 state.chat_id,
                 iteration,
-                _estimate_messages_chars(messages),
+                estimate_messages_tokens(messages),
                 phase_input.visible_names,
             )
         elif phase is LifecyclePhase.AFTER_STEP:
@@ -644,13 +651,14 @@ class _RuntimeExecution(ReActObserver):
                 state.channel,
                 state.chat_id,
                 cast(int, self._context.slots["step.iteration"]),
-                _estimate_messages_chars(messages),
+                estimate_messages_tokens(messages),
                 tuple(record.call.name for record in records),
                 response.content or "",
                 tuple(record.call.name for record in records),
                 tuple(_tool_record_snapshot(record) for record in records),
                 response.thinking,
                 bool(response.tool_calls),
+                self._context_window_tokens,
             )
             self._context.slots["after_step.input"] = step_ctx
             self._context.slots["step:ctx"] = step_ctx
@@ -872,12 +880,7 @@ async def _prompt_render(
     memory_prompt = ""
     memory_context = context.slots.get("memory.context")
     if isinstance(memory_context, str) and memory_context.strip():
-        memory_prompt = (
-            "以下是与当前问题相关的长期记忆：\n"
-            + memory_context.strip()
-            + "\n\n"
-            + CITATION_PROTOCOL
-        )
+        memory_prompt = "以下是与当前问题相关的长期记忆：\n" + memory_context.strip()
     active_prompt = ""
     skill_catalog = ""
     if skills is not None:
@@ -1296,10 +1299,6 @@ def _phase_ctx_slot(phase: LifecyclePhase) -> str:
         LifecyclePhase.AFTER_REASONING: "reasoning:ctx",
         LifecyclePhase.AFTER_TURN: "turn:ctx",
     }[phase]
-
-
-def _estimate_messages_chars(messages: Sequence[ChatMessage]) -> int:
-    return sum(len(item.content or "") for item in messages)
 
 
 def _tool_record_snapshot(record: ToolCallRecord) -> dict[str, object]:

@@ -33,6 +33,7 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
     assert settings.llm_retry_limit == 2
     assert settings.llm_max_iterations == 10
     assert settings.llm_max_output_tokens == 2048
+    assert settings.llm_context_window_tokens == 1_000_000
     assert settings.llm_timeout_seconds == 60
     assert settings.llm_thinking_enabled is False
     assert settings.tool_search_enabled is True
@@ -181,6 +182,7 @@ base_url = "https://vl.example/v1"
 [agent]
 max_tokens = 4096
 max_iterations = 12
+context_window_tokens = 128000
 [agent.tools]
 search_enabled = true
 [memory.embedding]
@@ -213,6 +215,7 @@ channel_name = "feishu_work"
     assert settings.vl_base_url == "https://vl.example/v1"
     assert settings.llm_max_output_tokens == 4096
     assert settings.llm_max_iterations == 12
+    assert settings.llm_context_window_tokens == 128_000
     assert settings.tool_search_enabled is True
     assert settings.embedding_model == "text-embedding-v3"
     assert settings.embedding_api_key.get_secret_value() == "embedding-secret"

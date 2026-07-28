@@ -21,10 +21,11 @@ from memopilot.memory.store import MemoryStore
 from memopilot.memory.tasks import MemoryTaskRouter
 from memopilot.memory.vectorization import VectorizationService
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
-from memopilot.runtime.background_task_loop import BackgroundTaskLoop
+from memopilot.runtime.agent_loop import AgentLoop
 from memopilot.tasks.lease import SessionLeaseManager
 from memopilot.tasks.operational import OperationalRepository
 from memopilot.tasks.redis_queue import RedisTaskQueue
+from memopilot.tasks.session_coordination import RedisSessionCoordinator
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
@@ -79,7 +80,7 @@ class _MemoryBackgroundExecutor:
     def __init__(self, router: MemoryTaskRouter) -> None:
         self.router = router
 
-    async def execute(self, message, *, payload, lease, now) -> str:
+    async def execute(self, message, *, payload, lease, now) -> tuple[()]:
         del now
         await self.router.execute(
             kind=message.kind,
@@ -87,7 +88,7 @@ class _MemoryBackgroundExecutor:
             payload=payload,
             lease=lease,
         )
-        return "succeeded"
+        return ()
 
 
 @pytest.mark.asyncio
@@ -132,13 +133,15 @@ async def test_turn_to_async_archive_vector_and_next_turn_recall(
     )
     queue = RedisTaskQueue(memory_redis)
     await queue.ensure_consumer_groups()
-    for task in tasks:
+    assert tasks is not None
+    for task in tasks.background_tasks:
         assert await queue.publish_task_once(task) is not None
-    runner = BackgroundTaskLoop(
+    runner = AgentLoop(
         queue,
         SessionLeaseManager(memory_redis, repository, ttl=timedelta(seconds=2)),
         _MemoryBackgroundExecutor(router),
         owner_id="runner-memory",
+        session_coordinator=RedisSessionCoordinator(memory_redis),
         clock=lambda: NOW + timedelta(seconds=1),
         heartbeat_interval=0.05,
     )

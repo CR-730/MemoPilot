@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,10 +14,12 @@ from zoneinfo import ZoneInfo
 
 from redis.asyncio import Redis
 
-from memopilot.app.service import GatewayService
 from memopilot.bus.events import InboundMessage
 from memopilot.channels.base import AttachmentStore, SessionIdentityIndex
-from memopilot.channels.contracts import InterruptController, MessageBus
+from memopilot.channels.contracts import (
+    InboundHandler,
+    InterruptAcknowledgement,
+)
 from memopilot.channels.feishu import FeishuChannel
 from memopilot.channels.ipc import IPCServerChannel
 from memopilot.config import MemoPilotSettings
@@ -73,9 +75,8 @@ from memopilot.proactive.loop import ProactiveLoop
 from memopilot.proactive.mcp_sources import ProactiveSourceGateway, load_proactive_sources
 from memopilot.proactive.service import ProactiveService
 from memopilot.proactive.store import ProactiveRepository
-from memopilot.runtime.agent_loop import AgentLoop, PassiveTurnStore
-from memopilot.runtime.background import BackgroundTaskDispatcher
-from memopilot.runtime.background_task_loop import BackgroundTaskLoop
+from memopilot.runtime.agent_loop import AgentLoop
+from memopilot.runtime.background import CoreRunner
 from memopilot.runtime.common_tools import register_common_tools
 from memopilot.runtime.common_tools.http import SharedHttpResources
 from memopilot.runtime.common_tools.message_push import MessagePushTool
@@ -117,7 +118,7 @@ class RuntimeBundle:
     memory_engine: LayeredMemoryEngine
     memory_tasks: MemoryTaskRouter
     runtime: AgentRuntime
-    background_dispatcher: BackgroundTaskDispatcher | None
+    core_runner: CoreRunner | None
     skills: SkillCatalog
     event_bus: EventBus
     plugin_manager: PluginManager
@@ -142,12 +143,9 @@ class RuntimeBundle:
 class AppRuntime:
     """原型式单进程运行时；Redis 只承担后台调度、抢占和恢复。"""
 
-    gateway: GatewayService
     scheduler: SchedulerService
-    background_tasks: BackgroundTaskLoop
     agent_loop: AgentLoop
     redis: Redis
-    bus: MessageBus
     repository: OperationalRepository
     channel: FeishuChannel
     console: IPCServerChannel
@@ -162,7 +160,7 @@ class AppRuntime:
         if self._started:
             return
         await self.console.start()
-        await self.gateway.start()
+        await self.channel.start()
         await self.runtime.mcp_registry.load_and_connect_all()
         self._started = True
 
@@ -170,10 +168,6 @@ class AppRuntime:
         tasks = (
             asyncio.create_task(self.agent_loop.run_forever(), name="memopilot-agent-loop"),
             asyncio.create_task(self.scheduler.run_forever(), name="memopilot-scheduler"),
-            asyncio.create_task(
-                self.background_tasks.run_forever(),
-                name="memopilot-background-tasks",
-            ),
         )
         try:
             await asyncio.gather(*tasks)
@@ -184,7 +178,7 @@ class AppRuntime:
 
     async def close(self) -> None:
         self.agent_loop.stop()
-        await self.gateway.stop()
+        await self.channel.stop()
         await self.console.stop()
         await self.runtime.close_extensions()
         await self.redis.aclose()
@@ -201,6 +195,7 @@ async def build_runtime_bundle(
     tools: Iterable[Tool] = (),
     outbound: OutboundPort | None = None,
     message_push: MessagePushTool | None = None,
+    progress_factory: Callable[[InboundMessage], ReActProgressObserver | None] | None = None,
     repository: OperationalRepository | None = None,
     skills: SkillCatalog | None = None,
 ) -> RuntimeBundle:
@@ -237,6 +232,7 @@ async def build_runtime_bundle(
         hotness_alpha=settings.memory_hotness_alpha,
         hotness_half_life_days=settings.memory_hotness_half_life_days,
     )
+    event_bus = EventBus()
     retriever = MemoryRetriever(
         cast(RetrievalStore, store),
         embedding_provider,
@@ -252,6 +248,7 @@ async def build_runtime_bundle(
     memory_engine = LayeredMemoryEngine(
         retriever,
         hypothesis_provider=ChatHypothesisProvider(light_provider),
+        event_bus=event_bus,
     )
     registry = ToolRegistry(configured_tools)
     http_resources = SharedHttpResources()
@@ -281,7 +278,6 @@ async def build_runtime_bundle(
     )
     for schedule_tool in build_schedule_tools(schedule_service):
         registry.register(schedule_tool)
-    event_bus = EventBus()
     skill_holder: list[SkillCatalog] = []
     procedure_tagger: ChatProcedureTagger | None = None
 
@@ -301,6 +297,7 @@ async def build_runtime_bundle(
         event_bus=event_bus,
         tool_registry=registry,
         workspace=settings.workspace,
+        session_manager=operational,
         memory_engine=memory_engine,
     )
     hook_ids: tuple[str, ...] = ()
@@ -348,6 +345,7 @@ async def build_runtime_bundle(
             store,
             embedding_provider,
             procedure_tagger=procedure_tagger,
+            event_bus=event_bus,
         )
         registry.register(build_memorize_tool(memorizer), always_on=True)
         registry.register(build_forget_memory_tool(store), always_on=True)
@@ -364,6 +362,7 @@ async def build_runtime_bundle(
             skills=active_skills,
             tool_search_enabled=settings.tool_search_enabled,
             prompt_workspace=settings.workspace,
+            context_window_tokens=settings.llm_context_window_tokens,
         )
         memory_tasks = MemoryTaskRouter(
             ConsolidationService(
@@ -479,14 +478,17 @@ async def build_runtime_bundle(
             shared_tools=registry,
             connected_mcp_servers=lambda: frozenset(mcp_registry.connected_server_ids),
         )
-        background_dispatcher = (
-            BackgroundTaskDispatcher(
+        core_runner = (
+            CoreRunner(
                 runtime,
                 repository=operational,
                 outbound=outbound,
                 memory_tasks=memory_tasks,
                 proactive=proactive_loop,
                 drift=system_jobs,
+                event_bus=event_bus,
+                short_term_message_limit=settings.memory_short_term_message_limit,
+                progress_factory=progress_factory,
             )
             if outbound is not None and proactive_loop is not None
             else None
@@ -497,7 +499,7 @@ async def build_runtime_bundle(
             memory_engine=memory_engine,
             memory_tasks=memory_tasks,
             runtime=runtime,
-            background_dispatcher=background_dispatcher,
+            core_runner=core_runner,
             skills=active_skills,
             event_bus=event_bus,
             plugin_manager=manager,
@@ -522,48 +524,123 @@ async def build_app_runtime(settings: MemoPilotSettings) -> AppRuntime:
     settings.validate_app_ready()
     repository = _repository(settings)
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    bus = MessageBus()
-    console = IPCServerChannel(bus)
-    channel = _feishu_channel(settings, repository, bus=bus)
+    queue = RedisTaskQueue(redis)
+    coordinator = RedisSessionCoordinator(redis)
+
+    async def handle_inbound(message: InboundMessage) -> object:
+        if message.content.strip() == "/stop":
+            await coordinator.request_background_stop(
+                message.session_key,
+                reason="user_stop",
+            )
+            return InterruptAcknowledgement(
+                message="已收到停止请求。",
+                provider_uuid=str(
+                    uuid5(
+                        NAMESPACE_URL,
+                        "memopilot:interrupt:"
+                        f"{message.metadata.get('message_id') or message.session_key}",
+                    )
+                ),
+            )
+        repository.record_inbound_activity(message)
+        return await queue.publish_inbound(
+            message,
+            stop_key=coordinator.stop_key(message.session_key),
+        )
+
+    console = IPCServerChannel(handle_inbound)
+    channel = _feishu_channel(settings, repository, inbound_handler=handle_inbound)
     message_push = MessagePushTool()
 
-    async def push_feishu(chat_id: str, message: str) -> None:
-        await channel.send(chat_id, message)
+    async def push_feishu(
+        chat_id: str,
+        message: str,
+        *,
+        provider_uuid: str | None = None,
+    ) -> None:
+        await channel.send(chat_id, message, provider_uuid=provider_uuid)
 
-    async def push_console(chat_id: str, message: str) -> None:
-        await console.send(chat_id, message)
+    async def push_console(
+        chat_id: str,
+        message: str,
+        *,
+        provider_uuid: str | None = None,
+    ) -> None:
+        await console.send(chat_id, message, provider_uuid=provider_uuid)
 
-    message_push.register_channel("feishu", text=push_feishu)
+    async def push_feishu_image(
+        chat_id: str,
+        image: str,
+        *,
+        provider_uuid: str,
+    ) -> None:
+        await channel.send_image(
+            chat_id,
+            image,
+            provider_uuid=provider_uuid,
+        )
+
+    async def push_feishu_file(
+        chat_id: str,
+        file: str,
+        name: str | None = None,
+        *,
+        provider_uuid: str,
+    ) -> None:
+        await channel.send_file(
+            chat_id,
+            file,
+            provider_uuid=provider_uuid,
+            name=name,
+        )
+
+    message_push.register_channel(
+        "feishu",
+        text=push_feishu,
+        image=push_feishu_image,
+        file=push_feishu_file,
+    )
     message_push.register_channel("cli", text=push_console)
     outbound = PushToolOutboundPort(message_push)
+
+    def progress_factory(message: InboundMessage) -> ReActProgressObserver | None:
+        if message.channel != "feishu":
+            return None
+        message_id = str(message.metadata.get("message_id") or message.session_key)
+        return FeishuLiveProgress(
+            channel,
+            chat_id=message.chat_id,
+            provider_uuid=str(uuid5(NAMESPACE_URL, f"feishu:{message_id}:live")),
+        )
+
     try:
         runtime = await build_runtime_bundle(
             settings,
             chat_provider=_chat_provider(settings),
             outbound=outbound,
             message_push=message_push,
+            progress_factory=progress_factory,
             repository=repository,
         )
     except BaseException:
         await redis.aclose()
         raise
-    if runtime.background_dispatcher is None:
+    if runtime.core_runner is None:
         await runtime.close_extensions()
         await redis.aclose()
         raise RuntimeError("后台任务分派器未初始化")
 
-    queue = RedisTaskQueue(redis)
-    coordinator = RedisSessionCoordinator(redis)
     leases = SessionLeaseManager(
         redis,
         repository,
         ttl=timedelta(seconds=settings.lease_ttl_seconds),
     )
-    background_tasks = BackgroundTaskLoop(
+    agent_loop = AgentLoop(
         queue,
         leases,
-        runtime.background_dispatcher,
-        owner_id=f"background-{uuid4().hex[:8]}",
+        runtime.core_runner,
+        owner_id=f"agent-{uuid4().hex[:8]}",
         heartbeat_interval=settings.lease_heartbeat_seconds,
         pending_min_idle=timedelta(seconds=settings.reclaim_idle_seconds),
         session_coordinator=coordinator,
@@ -588,41 +665,11 @@ async def build_app_runtime(settings: MemoPilotSettings) -> AppRuntime:
             proactive_enabled=settings.proactive_enabled,
         ),
         queue=queue,
-        session_coordinator=coordinator,
-    )
-
-    def progress_factory(message: InboundMessage) -> ReActProgressObserver | None:
-        if message.channel != "feishu":
-            return None
-        message_id = str(message.metadata.get("message_id") or message.session_key)
-        return FeishuLiveProgress(
-            channel,
-            chat_id=message.chat_id,
-            provider_uuid=str(uuid5(NAMESPACE_URL, f"feishu:{message_id}:live")),
-        )
-
-    agent_loop = AgentLoop(
-        bus=bus,
-        runtime=runtime.runtime,
-        store=cast(PassiveTurnStore, repository),
-        short_term_message_limit=settings.memory_short_term_message_limit,
-        progress_factory=progress_factory,
-        session_coordinator=coordinator,
-        background_publisher=queue,
-    )
-    channel.set_interrupt_controller(agent_loop)
-    gateway = GatewayService(
-        channel=channel,
-        bus=bus,
-        outbound_transports={"feishu": channel, "cli": console},
     )
     return AppRuntime(
-        gateway=gateway,
         scheduler=scheduler,
-        background_tasks=background_tasks,
         agent_loop=agent_loop,
         redis=redis,
-        bus=bus,
         repository=repository,
         channel=channel,
         console=console,
@@ -771,20 +818,18 @@ def _feishu_channel(
     settings: MemoPilotSettings,
     repository: OperationalRepository,
     *,
-    bus: MessageBus,
-    interrupt_controller: InterruptController | None = None,
+    inbound_handler: InboundHandler,
 ) -> FeishuChannel:
     return FeishuChannel(
         app_id=settings.feishu_app_id,
         app_secret=settings.feishu_app_secret.get_secret_value(),
-        bus=bus,
+        inbound_handler=inbound_handler,
         identity_index=SessionIdentityIndex(
             repository,
             channel=settings.feishu_channel_name,
         ),
         attachment_store=AttachmentStore(settings.uploads_dir),
         allow_from=settings.feishu_allow_from,
-        interrupt_controller=interrupt_controller,
         channel_name=settings.feishu_channel_name,
     )
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
+
 from memopilot.proactive.loop import ProactiveLoop
 from memopilot.proactive.service import ProactiveOutcome
 from memopilot.runtime.outbound import OutboundDispatch
@@ -76,7 +78,7 @@ async def test_proactive_reply_dispatches_then_commits_decision() -> None:
     assert proactive.finalized == [proactive.outcome]
 
 
-async def test_proactive_send_failure_runs_failure_path() -> None:
+async def test_proactive_send_failure_stays_retryable() -> None:
     proactive = _ProactiveService(
         ProactiveOutcome(
             "send",
@@ -87,13 +89,13 @@ async def test_proactive_send_failure_runs_failure_path() -> None:
         )
     )
 
-    result = await _loop(proactive, _Outbound(False)).execute_task(
-        task_id="proactive-1",
-        session_key="feishu:chat-1",
-        payload={"channel": "cli", "chat_id": "chat-1", "activity_version": 4},
-        lease=SimpleNamespace(),
-        now=NOW,
-    )
+    with pytest.raises(RuntimeError, match="明确发送成功"):
+        await _loop(proactive, _Outbound(False)).execute_task(
+            task_id="proactive-1",
+            session_key="feishu:chat-1",
+            payload={"channel": "cli", "chat_id": "chat-1", "activity_version": 4},
+            lease=SimpleNamespace(),
+            now=NOW,
+        )
 
-    assert result == "failed"
-    assert proactive.failed == [proactive.outcome]
+    assert proactive.failed == []

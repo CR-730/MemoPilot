@@ -24,10 +24,6 @@ class UserScheduleService(Protocol):
     def scan_due(self, *, now: datetime) -> DueScanResult: ...
 
 
-class SessionCoordinator(Protocol):
-    async def session_busy(self, session_key: str) -> bool: ...
-
-
 @dataclass(frozen=True, slots=True)
 class SystemTickResult:
     memory: object
@@ -106,14 +102,12 @@ class SchedulerService:
         queue: object,
         *,
         max_publish_per_tick: int = 100,
-        session_coordinator: SessionCoordinator | None = None,
     ) -> None:
         if max_publish_per_tick <= 0:
             raise ValueError("max_publish_per_tick 必须大于 0")
         self.scheduler = scheduler
         self.queue = queue
         self.max_publish_per_tick = max_publish_per_tick
-        self.session_coordinator = session_coordinator
 
     async def run_once(self, *, now: datetime | None = None) -> int:
         current = now or self.scheduler.clock()
@@ -121,25 +115,23 @@ class SchedulerService:
         published = 0
         for task in (result.memory, *result.schedules.tasks, result.proactive):
             if isinstance(task, BackgroundTask):
-                if (
-                    task.kind == "proactive.tick"
-                    and self.session_coordinator is not None
-                    and await self.session_coordinator.session_busy(task.session_key)
-                ):
-                    continue
                 message_id = await self.queue.publish_task_once(task)  # type: ignore[attr-defined]
                 published += message_id is not None
         return published
 
     async def run_forever(self) -> None:
-        while True:
-            try:
-                await self.run_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Scheduler 周期失败，下次轮询继续")
-            await self.scheduler.sleep(self.scheduler.poll_interval_seconds)
+        logger.info("SchedulerService started")
+        try:
+            while True:
+                try:
+                    await self.run_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Scheduler 周期失败，下次轮询继续")
+                await self.scheduler.sleep(self.scheduler.poll_interval_seconds)
+        finally:
+            logger.info("SchedulerService stopped")
 
 
 __all__ = ["SchedulerService", "SystemScheduler", "SystemTickResult"]

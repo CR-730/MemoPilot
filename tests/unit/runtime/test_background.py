@@ -1,133 +1,219 @@
+from __future__ import annotations
+
+import json
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from memopilot.runtime.background import BackgroundTaskDispatcher
-from memopilot.runtime.outbound import OutboundDispatch
+from memopilot.bus.events import InboundMessage, TurnCommitted
+from memopilot.extensions.events import EventBus
+from memopilot.persistence.migrations import DatabaseKind, migrate_database
+from memopilot.runtime.background import CoreRunner
+from memopilot.runtime.common_tools.message_push import MessagePushTool
+from memopilot.runtime.engine import TurnResult
+from memopilot.runtime.outbound import (
+    DeliveryError,
+    OutboundDispatch,
+    PushToolOutboundPort,
+)
+from memopilot.runtime.react import ReActResult
 from memopilot.tasks.lease import SessionLease
+from memopilot.tasks.operational import OperationalRepository
 from memopilot.tasks.redis_queue import QueueMessage
 
-NOW = datetime(2026, 7, 27, tzinfo=UTC)
-LEASE = SessionLease("feishu:chat-1", "runner-1", 1, "lease-key", "lease-value")
+NOW = datetime(2026, 7, 28, tzinfo=UTC)
+LEASE = SessionLease("feishu:chat-1", "agent-1", 1, "lease-key", "lease-value")
 
 
-class _Proactive:
-    async def execute_task(self, **kwargs) -> str:
-        del kwargs
-        return "drift"
-
-
-class _DriftResult:
-    outcome = "succeeded"
-
-
-class _Drift:
-    def __init__(self) -> None:
+class _Runtime:
+    def __init__(self, media: tuple[str, ...] = ()) -> None:
         self.calls = 0
+        self.media = media
 
-    async def execute_task(self, **kwargs) -> _DriftResult:
-        del kwargs
+    async def run(self, turn: object, **kwargs: object) -> TurnResult:
+        del turn, kwargs
         self.calls += 1
-        return _DriftResult()
-
-
-class _Unused:
-    def __getattr__(self, name):
-        raise AssertionError(f"不应访问 {name}")
-
-
-class _ScheduleRepository:
-    def __init__(self) -> None:
-        self.outcomes: list[str] = []
-
-    def transition_background_schedule(self, execution_id, *, lease, outcome, now):
-        del execution_id, lease, now
-        self.outcomes.append(outcome)
-        return outcome
+        react = ReActResult("旧回复", (), 1, (), "completed")
+        return TurnResult("旧回复", (), react, (), (), self.media)
 
 
 class _Outbound:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str]) -> None:
+        self.results = iter((False, True))
         self.calls: list[OutboundDispatch] = []
+        self.events = events
 
     async def dispatch(self, outbound: OutboundDispatch) -> bool:
+        self.events.append("send")
         self.calls.append(outbound)
-        return True
+        return next(self.results)
+
+
+class _Unused:
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(f"不应访问 {name}")
+
+
+def _runner(
+    repository: OperationalRepository,
+    events: list[str],
+) -> tuple[CoreRunner, _Runtime, _Outbound, EventBus]:
+    runtime = _Runtime()
+    outbound = _Outbound(events)
+    event_bus = EventBus()
+    return (
+        CoreRunner(
+            runtime,  # type: ignore[arg-type]
+            repository=repository,
+            outbound=outbound,
+            memory_tasks=_Unused(),  # type: ignore[arg-type]
+            proactive=_Unused(),  # type: ignore[arg-type]
+            drift=_Unused(),  # type: ignore[arg-type]
+            event_bus=event_bus,
+        ),
+        runtime,
+        outbound,
+        event_bus,
+    )
 
 
 @pytest.mark.asyncio
-async def test_proactive_drift_decision_continues_into_drift_runtime() -> None:
-    drift = _Drift()
-    executor = BackgroundTaskDispatcher(
-        _Unused(),  # type: ignore[arg-type]
-        repository=_Unused(),  # type: ignore[arg-type]
-        outbound=_Unused(),  # type: ignore[arg-type]
-        memory_tasks=_Unused(),  # type: ignore[arg-type]
-        proactive=_Proactive(),
-        drift=drift,
+async def test_committed_turn_retry_reuses_reply_model_and_event_once(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    message_time = NOW
+    inbound = {
+        "channel": "feishu",
+        "sender": "user",
+        "chat_id": "chat-1",
+        "content": "你好",
+        "timestamp": message_time.isoformat(),
+        "media": [],
+        "metadata": {"message_id": "message-1"},
+    }
+    repository.record_inbound_activity(
+        InboundMessage(
+            "feishu",
+            "user",
+            "chat-1",
+            "你好",
+            timestamp=message_time,
+            metadata={"message_id": "message-1"},
+        )
     )
+    repository.allocate_fence("feishu:chat-1", owner_id="agent-1", now=NOW)
+    order: list[str] = []
+    runner, runtime, outbound, event_bus = _runner(repository, order)
+    events: list[object] = []
+    event_bus.on(
+        TurnCommitted,
+        lambda event: (events.append(event), order.append("event"))[0],
+        observer=True,
+    )
+    payload = inbound
     message = QueueMessage(
-        "memopilot:jobs:p2",
+        "memopilot:tasks:p0",
         "1-0",
-        "proactive.tick:1",
-        "proactive.tick",
-        2,
+        "task-1",
+        "passive.turn",
+        0,
         "feishu:chat-1",
-        "{}",
+        json.dumps(payload),
     )
 
-    outcome = await executor.execute(
-        message,
-        payload={"chat_id": "chat-1", "activity_version": 0},
-        lease=LEASE,
-        now=NOW,
-    )
+    with pytest.raises(RuntimeError, match="明确发送成功"):
+        await runner.execute(message, payload=payload, lease=LEASE, now=NOW)
+    await runner.execute(message, payload=payload, lease=LEASE, now=NOW)
 
-    assert outcome == "succeeded"
-    assert drift.calls == 1
+    assert runtime.calls == 1
+    assert [call.content for call in outbound.calls] == ["旧回复", "旧回复"]
+    assert len(events) == 1
+    assert order == ["event", "send", "send"]
+    await event_bus.aclose()
 
 
 @pytest.mark.asyncio
-async def test_schedule_dispatches_to_originating_channel() -> None:
-    repository = _ScheduleRepository()
-    outbound = _Outbound()
-    dispatcher = BackgroundTaskDispatcher(
-        _Unused(),  # type: ignore[arg-type]
-        repository=repository,  # type: ignore[arg-type]
-        outbound=outbound,
+async def test_committed_turn_retry_restores_media_with_same_provider_uuid(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    inbound_message = InboundMessage(
+        "feishu",
+        "user",
+        "chat-1",
+        "来个表情",
+        timestamp=NOW,
+        metadata={"message_id": "message-media"},
+    )
+    repository.record_inbound_activity(inbound_message)
+    repository.allocate_fence("feishu:chat-1", owner_id="agent-1", now=NOW)
+    payload = {
+        "channel": "feishu",
+        "sender": "user",
+        "chat_id": "chat-1",
+        "content": "来个表情",
+        "timestamp": NOW.isoformat(),
+        "media": [],
+        "metadata": {"message_id": "message-media"},
+    }
+    message = QueueMessage(
+        "memopilot:tasks:p0",
+        "1-0",
+        "task-media",
+        "passive.turn",
+        0,
+        "feishu:chat-1",
+        json.dumps(payload),
+    )
+    text_uuids: list[str | None] = []
+    image_uuids: list[str] = []
+
+    async def send_text(
+        chat_id: str,
+        content: str,
+        *,
+        provider_uuid: str | None = None,
+    ) -> None:
+        del chat_id, content
+        text_uuids.append(provider_uuid)
+
+    async def send_image(
+        chat_id: str,
+        image: str,
+        *,
+        provider_uuid: str,
+    ) -> None:
+        del chat_id, image
+        image_uuids.append(provider_uuid)
+        if len(image_uuids) == 1:
+            raise RuntimeError("image failed")
+
+    push = MessagePushTool()
+    push.register_channel("feishu", text=send_text, image=send_image)
+    runtime = _Runtime(("meme.png",))
+    event_bus = EventBus()
+    runner = CoreRunner(
+        runtime,  # type: ignore[arg-type]
+        repository=repository,
+        outbound=PushToolOutboundPort(push),
         memory_tasks=_Unused(),  # type: ignore[arg-type]
         proactive=_Unused(),  # type: ignore[arg-type]
         drift=_Unused(),  # type: ignore[arg-type]
-    )
-    message = QueueMessage(
-        "memopilot:jobs:p1",
-        "1-0",
-        "execution-1",
-        "schedule.run",
-        1,
-        "cli:session-1",
-        "{}",
+        event_bus=event_bus,
     )
 
-    result = await dispatcher.execute(
-        message,
-        payload={
-            "execution_id": "execution-1",
-            "execution_mode": "instant",
-            "payload": {"message": "检查 MemoPilot"},
-            "channel": "cli",
-            "chat_id": "session-1",
-        },
-        lease=LEASE,
-        now=NOW,
-    )
+    with pytest.raises(DeliveryError, match="明确发送成功"):
+        await runner.execute(message, payload=payload, lease=LEASE, now=NOW)
+    await runner.execute(message, payload=payload, lease=LEASE, now=NOW)
 
-    assert result == "succeeded"
-    assert outbound.calls == [
-        OutboundDispatch(
-            channel="cli",
-            chat_id="session-1",
-            content="检查 MemoPilot",
-        )
-    ]
-    assert repository.outcomes == ["running", "succeeded"]
+    assert runtime.calls == 1
+    assert len(text_uuids) == 2
+    assert text_uuids[0] == text_uuids[1]
+    assert len(image_uuids) == 2
+    assert image_uuids[0] == image_uuids[1]
+    await event_bus.aclose()

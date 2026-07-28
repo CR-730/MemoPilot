@@ -91,6 +91,7 @@ class MemoPilotSettings(BaseSettings):
     llm_retry_limit: int = Field(default=2, ge=0)
     llm_max_iterations: int = Field(default=10, gt=0)
     llm_max_output_tokens: int = Field(default=2048, gt=0)
+    llm_context_window_tokens: int = Field(default=1_000_000, gt=0)
     llm_timeout_seconds: float = Field(default=60, gt=0)
     llm_thinking_enabled: bool = False
     tool_search_enabled: bool = True
@@ -273,6 +274,7 @@ def load_settings(
         (vl, "base_url", "vl_base_url"),
         (agent, "max_tokens", "llm_max_output_tokens"),
         (agent, "max_iterations", "llm_max_iterations"),
+        (agent, "context_window_tokens", "llm_context_window_tokens"),
         (agent_tools, "search_enabled", "tool_search_enabled"),
         (feishu, "enabled", "feishu_enabled"),
         (feishu, "channel_name", "feishu_channel_name"),
