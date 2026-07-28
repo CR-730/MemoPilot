@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import logging
 import re
 import sys
 import tempfile
@@ -42,6 +43,8 @@ from memopilot.runtime.phases import (
     PluginPhaseFrame,
 )
 from memopilot.runtime.tools import Tool, ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 _MODULE_METHODS = (
     "before_turn_modules",
@@ -311,6 +314,7 @@ class PluginManager:
         self._loaded.append(
             _LoadedPlugin(plugin_id, module_path, instance, tuple(tool_names))
         )
+        logger.info("插件已加载: %s", plugin_id)
 
     async def unload_all(self) -> None:
         for loaded in reversed(self._loaded):

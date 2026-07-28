@@ -170,6 +170,7 @@ class AfterStepCtx:
     tool_chain_partial: tuple[dict[str, object], ...]
     partial_thinking: str | None
     has_more: bool
+    context_window_tokens: int
     early_stop: bool = False
     early_stop_reason: str = ""
     extra_metadata: dict[str, object] = field(default_factory=dict)
