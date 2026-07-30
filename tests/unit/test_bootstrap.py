@@ -304,6 +304,33 @@ async def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(
     await bundle.close_extensions()
 
 
+async def test_runtime_bundle_injects_one_derived_memory_window(
+    tmp_path: Path,
+) -> None:
+    settings = MemoPilotSettings(
+        workspace=tmp_path,
+        memory_window=41,
+        embedding_base_url="https://embedding.example/v1",
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        _env_file=None,
+    )
+
+    bundle = await build_runtime_bundle(
+        settings,
+        chat_provider=_ChatProvider(),  # type: ignore[arg-type]
+        embedder=_Embedder(),  # type: ignore[arg-type]
+        outbound=object(),  # type: ignore[arg-type]
+    )
+    try:
+        assert bundle.core_runner is not None
+        assert bundle.core_runner.short_term_message_limit == 22
+        assert bundle.memory_tasks.consolidation.keep_count == 22
+        assert bundle.memory_tasks.consolidation.min_new_messages == 11
+    finally:
+        await bundle.close_extensions()
+
+
 async def test_proactive_source_can_reference_server_from_manual_mcp_json(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

@@ -370,8 +370,8 @@ async def build_runtime_bundle(
                 markdown,
                 ChatConsolidationExtractor(provider, markdown),
                 recent_context=ChatRecentContextCompressor(light_provider),
-                keep_count=settings.memory_consolidation_keep_count,
-                min_new_messages=settings.memory_consolidation_min_new_messages,
+                keep_count=settings.consolidation_keep_count,
+                min_new_messages=settings.consolidation_min_new_messages,
             ),
             VectorizationService(
                 settings.operational_database,
@@ -487,7 +487,7 @@ async def build_runtime_bundle(
                 proactive=proactive_loop,
                 drift=system_jobs,
                 event_bus=event_bus,
-                short_term_message_limit=settings.memory_short_term_message_limit,
+                short_term_message_limit=settings.history_limit,
                 progress_factory=progress_factory,
             )
             if outbound is not None and proactive_loop is not None

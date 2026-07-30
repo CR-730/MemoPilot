@@ -95,9 +95,7 @@ class MemoPilotSettings(BaseSettings):
     llm_timeout_seconds: float = Field(default=60, gt=0)
     llm_thinking_enabled: bool = False
     tool_search_enabled: bool = True
-    memory_short_term_message_limit: int = Field(default=12, gt=0)
-    memory_consolidation_keep_count: int = Field(default=12, ge=0)
-    memory_consolidation_min_new_messages: int = Field(default=5, gt=0)
+    memory_window: int = Field(default=40, gt=0)
     memory_retrieval_limit: int = Field(default=8, gt=0, le=200)
     memory_score_threshold: float = Field(default=0.45, ge=0, le=1)
     memory_score_thresholds: dict[str, float] = Field(
@@ -199,6 +197,22 @@ class MemoPilotSettings(BaseSettings):
         return ()
 
     @property
+    def history_limit(self) -> int:
+        return max(4, (self.memory_window + 3) // 4 * 4) // 2
+
+    @property
+    def consolidation_keep_count(self) -> int:
+        return self.history_limit
+
+    @property
+    def consolidation_min_new_messages(self) -> int:
+        return max(5, self.history_limit // 2)
+
+    @property
+    def recent_turn_count(self) -> int:
+        return max(1, self.history_limit // 2)
+
+    @property
     def operational_database(self) -> Path:
         return self.data_dir / "operational.db"
 
@@ -280,6 +294,7 @@ def load_settings(
         (feishu, "channel_name", "feishu_channel_name"),
         (feishu, "receive_mode", "feishu_receive_mode"),
         (memory, "score_threshold", "memory_score_threshold"),
+        (memory, "window", "memory_window"),
         (memory, "score_thresholds", "memory_score_thresholds"),
         (memory, "embed_timeout_seconds", "memory_embed_timeout_seconds"),
         (memory, "procedure_guard_enabled", "memory_procedure_guard_enabled"),
