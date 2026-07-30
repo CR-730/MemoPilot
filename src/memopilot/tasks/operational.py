@@ -75,12 +75,14 @@ class MessageRecord:
     turn_id: str
     session_position: int
     created_at: str
+    tool_chain: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class TurnCommitResult:
     assistant_content: str
     media: tuple[str, ...]
+    tool_chain: tuple[dict[str, object], ...]
     inserted: bool
     background_tasks: tuple[BackgroundTask, ...]
 
@@ -189,6 +191,7 @@ class OperationalRepository:
         *,
         assistant_content: str | None = None,
         assistant_media: tuple[str, ...] = (),
+        tool_chain: tuple[dict[str, object], ...] = (),
         cited_memory_ids: tuple[str, ...] = (),
         explicitly_memorized_ids: tuple[str, ...] = (),
         lease: FenceToken | None = None,
@@ -221,7 +224,7 @@ class OperationalRepository:
                 now_text=now_text,
             )
             existing = connection.execute(
-                "SELECT role, content, media_json FROM messages "
+                "SELECT role, content, media_json, tool_chain_json FROM messages "
                 "WHERE turn_id = ? ORDER BY turn_position",
                 (turn_id,),
             ).fetchall()
@@ -235,6 +238,7 @@ class OperationalRepository:
                     raise ValueError("同一 Turn 不能以不同内容重复提交")
                 persisted_assistant = str(existing[1]["content"])
                 persisted_media = _parse_media_json(existing[1]["media_json"])
+                persisted_tool_chain = _parse_tool_chain_json(existing[1]["tool_chain_json"])
                 if assistant_content is not None and (
                     str(existing[1]["role"]),
                     persisted_assistant,
@@ -255,6 +259,7 @@ class OperationalRepository:
             else:
                 persisted_assistant = assistant_content
                 persisted_media = assistant_media
+                persisted_tool_chain = tool_chain
                 position = int(
                     connection.execute(
                         "SELECT COALESCE(MAX(session_position), 0) + 1 "
@@ -266,8 +271,8 @@ class OperationalRepository:
                     """
                     INSERT INTO messages(
                         message_id, session_key, role, content, turn_id,
-                        turn_position, created_at, session_position, media_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        turn_position, created_at, session_position, media_json, tool_chain_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         (
@@ -280,6 +285,7 @@ class OperationalRepository:
                             now_text,
                             position,
                             "[]",
+                            "[]",
                         ),
                         (
                             assistant_id,
@@ -291,6 +297,7 @@ class OperationalRepository:
                             now_text,
                             position + 1,
                             json.dumps(assistant_media, ensure_ascii=False),
+                            json.dumps(tool_chain, ensure_ascii=False),
                         ),
                     ),
                 )
@@ -344,6 +351,7 @@ class OperationalRepository:
         return TurnCommitResult(
             persisted_assistant,
             persisted_media,
+            persisted_tool_chain,
             inserted,
             tuple(tasks),
         )
@@ -362,10 +370,10 @@ class OperationalRepository:
             rows = connection.execute(
                 """
                 SELECT message_id, session_key, role, content, turn_id,
-                       session_position, created_at
+                       session_position, created_at, tool_chain_json
                 FROM (
                     SELECT message_id, session_key, role, content, turn_id,
-                           session_position, created_at
+                           session_position, created_at, tool_chain_json
                     FROM messages
                     WHERE session_key = ? AND session_position IS NOT NULL
                       AND (? IS NULL OR julianday(created_at) <= julianday(?))
@@ -385,6 +393,7 @@ class OperationalRepository:
                 str(row["turn_id"]),
                 int(row["session_position"]),
                 str(row["created_at"]),
+                _parse_tool_chain_json(row["tool_chain_json"]),
             )
             for row in rows
         )
@@ -821,6 +830,16 @@ def _parse_media_json(value: object) -> tuple[str, ...]:
         raise ValueError("持久化消息的 media_json 必须是列表")
     if any(not isinstance(item, str) or not item.strip() for item in decoded):
         raise ValueError("持久化消息的 media_json 只能包含非空字符串")
+    return tuple(decoded)
+
+
+def _parse_tool_chain_json(value: object) -> tuple[dict[str, object], ...]:
+    try:
+        decoded = json.loads(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("持久化消息的 tool_chain_json 不是合法 JSON") from exc
+    if not isinstance(decoded, list) or any(not isinstance(item, dict) for item in decoded):
+        raise ValueError("持久化消息的 tool_chain_json 必须是对象列表")
     return tuple(decoded)
 
 

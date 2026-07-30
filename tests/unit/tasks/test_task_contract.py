@@ -103,3 +103,45 @@ def test_commit_turn_rejects_different_explicit_media_on_replay(
         ("user", "[]"),
         ("assistant", invalid_media),
     ]
+
+
+def test_commit_turn_persists_tool_chain_and_replay_keeps_it(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    message = InboundMessage(
+        "feishu", "user", "chat-1", "你好",
+        timestamp=datetime(2026, 7, 28, tzinfo=UTC),
+        metadata={"message_id": "message-tools"},
+    )
+    tool_chain = ({"text": "调用工具", "calls": [{"call_id": "call-1", "result": "ok"}]},)
+
+    assert repository.commit_turn(
+        message,
+        assistant_content="回复",
+        tool_chain=tool_chain,
+    ) is not None
+    assert repository.commit_turn(message) is not None
+    records = repository.list_recent_messages(message.session_key, limit=2)
+
+    assert records[0].tool_chain == ()
+    assert records[1].tool_chain == tool_chain
+
+
+def test_commit_turn_fails_explicitly_for_corrupt_tool_chain_json(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    message = InboundMessage(
+        "feishu", "user", "chat-1", "你好",
+        timestamp=datetime(2026, 7, 28, tzinfo=UTC),
+        metadata={"message_id": "message-corrupt-tools"},
+    )
+    repository.commit_turn(message, assistant_content="回复")
+    with connect_database(database) as connection:
+        connection.execute(
+            "UPDATE messages SET tool_chain_json = 'broken' WHERE role = 'assistant'"
+        )
+
+    with pytest.raises(ValueError, match="tool_chain_json"):
+        repository.commit_turn(message)
