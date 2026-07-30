@@ -12,7 +12,7 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
 from memopilot.bus.events import InboundMessage
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 
 _PUBLISH_ONCE = """
 if redis.call('EXISTS', KEYS[1]) == 1 then
@@ -124,7 +124,7 @@ class RedisTaskQueue:
         return _text(message_id)
 
     async def publish_task_once(
-        self, task: BackgroundTask, *, ttl_seconds: int = 86400
+        self, task: AgentTask, *, ttl_seconds: int = 86400
     ) -> str | None:
         """以任务 ID 做 Redis 幂等，避免 Scheduler 重启重复投递同一时间桶。"""
         key = f"{self.namespace}:task:{task.task_id}"

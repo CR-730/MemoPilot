@@ -13,7 +13,7 @@ from typing import Any, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from memopilot.persistence.migrations import connect_database
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 
 
 class LostLeaseError(RuntimeError):
@@ -84,7 +84,7 @@ class TurnCommitResult:
     media: tuple[str, ...]
     tool_chain: tuple[dict[str, object], ...]
     inserted: bool
-    background_tasks: tuple[BackgroundTask, ...]
+    background_tasks: tuple[AgentTask, ...]
 
 
 class OperationalRepository:
@@ -312,7 +312,7 @@ class OperationalRepository:
             connection.close()
 
         tasks = [
-            BackgroundTask(
+            AgentTask(
                 _stable_id("task", f"consolidate:{turn_id}"),
                 "memory.consolidate",
                 3,
@@ -320,7 +320,7 @@ class OperationalRepository:
                 {"trigger_turn_id": turn_id, "last_message_id": assistant_id},
                 timestamp,
             ),
-            BackgroundTask(
+            AgentTask(
                 _stable_id("task", f"post-response:{turn_id}"),
                 "memory.post_response",
                 3,
@@ -341,7 +341,7 @@ class OperationalRepository:
         cited = tuple(dict.fromkeys(item.strip() for item in cited_memory_ids if item.strip()))
         if cited:
             tasks.append(
-                BackgroundTask(
+                AgentTask(
                     _stable_id("task", f"memory-reinforce:{turn_id}"),
                     "memory.reinforce",
                     3,

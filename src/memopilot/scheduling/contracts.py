@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 
 ScheduleKind = Literal["at", "after", "every"]
 ExecutionMode = Literal["instant", "agent"]
@@ -49,7 +49,7 @@ class ScheduledExecution:
     task_id: str
     scheduled_at: datetime
     state: str
-    task: BackgroundTask | None = None
+    task: AgentTask | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +58,7 @@ class DueScanResult:
     missed: tuple[ScheduledExecution, ...] = ()
 
     @property
-    def tasks(self) -> tuple[BackgroundTask, ...]:
+    def tasks(self) -> tuple[AgentTask, ...]:
         return tuple(item.task for item in self.queued if item.task is not None)
 
 

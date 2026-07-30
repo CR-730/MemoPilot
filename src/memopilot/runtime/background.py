@@ -15,7 +15,7 @@ from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.history import build_tool_chain, expand_history
 from memopilot.runtime.outbound import DeliveryError, OutboundDispatch, OutboundPort
 from memopilot.runtime.react import ReActProgressObserver
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.lease import SessionLease
 from memopilot.tasks.operational import OperationalRepository
 from memopilot.tasks.redis_queue import QueueMessage
@@ -87,7 +87,7 @@ class CoreRunner:
         payload: dict[str, object],
         lease: SessionLease,
         now: datetime,
-    ) -> Sequence[BackgroundTask]:
+    ) -> Sequence[AgentTask]:
         if message.kind == "passive.turn":
             return await self._run_passive(message, payload, lease=lease)
         elif message.kind.startswith("memory."):
@@ -148,7 +148,7 @@ class CoreRunner:
         payload: Mapping[str, object],
         *,
         lease: SessionLease,
-    ) -> Sequence[BackgroundTask]:
+    ) -> Sequence[AgentTask]:
         message = _inbound_message(payload)
         if message.session_key != queue_message.session_key:
             raise ValueError("passive.turn 的 session_key 不一致")

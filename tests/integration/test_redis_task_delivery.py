@@ -9,7 +9,7 @@ import pytest_asyncio
 from redis.asyncio import Redis
 
 from memopilot.bus.events import InboundMessage
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.redis_queue import PublishedTask, RedisTaskQueue
 from memopilot.tasks.session_coordination import RedisSessionCoordinator
 
@@ -32,7 +32,7 @@ async def redis_client() -> AsyncIterator[Redis]:
 @pytest.mark.asyncio
 async def test_background_task_publish_is_atomic_and_idempotent(redis_client: Redis) -> None:
     queue = RedisTaskQueue(redis_client)
-    task = BackgroundTask(
+    task = AgentTask(
         "memory:bucket:1",
         "memory.optimize",
         3,

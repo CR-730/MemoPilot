@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 
 from memopilot.runtime.background import CoreRunner
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.lease import SessionLease, SessionLeaseManager
 from memopilot.tasks.operational import LostLeaseError, StaleActivityError
 from memopilot.tasks.redis_queue import QueueMessage, RedisTaskQueue
@@ -168,7 +168,7 @@ class AgentLoop:
         message: QueueMessage,
         payload: dict[str, object],
         lease: SessionLease,
-    ) -> tuple[Sequence[BackgroundTask], str | None]:
+    ) -> tuple[Sequence[AgentTask], str | None]:
         execution = asyncio.create_task(
             self._runner.execute(
                 message,

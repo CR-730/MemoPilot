@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from memopilot.scheduling.contracts import DueScanResult
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.operational import OperationalRepository
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ class UserScheduleService(Protocol):
 class SystemTickResult:
     memory: object
     schedules: DueScanResult
-    proactive: BackgroundTask | None
+    proactive: AgentTask | None
 
 
 class SystemScheduler:
@@ -67,7 +67,7 @@ class SystemScheduler:
         if target is None:
             return SystemTickResult(memory, schedules, None)
         bucket = int(current.timestamp() // self.proactive_tick_seconds)
-        proactive = BackgroundTask(
+        proactive = AgentTask(
             task_id=f"proactive.tick:{target.session_key}:{bucket}",
             kind="proactive.tick",
             priority=2,
@@ -114,7 +114,7 @@ class SchedulerService:
         result = self.scheduler.tick(now=current)
         published = 0
         for task in (result.memory, *result.schedules.tasks, result.proactive):
-            if isinstance(task, BackgroundTask):
+            if isinstance(task, AgentTask):
                 message_id = await self.queue.publish_task_once(task)  # type: ignore[attr-defined]
                 published += message_id is not None
         return published

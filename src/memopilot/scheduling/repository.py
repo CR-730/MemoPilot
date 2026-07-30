@@ -20,7 +20,7 @@ from memopilot.scheduling.contracts import (
     ScheduleKind,
 )
 from memopilot.scheduling.time_rules import advance_every, is_cron_expr, parse_duration
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 
 
 class ScheduleRepository:
@@ -273,7 +273,7 @@ class ScheduleRepository:
         ).fetchone()
         if session_row is None:
             raise KeyError(task.session_key)
-        payload = {
+        payload: dict[str, object] = {
             "execution_id": execution_id,
             "execution_mode": task.execution_mode,
             "payload": dict(task.payload),
@@ -304,7 +304,7 @@ class ScheduleRepository:
                 task.task_id,
                 effective_scheduled_at,
                 "queued",
-                BackgroundTask(
+                AgentTask(
                     task_id=execution_id,
                     kind="schedule.run",
                     priority=1,
@@ -388,7 +388,7 @@ class ScheduleRepository:
                     str(row["task_id"]),
                     scheduled_at,
                     str(row["state"]),
-                    BackgroundTask(
+                    AgentTask(
                         task_id=str(row["execution_id"]),
                         kind="schedule.run",
                         priority=1,

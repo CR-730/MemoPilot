@@ -9,13 +9,13 @@ from memopilot.persistence.migrations import (
     connect_database,
     migrate_database,
 )
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.lease import SessionLease
 from memopilot.tasks.operational import LostLeaseError, OperationalRepository
 
 
 def test_background_task_is_serializable_without_operational_job_fields() -> None:
-    task = BackgroundTask(
+    task = AgentTask(
         task_id="execution-1",
         kind="schedule.run",
         priority=1,

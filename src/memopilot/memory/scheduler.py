@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.operational import OperationalRepository
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,7 @@ class MemoryMaintenanceScheduler:
         self.interval = interval
         self.clock = clock or (lambda: datetime.now(UTC))
 
-    def tick(self, *, now: datetime | None = None) -> BackgroundTask | None:
+    def tick(self, *, now: datetime | None = None) -> AgentTask | None:
         current = now or self.clock()
         if not self.enabled:
             return None
@@ -39,7 +39,7 @@ class MemoryMaintenanceScheduler:
             chat_id="memory",
             now=current,
         )
-        return BackgroundTask(
+        return AgentTask(
             task_id=f"memory.optimize:{bucket}",
             kind="memory.optimize",
             priority=3,

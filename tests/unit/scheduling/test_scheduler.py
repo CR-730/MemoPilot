@@ -6,7 +6,7 @@ import pytest
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
 from memopilot.scheduling.contracts import DueScanResult
 from memopilot.scheduling.scheduler import SchedulerService, SystemScheduler
-from memopilot.tasks.background import BackgroundTask
+from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.operational import MultiplePrivateSessionsError, OperationalRepository
 
 NOW = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
@@ -39,7 +39,7 @@ def _add_session(
 
 class _Memory:
     def tick(self, *, now: datetime):
-        return BackgroundTask("memory-1", "memory.optimize", 3, "system:memory", {}, now)
+        return AgentTask("memory-1", "memory.optimize", 3, "system:memory", {}, now)
 
 
 class _Schedules:
@@ -76,7 +76,7 @@ def test_no_private_session_skips_only_proactive_task(tmp_path: Path) -> None:
     result = _scheduler(_repository(tmp_path)).tick(now=NOW)
 
     assert result.proactive is None
-    assert isinstance(result.memory, BackgroundTask)
+    assert isinstance(result.memory, AgentTask)
 
 
 def test_multiple_private_sessions_are_rejected(tmp_path: Path) -> None:
@@ -96,7 +96,7 @@ async def test_scheduler_process_publishes_each_background_task_once(tmp_path: P
         def __init__(self) -> None:
             self.ids: list[str] = []
 
-        async def publish_task_once(self, task: BackgroundTask) -> str | None:
+        async def publish_task_once(self, task: AgentTask) -> str | None:
             self.ids.append(task.task_id)
             return task.task_id
 
@@ -118,7 +118,7 @@ async def test_scheduler_publishes_proactive_without_duplicate_busy_gate(
         def __init__(self) -> None:
             self.ids: list[str] = []
 
-        async def publish_task_once(self, task: BackgroundTask) -> str | None:
+        async def publish_task_once(self, task: AgentTask) -> str | None:
             self.ids.append(task.task_id)
             return task.task_id
 
