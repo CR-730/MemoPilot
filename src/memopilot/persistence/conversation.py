@@ -1,11 +1,10 @@
-"""会话、消息与后台提交权的轻量 SQLite 仓储。"""
+"""会话、消息、活跃状态与渠道身份的 SQLite 仓储。"""
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,30 +12,14 @@ from typing import Any, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from memopilot.persistence.migrations import connect_database
-from memopilot.tasks.agent_task import AgentTask
-
-
-class LostLeaseError(RuntimeError):
-    """当前执行者已经失去会话提交权。"""
-
-
-class StaleActivityError(LostLeaseError):
-    """用户活动已变化，当前主动任务应结束并等待下一轮。"""
 
 
 class MultiplePrivateSessionsError(RuntimeError):
-    """单用户版本检测到多个飞书私聊目标。"""
+    """主动任务发现多个私聊会话，无法唯一选择目标。"""
 
 
-class FenceToken(Protocol):
-    @property
-    def session_key(self) -> str: ...
-
-    @property
-    def owner_id(self) -> str: ...
-
-    @property
-    def epoch(self) -> int: ...
+class StaleActivityError(RuntimeError):
+    """任务携带的用户活跃版本已经过期。"""
 
 
 class TurnMessage(Protocol):
@@ -84,11 +67,12 @@ class TurnCommitResult:
     media: tuple[str, ...]
     tool_chain: tuple[dict[str, object], ...]
     inserted: bool
-    background_tasks: tuple[AgentTask, ...]
+    turn_id: str
+    assistant_message_id: str
 
 
-class OperationalRepository:
-    """只保存跨重启仍有业务意义的数据。"""
+class ConversationRepository:
+    """维护会话业务事实，不承担任务执行协调。"""
 
     _COUNTABLE_TABLES = frozenset(
         {
@@ -97,8 +81,6 @@ class OperationalRepository:
             "inbound_events",
             "session_identities",
             "messages",
-            "scheduled_tasks",
-            "scheduled_executions",
             "consolidation_manifests",
         }
     )
@@ -192,15 +174,12 @@ class OperationalRepository:
         assistant_content: str | None = None,
         assistant_media: tuple[str, ...] = (),
         assistant_tool_chain: tuple[dict[str, object], ...] = (),
-        cited_memory_ids: tuple[str, ...] = (),
-        explicitly_memorized_ids: tuple[str, ...] = (),
-        lease: FenceToken | None = None,
     ) -> TurnCommitResult | None:
         content = message.content
         if not content.strip() or (
             assistant_content is not None and not assistant_content.strip()
         ):
-            raise ValueError("Turn 的用户消息和助手回复不能为空")
+            raise ValueError("Turn 必须提供完整的会话与消息字段")
         timestamp = message.timestamp
         metadata = message.metadata
         now_text = _utc_iso(timestamp)
@@ -214,8 +193,6 @@ class OperationalRepository:
         connection = self._connect()
         connection.execute("BEGIN IMMEDIATE")
         try:
-            if lease is not None:
-                self.require_current_fence(connection, lease)
             self._upsert_session(
                 connection,
                 session_key=session_key,
@@ -235,7 +212,7 @@ class OperationalRepository:
                     or (str(existing[0]["role"]), str(existing[0]["content"]))
                     != ("user", content)
                 ):
-                    raise ValueError("同一 Turn 不能以不同内容重复提交")
+                    raise ValueError("重复 Turn 的用户消息内容不一致")
                 persisted_assistant = str(existing[1]["content"])
                 persisted_media = _parse_media_json(existing[1]["media_json"])
                 persisted_tool_chain = _parse_tool_chain_json(existing[1]["tool_chain_json"])
@@ -246,15 +223,15 @@ class OperationalRepository:
                     "assistant",
                     assistant_content,
                 ):
-                    raise ValueError("同一 Turn 不能以不同内容重复提交")
+                    raise ValueError("重复 Turn 的助手消息内容不一致")
                 if (
                     assistant_content is not None
                     and assistant_media
                     and persisted_media != assistant_media
                 ):
-                    raise ValueError("同一 Turn 不能以不同媒体重复提交")
+                    raise ValueError("重复 Turn 的媒体结果不一致")
                 if assistant_tool_chain and persisted_tool_chain != assistant_tool_chain:
-                    raise ValueError("同一 Turn 不能以不同工具链重复提交")
+                    raise ValueError("重复 Turn 的工具调用链不一致")
             elif assistant_content is None:
                 connection.execute("COMMIT")
                 return None
@@ -311,51 +288,13 @@ class OperationalRepository:
         finally:
             connection.close()
 
-        tasks = [
-            AgentTask(
-                _stable_id("task", f"consolidate:{turn_id}"),
-                "memory.consolidate",
-                3,
-                session_key,
-                {"trigger_turn_id": turn_id, "last_message_id": assistant_id},
-                timestamp,
-            ),
-            AgentTask(
-                _stable_id("task", f"post-response:{turn_id}"),
-                "memory.post_response",
-                3,
-                session_key,
-                {
-                    "turn_id": turn_id,
-                    "protected_ids": list(
-                        dict.fromkeys(
-                            item.strip()
-                            for item in explicitly_memorized_ids
-                            if item.strip()
-                        )
-                    ),
-                },
-                timestamp,
-            ),
-        ]
-        cited = tuple(dict.fromkeys(item.strip() for item in cited_memory_ids if item.strip()))
-        if cited:
-            tasks.append(
-                AgentTask(
-                    _stable_id("task", f"memory-reinforce:{turn_id}"),
-                    "memory.reinforce",
-                    3,
-                    session_key,
-                    {"usage_ref": f"turn:{turn_id}", "item_ids": list(cited)},
-                    timestamp,
-                )
-            )
         return TurnCommitResult(
             persisted_assistant,
             persisted_media,
             persisted_tool_chain,
             inserted,
-            tuple(tasks),
+            turn_id,
+            assistant_id,
         )
 
     def list_recent_messages(
@@ -480,7 +419,7 @@ class OperationalRepository:
                 (str(target["user_id"]), str(target["assistant_id"])),
             ).rowcount
             if deleted != 2:
-                raise RuntimeError("撤销目标不再完整")
+                raise RuntimeError("无法解析私聊会话目标")
             remaining = int(
                 connection.execute(
                     "SELECT COALESCE(MAX(session_position), 0) FROM messages "
@@ -588,7 +527,7 @@ class OperationalRepository:
             return None
         if len(rows) > 1:
             raise MultiplePrivateSessionsError(
-                "MemoPilot 当前只支持一个飞书私聊，检测到多个会话目标"
+                "MemoPilot 当前存在多个私聊会话，无法唯一确定主动任务目标"
             )
         row = rows[0]
         return PrivateSessionTarget(
@@ -622,165 +561,9 @@ class OperationalRepository:
             ).fetchone()
         return None if row is None else int(row["activity_version"])
 
-    def allocate_fence(self, session_key: str, *, owner_id: str, now: datetime) -> int:
-        now_text = _utc_iso(now)
-        connection = self._connect()
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            if connection.execute(
-                "SELECT 1 FROM sessions WHERE session_key = ?",
-                (session_key,),
-            ).fetchone() is None:
-                raise KeyError(f"会话不存在: {session_key}")
-            connection.execute(
-                """
-                INSERT INTO session_fences(
-                    session_key, current_epoch, owner_id, heartbeat_at, updated_at
-                ) VALUES (?, 0, NULL, NULL, ?)
-                ON CONFLICT(session_key) DO NOTHING
-                """,
-                (session_key, now_text),
-            )
-            connection.execute(
-                """
-                UPDATE session_fences
-                SET current_epoch = current_epoch + 1,
-                    owner_id = ?, heartbeat_at = ?, updated_at = ?
-                WHERE session_key = ?
-                """,
-                (owner_id, now_text, now_text, session_key),
-            )
-            row = connection.execute(
-                "SELECT current_epoch FROM session_fences WHERE session_key = ?",
-                (session_key,),
-            ).fetchone()
-            assert row is not None
-            connection.execute("COMMIT")
-            return int(row["current_epoch"])
-        except Exception:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-        finally:
-            connection.close()
-
-    def heartbeat_fence(self, lease: FenceToken, *, now: datetime) -> bool:
-        now_text = _utc_iso(now)
-        with self._connect() as connection:
-            changed = connection.execute(
-                """
-                UPDATE session_fences SET heartbeat_at = ?, updated_at = ?
-                WHERE session_key = ? AND owner_id = ? AND current_epoch = ?
-                """,
-                (now_text, now_text, lease.session_key, lease.owner_id, lease.epoch),
-            ).rowcount
-        return changed == 1
-
-    @staticmethod
-    def require_current_fence(connection: sqlite3.Connection, lease: FenceToken) -> None:
-        row = connection.execute(
-            """
-            SELECT 1 FROM session_fences
-            WHERE session_key = ? AND owner_id = ? AND current_epoch = ?
-            """,
-            (lease.session_key, lease.owner_id, lease.epoch),
-        ).fetchone()
-        if row is None:
-            raise LostLeaseError(
-                f"会话 {lease.session_key} 的 owner/epoch 已失效: "
-                f"{lease.owner_id}/{lease.epoch}"
-            )
-
-    def assert_current_fence(self, lease: FenceToken) -> None:
-        with self._connect() as connection:
-            self.require_current_fence(connection, lease)
-
-    def assert_current_fence_and_activity(
-        self,
-        lease: FenceToken,
-        *,
-        expected_activity_version: int,
-    ) -> None:
-        with self._connect() as connection:
-            self.require_current_fence(connection, lease)
-            row = connection.execute(
-                "SELECT activity_version FROM session_activity WHERE session_key = ?",
-                (lease.session_key,),
-            ).fetchone()
-            current = None if row is None else int(row["activity_version"])
-            if current != expected_activity_version:
-                raise StaleActivityError(
-                    f"会话 {lease.session_key} 的 activity_version 已变化: "
-                    f"expected={expected_activity_version}, current={current}"
-                )
-
-    @contextmanager
-    def fenced_write(self, lease: FenceToken) -> Iterator[None]:
-        connection = self._connect()
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            self.require_current_fence(connection, lease)
-            yield
-            connection.execute("COMMIT")
-        except BaseException:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-        finally:
-            connection.close()
-
-    def transition_background_schedule(
-        self,
-        execution_id: str,
-        *,
-        lease: FenceToken,
-        outcome: str,
-        now: datetime,
-    ) -> str:
-        allowed = {"running", "succeeded", "failed", "cancelled"}
-        if outcome not in allowed:
-            raise ValueError(f"不支持的定时执行状态: {outcome}")
-        connection = self._connect()
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            self.require_current_fence(connection, lease)
-            row = connection.execute(
-                """
-                SELECT execution.state
-                FROM scheduled_executions AS execution
-                JOIN scheduled_tasks AS task ON task.task_id = execution.task_id
-                WHERE execution.execution_id = ? AND task.session_key = ?
-                """,
-                (execution_id, lease.session_key),
-            ).fetchone()
-            if row is None:
-                raise KeyError(execution_id)
-            current = str(row["state"])
-            terminal = {"succeeded", "failed", "cancelled"}
-            if current in terminal:
-                if outcome == "running" or outcome == current:
-                    connection.execute("COMMIT")
-                    return current
-                raise RuntimeError(
-                    f"定时执行 {execution_id} 已终结为 {current}，不能改为 {outcome}"
-                )
-            connection.execute(
-                "UPDATE scheduled_executions SET state = ?, updated_at = ? "
-                "WHERE execution_id = ?",
-                (outcome, _utc_iso(now), execution_id),
-            )
-            connection.execute("COMMIT")
-            return outcome
-        except Exception:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-        finally:
-            connection.close()
-
     def count(self, table: str) -> int:
         if table not in self._COUNTABLE_TABLES:
-            raise ValueError(f"不允许统计表: {table}")
+            raise ValueError(f"不允许统计的数据表: {table}")
         with self._connect() as connection:
             row = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
         assert row is not None
@@ -827,11 +610,11 @@ def _parse_media_json(value: object) -> tuple[str, ...]:
     try:
         decoded = json.loads(str(value))
     except (TypeError, ValueError) as exc:
-        raise ValueError("持久化消息的 media_json 不是合法 JSON") from exc
+        raise ValueError("消息 media_json 不是合法 JSON") from exc
     if not isinstance(decoded, list):
-        raise ValueError("持久化消息的 media_json 必须是列表")
+        raise ValueError("消息 media_json 必须是数组")
     if any(not isinstance(item, str) or not item.strip() for item in decoded):
-        raise ValueError("持久化消息的 media_json 只能包含非空字符串")
+        raise ValueError("消息 media_json 只能包含字符串")
     return tuple(decoded)
 
 
@@ -839,19 +622,17 @@ def _parse_tool_chain_json(value: object) -> tuple[dict[str, object], ...]:
     try:
         decoded = json.loads(str(value))
     except (TypeError, ValueError) as exc:
-        raise ValueError("持久化消息的 tool_chain_json 不是合法 JSON") from exc
+        raise ValueError("消息 tool_chain_json 不是合法 JSON") from exc
     if not isinstance(decoded, list) or any(not isinstance(item, dict) for item in decoded):
-        raise ValueError("持久化消息的 tool_chain_json 必须是对象列表")
+        raise ValueError("消息 tool_chain_json 必须是数组")
     return tuple(decoded)
 
 
 __all__ = [
-    "FenceToken",
-    "LostLeaseError",
     "MessageRecord",
     "MultiplePrivateSessionsError",
-    "OperationalRepository",
     "PrivateSessionTarget",
     "SessionIdentityRecord",
     "StaleActivityError",
+    "TurnCommitResult",
 ]

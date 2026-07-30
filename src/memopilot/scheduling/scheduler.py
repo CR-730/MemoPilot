@@ -1,104 +1,23 @@
-"""固定周期任务生产与 Redis 发布服务。"""
+"""将系统生成的任务发布到 Redis。"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Protocol
+from datetime import datetime
 
-from memopilot.scheduling.contracts import DueScanResult
 from memopilot.tasks.agent_task import AgentTask
-from memopilot.tasks.operational import OperationalRepository
+from memopilot.tasks.producer import TaskProducer
 
 logger = logging.getLogger(__name__)
 
 
-class MemoryScheduler(Protocol):
-    def tick(self, *, now: datetime) -> object: ...
-
-
-class UserScheduleService(Protocol):
-    def scan_due(self, *, now: datetime) -> DueScanResult: ...
-
-
-@dataclass(frozen=True, slots=True)
-class SystemTickResult:
-    memory: object
-    schedules: DueScanResult
-    proactive: AgentTask | None
-
-
-class _TaskProducer:
-    """组合记忆、定时任务和主动唤醒三类生产器。"""
+class ScheduledTurnPipeline:
+    """按 Tick 发布内存、定时和主动任务。"""
 
     def __init__(
         self,
-        repository: OperationalRepository,
-        *,
-        memory_scheduler: MemoryScheduler,
-        schedule_service: UserScheduleService,
-        proactive_tick_seconds: int,
-        proactive_enabled: bool = True,
-        clock: Callable[[], datetime] | None = None,
-        sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
-        poll_interval_seconds: float = 5.0,
-    ) -> None:
-        if proactive_tick_seconds <= 0:
-            raise ValueError("proactive_tick_seconds 必须大于 0")
-        if poll_interval_seconds <= 0:
-            raise ValueError("poll_interval_seconds 必须大于 0")
-        self.repository = repository
-        self.memory_scheduler = memory_scheduler
-        self.schedule_service = schedule_service
-        self.proactive_tick_seconds = proactive_tick_seconds
-        self.proactive_enabled = proactive_enabled
-        self.clock = clock or (lambda: datetime.now(UTC))
-        self.sleep = sleep
-        self.poll_interval_seconds = poll_interval_seconds
-
-    def tick(self, *, now: datetime | None = None) -> SystemTickResult:
-        current = now or self.clock()
-        memory = self.memory_scheduler.tick(now=current)
-        schedules = self.schedule_service.scan_due(now=current)
-        target = self.repository.get_single_private_session() if self.proactive_enabled else None
-        if target is None:
-            return SystemTickResult(memory, schedules, None)
-        bucket = int(current.timestamp() // self.proactive_tick_seconds)
-        proactive = AgentTask(
-            task_id=f"proactive.tick:{target.session_key}:{bucket}",
-            kind="proactive.tick",
-            priority=2,
-            session_key=target.session_key,
-            payload={
-                "bucket": bucket,
-                "channel": target.channel,
-                "chat_id": target.chat_id,
-                "activity_version": target.activity_version,
-            },
-            created_at=current,
-        )
-        return SystemTickResult(memory, schedules, proactive)
-
-    async def run_forever(self) -> None:
-        while True:
-            try:
-                self.tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("系统 Scheduler Tick 失败，下次轮询继续")
-            await self.sleep(self.poll_interval_seconds)
-
-
-class ApplicationScheduler:
-    """生成到期任务并发布到 Redis。"""
-
-    def __init__(
-        self,
-        scheduler: _TaskProducer,
+        scheduler: TaskProducer,
         queue: object,
         *,
         max_publish_per_tick: int = 100,
@@ -120,7 +39,7 @@ class ApplicationScheduler:
         return published
 
     async def run_forever(self) -> None:
-        logger.info("ApplicationScheduler started")
+        logger.info("ScheduledTurnPipeline started")
         try:
             while True:
                 try:
@@ -128,10 +47,10 @@ class ApplicationScheduler:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.exception("Scheduler 周期失败，下次轮询继续")
+                    logger.exception("Scheduler 任务发布失败")
                 await self.scheduler.sleep(self.scheduler.poll_interval_seconds)
         finally:
-            logger.info("ApplicationScheduler stopped")
+            logger.info("ScheduledTurnPipeline stopped")
 
 
-__all__ = ["ApplicationScheduler", "SystemTickResult"]
+__all__ = ["ScheduledTurnPipeline"]

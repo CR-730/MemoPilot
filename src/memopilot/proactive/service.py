@@ -113,6 +113,9 @@ class ProactiveService:
         self._proactive_context = proactive_context
         self._recent_context = recent_context
 
+    def assert_current(self) -> None:
+        self._assert_current()
+
     async def execute(
         self,
         task_id: str,
@@ -328,12 +331,9 @@ class ProactiveService:
             )
         event_by_id = alert_by_id | content_by_id
         delivery_key = _build_delivery_key(result, event_by_id)
-        if (
-            self._repository.is_delivery_duplicate(
-                session_key, delivery_key, window=timedelta(hours=24), now=now
-            )
-            or await self._is_semantic_duplicate(session_key, result.message)
-        ):
+        if self._repository.is_delivery_duplicate(
+            session_key, delivery_key, window=timedelta(hours=24), now=now
+        ) or await self._is_semantic_duplicate(session_key, result.message):
             duplicate = self._commit_duplicate(
                 session_key, selected, activity_version=activity_version, now=now
             )
@@ -483,9 +483,7 @@ class ProactiveService:
         now: datetime,
     ) -> str:
         if trigger_kind == "alert":
-            last_alert = self._repository.last_confirmed_send(
-                session_key, trigger_kinds=("alert",)
-            )
+            last_alert = self._repository.last_confirmed_send(session_key, trigger_kinds=("alert",))
             if last_alert is not None and now - last_alert < self._alert_cooldown:
                 return "alert_cooldown"
             return ""
@@ -505,16 +503,11 @@ class ProactiveService:
         last_ordinary = self._repository.last_confirmed_send(
             session_key, trigger_kinds=("content", "context")
         )
-        if (
-            last_ordinary is not None
-            and now - last_ordinary < self._ordinary_cooldown
-        ):
+        if last_ordinary is not None and now - last_ordinary < self._ordinary_cooldown:
             return "shared_cooldown"
         return ""
 
-    def _handle_drift(
-        self, task_id: str, session_key: str, now: datetime
-    ) -> ProactiveOutcome:
+    def _handle_drift(self, task_id: str, session_key: str, now: datetime) -> ProactiveOutcome:
         if not self._drift_enabled:
             return ProactiveOutcome("quiet", session_key=session_key, reason="drift_disabled")
         if not self._skill_catalog.background_candidates():

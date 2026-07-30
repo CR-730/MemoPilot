@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo
 
 from redis.asyncio import Redis
@@ -52,7 +52,6 @@ from memopilot.memory.providers import (
     OpenAIEmbeddingProvider,
 )
 from memopilot.memory.retrieval import MemoryRetriever, RetrievalStore
-from memopilot.memory.scheduler import MemoryMaintenanceScheduler
 from memopilot.memory.service import MemoryService
 from memopilot.memory.store import MemoryStore
 from memopilot.memory.tools import (
@@ -61,6 +60,7 @@ from memopilot.memory.tools import (
     build_recall_memory_tool,
 )
 from memopilot.memory.vectorization import VectorizationService
+from memopilot.persistence.conversation import ConversationRepository, StaleActivityError
 from memopilot.persistence.memory_metadata import EmbeddingIdentity, ensure_embedding_identity
 from memopilot.persistence.migrations import (
     DatabaseKind,
@@ -69,8 +69,8 @@ from memopilot.persistence.migrations import (
 )
 from memopilot.proactive.content_turn import AgentTick, AgentTickDeps
 from memopilot.proactive.dedupe import MessageDeduper
-from memopilot.proactive.drift import DriftSkillSelector
-from memopilot.proactive.drift_executor import DriftRuntime
+from memopilot.proactive.drift import DriftSkillSelector as ModelDriftSkillSelector
+from memopilot.proactive.drift_executor import DriftTurnPipeline
 from memopilot.proactive.investigation import ToolContentFetcher
 from memopilot.proactive.loop import ProactiveLoop
 from memopilot.proactive.mcp_sources import ProactiveSourceGateway, load_proactive_sources
@@ -89,15 +89,13 @@ from memopilot.runtime.react import ReActProgressObserver
 from memopilot.runtime.session import OperationalSessionManager
 from memopilot.runtime.task_dispatcher import TaskDispatcher
 from memopilot.runtime.tool_search import build_tool_search_tool
-from memopilot.runtime.tools import Tool, ToolRegistry
+from memopilot.runtime.tools import Tool, ToolExecutor, ToolRegistry
 from memopilot.scheduling.repository import ScheduleRepository
-from memopilot.scheduling.scheduler import ApplicationScheduler, _TaskProducer
+from memopilot.scheduling.scheduler import ScheduledTurnPipeline
 from memopilot.scheduling.service import SchedulerService
 from memopilot.scheduling.tools import build_schedule_tools
-from memopilot.tasks.lease import SessionLeaseManager
-from memopilot.tasks.operational import FenceToken, OperationalRepository
+from memopilot.tasks.producer import TaskProducer
 from memopilot.tasks.redis_queue import RedisTaskQueue
-from memopilot.tasks.session_coordination import RedisSessionCoordinator
 
 _BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
 _BUILTIN_PLUGINS_DIR = Path(__file__).resolve().parent / "builtin_plugins"
@@ -115,8 +113,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class RuntimeBundle:
-    repository: OperationalRepository
+    repository: ConversationRepository
     tools: ToolRegistry
+    tool_executor: ToolExecutor
     memory_engine: LayeredMemoryEngine
     memory_tasks: MemoryService
     scheduler_service: SchedulerService
@@ -135,7 +134,7 @@ class RuntimeBundle:
         """按依赖逆序幂等拆除扩展贡献；半启动状态也可安全调用。"""
         await self.event_bus.drain()
         for hook_id in self.hook_ids:
-            self.tools.unregister_hook(hook_id)
+            self.tool_executor.unregister_hook(hook_id)
         await self.plugin_manager.unload_all()
         await self.mcp_registry.shutdown()
         await self.http_resources.aclose()
@@ -146,10 +145,10 @@ class RuntimeBundle:
 class AppRuntime:
     """原型式单进程运行时；Redis 只承担后台调度、抢占和恢复。"""
 
-    scheduler: ApplicationScheduler
+    scheduler: ScheduledTurnPipeline
     agent_loop: AgentLoop
     redis: Redis
-    repository: OperationalRepository
+    repository: ConversationRepository
     channel: FeishuChannel
     console: IPCServerChannel
     runtime: RuntimeBundle
@@ -199,13 +198,13 @@ async def build_runtime_bundle(
     outbound: OutboundPort | None = None,
     message_push: MessagePushTool | None = None,
     progress_factory: Callable[[InboundMessage], ReActProgressObserver | None] | None = None,
-    repository: OperationalRepository | None = None,
+    repository: ConversationRepository | None = None,
     skills: SkillCatalog | None = None,
 ) -> RuntimeBundle:
     """从类型化配置创建 Agent 与分层记忆链路。"""
     configured_tools = tuple(tools)
     migrate_all_databases(settings)
-    operational = repository or OperationalRepository(
+    operational = repository or ConversationRepository(
         settings.operational_database,
         busy_timeout_seconds=settings.sqlite_busy_timeout_seconds,
     )
@@ -254,6 +253,7 @@ async def build_runtime_bundle(
         event_bus=event_bus,
     )
     registry = ToolRegistry(configured_tools)
+    tool_executor = ToolExecutor(registry)
     http_resources = SharedHttpResources()
     registry.register(build_recall_memory_tool(memory_engine), always_on=True)
     registry.register(build_tool_search_tool(registry), always_on=True)
@@ -318,7 +318,7 @@ async def build_runtime_bundle(
             )
         register_mcp_management_tools(registry, mcp_registry)
         await manager.load_all()
-        registry.register_hooks(manager.tool_hooks)
+        tool_executor.register_hooks(manager.tool_hooks)
         hook_ids = tuple(hook.hook_id for hook in manager.tool_hooks)
         if skills is None:
             skill_result = SkillLoader(
@@ -356,6 +356,7 @@ async def build_runtime_bundle(
         runtime = AgentRuntime(
             provider,
             registry,
+            tool_executor=tool_executor,
             max_iterations=settings.llm_max_iterations,
             memory_engine=memory_engine,
             memory_profile=markdown,
@@ -407,13 +408,10 @@ async def build_runtime_bundle(
         def build_proactive_service(
             session_key: str,
             activity_version: int,
-            lease: FenceToken,
         ) -> ProactiveService:
             def assert_proactive_current() -> None:
-                operational.assert_current_fence_and_activity(
-                    lease,
-                    expected_activity_version=activity_version,
-                )
+                if operational.get_activity_version(session_key) != activity_version:
+                    raise StaleActivityError("用户活跃状态已经变化，丢弃陈旧主动任务")
 
             proactive_web_fetch = _proactive_web_fetch_tool(registry)
             proactive_web_search = _proactive_named_tool(registry, "web_search")
@@ -464,11 +462,11 @@ async def build_runtime_bundle(
                 recent_context=lambda _session_key, _now: markdown.read("RECENT_CONTEXT.md"),
             )
 
-        system_jobs = DriftRuntime(
+        system_jobs = DriftTurnPipeline(
             operational,
             runtime,
             outbound=outbound,
-            drift_selector=DriftSkillSelector(provider, active_skills),
+            drift_selector=ModelDriftSkillSelector(provider, active_skills),
             drift_workspace=settings.workspace,
             drift_builtin_skills=_BUILTIN_SKILLS_DIR,
             drift_repository=proactive_repository,
@@ -493,9 +491,7 @@ async def build_runtime_bundle(
                 history_limit=settings.memory_history_limit,
                 progress_factory=progress_factory,
             )
-            schedule_service._operational = operational
-            schedule_service._runtime = runtime
-            schedule_service._outbound = outbound
+            schedule_service.bind_executor(runtime, outbound)
             task_dispatcher = TaskDispatcher(
                 passive=passive,
                 memory=memory_tasks,
@@ -507,6 +503,7 @@ async def build_runtime_bundle(
         return RuntimeBundle(
             repository=operational,
             tools=registry,
+            tool_executor=tool_executor,
             memory_engine=memory_engine,
             memory_tasks=memory_tasks,
             scheduler_service=schedule_service,
@@ -523,7 +520,7 @@ async def build_runtime_bundle(
         )
     except BaseException:
         for hook_id in hook_ids:
-            registry.unregister_hook(hook_id)
+            tool_executor.unregister_hook(hook_id)
         await manager.unload_all()
         await mcp_registry.shutdown()
         await http_resources.aclose()
@@ -537,14 +534,12 @@ async def build_app_runtime(settings: MemoPilotSettings) -> AppRuntime:
     repository = _repository(settings)
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     queue = RedisTaskQueue(redis)
-    coordinator = RedisSessionCoordinator(redis)
+    agent_loop: AgentLoop | None = None
 
     async def handle_inbound(message: InboundMessage) -> object:
         if message.content.strip() == "/stop":
-            await coordinator.request_background_stop(
-                message.session_key,
-                reason="user_stop",
-            )
+            if agent_loop is not None:
+                agent_loop.cancel_current()
             return InterruptAcknowledgement(
                 message="已收到停止请求。",
                 provider_uuid=str(
@@ -556,10 +551,10 @@ async def build_app_runtime(settings: MemoPilotSettings) -> AppRuntime:
                 ),
             )
         repository.record_inbound_activity(message)
-        return await queue.publish_inbound(
-            message,
-            stop_key=coordinator.stop_key(message.session_key),
-        )
+        published = await queue.publish_inbound(message)
+        if published is not None and agent_loop is not None:
+            agent_loop.preempt_for_p0()
+        return published
 
     console = IPCServerChannel(handle_inbound)
     channel = _feishu_channel(settings, repository, inbound_handler=handle_inbound)
@@ -643,30 +638,16 @@ async def build_app_runtime(settings: MemoPilotSettings) -> AppRuntime:
         await redis.aclose()
         raise RuntimeError("后台任务分派器未初始化")
 
-    leases = SessionLeaseManager(
-        redis,
-        repository,
-        ttl=timedelta(seconds=settings.lease_ttl_seconds),
-    )
     agent_loop = AgentLoop(
         queue,
-        leases,
         runtime.task_dispatcher,
-        owner_id=f"agent-{uuid4().hex[:8]}",
-        heartbeat_interval=settings.lease_heartbeat_seconds,
-        pending_min_idle=timedelta(seconds=settings.reclaim_idle_seconds),
-        session_coordinator=coordinator,
     )
-    memory_scheduler = MemoryMaintenanceScheduler(
-        repository,
-        enabled=settings.memory_optimizer_enabled,
-        interval=timedelta(seconds=settings.memory_optimizer_interval_seconds),
-    )
-    scheduler = ApplicationScheduler(
-        _TaskProducer(
+    scheduler = ScheduledTurnPipeline(
+        TaskProducer(
             repository,
-            memory_scheduler=memory_scheduler,
             schedule_service=runtime.scheduler_service,
+            memory_optimizer_enabled=settings.memory_optimizer_enabled,
+            memory_optimizer_interval=timedelta(seconds=settings.memory_optimizer_interval_seconds),
             proactive_tick_seconds=settings.proactive_tick_seconds,
             proactive_enabled=settings.proactive_enabled,
         ),
@@ -712,7 +693,7 @@ def _ensure_proactive_context(path: Path) -> None:
 
 
 def _proactive_recent_session(
-    repository: OperationalRepository,
+    repository: ConversationRepository,
     session_key: str,
     now: datetime,
 ) -> str:
@@ -734,7 +715,7 @@ def _proactive_recent_session(
 
 
 def _proactive_recent_chat(
-    repository: OperationalRepository,
+    repository: ConversationRepository,
     session_key: str,
     *,
     now: datetime,
@@ -755,13 +736,13 @@ def _proactive_recent_chat(
     ]
 
 
-def _repository(settings: MemoPilotSettings) -> OperationalRepository:
+def _repository(settings: MemoPilotSettings) -> ConversationRepository:
     migrate_database(
         settings.operational_database,
         DatabaseKind.OPERATIONAL,
         busy_timeout_seconds=settings.sqlite_busy_timeout_seconds,
     )
-    return OperationalRepository(
+    return ConversationRepository(
         settings.operational_database,
         busy_timeout_seconds=settings.sqlite_busy_timeout_seconds,
     )
@@ -822,7 +803,7 @@ def _vl_provider(settings: MemoPilotSettings) -> OpenAICompatibleProvider | None
 
 def _feishu_channel(
     settings: MemoPilotSettings,
-    repository: OperationalRepository,
+    repository: ConversationRepository,
     *,
     inbound_handler: InboundHandler,
 ) -> FeishuChannel:

@@ -12,7 +12,13 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .legacy_base import Tool, ToolResult
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ToolResult:
+    text: str = ""
+    content_blocks: list[dict[str, Any]] = field(default_factory=list)
 
 logger = logging.getLogger(__name__)
 _FILE_MUTATION_LOCKS: dict[str, asyncio.Lock] = {}
@@ -262,7 +268,7 @@ def _truncate_numbered_lines(
     return "".join(parts), truncated_by is not None, truncated_by, False, output_lines, used_bytes
 
 
-class ReadFileTool(Tool):
+class ReadFileTool:
     """读取文件内容，支持按行分页，超大文件自动截断。"""
 
     def __init__(self, allowed_dir: Path | None = None, multimodal: bool = True, vl_available: bool = False):
@@ -399,7 +405,7 @@ class ReadFileTool(Tool):
             return f"读取文件失败：{e}"
 
 
-class WriteFileTool(Tool):
+class WriteFileTool:
     """将内容写入文件，自动创建所需的父目录。"""
 
     def __init__(self, allowed_dir: Path | None = None):
@@ -448,7 +454,7 @@ class WriteFileTool(Tool):
         except Exception as e:
             return f"写入文件失败：{e}"
 
-class EditFileTool(Tool):
+class EditFileTool:
     """精确替换文件中的指定文本片段。"""
 
     def __init__(self, allowed_dir: Path | None = None):
@@ -542,7 +548,7 @@ class EditFileTool(Tool):
         except Exception as e:
             return f"编辑文件失败：{e}"
 
-class ListDirTool(Tool):
+class ListDirTool:
     """列举目录内容。"""
 
     def __init__(self, allowed_dir: Path | None = None):

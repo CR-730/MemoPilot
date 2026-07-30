@@ -22,9 +22,7 @@ from memopilot.extensions.events import EventHandler
 from memopilot.extensions.hooks import (
     HookContext,
     HookOutcome,
-    ToolExecutionRequest,
     ToolHook,
-    ToolHookDecision,
 )
 from memopilot.extensions.plugin_config import PluginConfig
 from memopilot.extensions.plugin_context import PluginContext, PluginKVStore
@@ -461,14 +459,6 @@ def _build_tool_hook(instance: Any, metadata: PluginHandlerMetadata) -> ToolHook
                 return HookOutcome()
             if isinstance(result, HookOutcome):
                 return result
-            if isinstance(result, ToolHookDecision):
-                return HookOutcome(
-                    decision="deny" if result.denied else "pass",
-                    updated_input=(
-                        dict(result.arguments) if result.arguments is not None else None
-                    ),
-                    reason=result.reason or "",
-                )
             if isinstance(result, dict):
                 return HookOutcome(updated_input=cast(dict[str, Any], result))
             raise TypeError(f"插件 ToolHook 返回值无效: {type(result).__name__}")
@@ -478,29 +468,6 @@ def _build_tool_hook(instance: Any, metadata: PluginHandlerMetadata) -> ToolHook
         event="pre_tool_use",
     )
 
-    async def legacy_before(
-        tool_name: str,
-        arguments: dict[str, object],
-    ) -> ToolHookDecision | None:
-        context = HookContext(
-            event="pre_tool_use",
-            request=ToolExecutionRequest(
-                call_id="",
-                tool_name=tool_name,
-                arguments=dict(arguments),
-            ),
-            current_arguments=dict(arguments),
-        )
-        if not hook.matches(context):
-            return None
-        outcome = await hook.run(context)
-        return ToolHookDecision(
-            arguments=outcome.updated_input,
-            denied=outcome.decision == "deny",
-            reason=outcome.reason or None,
-        )
-
-    hook.before = legacy_before
     return hook
 
 

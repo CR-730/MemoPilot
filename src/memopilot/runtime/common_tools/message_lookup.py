@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 from typing import Any, Protocol, cast
 
-from .legacy_base import Tool
 
 
 class SessionStore(Protocol):
@@ -26,7 +25,7 @@ _MAX_CONTEXT = 10
 _MAX_PREVIEW_LINES = 50
 
 
-class FetchMessagesTool(Tool):
+class FetchMessagesTool:
     name = "fetch_messages"
     description = (
         "fetch_messages 根据消息 ID 或 source_ref 读取原始历史消息原文与上下文。\n"
@@ -175,7 +174,7 @@ def _to_public_message(message: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in message.items() if k in keep}
 
 
-class SearchMessagesTool(Tool):
+class SearchMessagesTool:
     name = "search_messages"
     description = (
         "对原始历史消息做 grep 式搜索，返回命中候选消息的预览和 source_ref。\n"

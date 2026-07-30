@@ -1,4 +1,4 @@
-"""Redis Streams 的 P0-P3 至少一次任务派发。"""
+"""基于 Redis Streams 的 P0—P3 优先级任务队列。"""
 
 from __future__ import annotations
 
@@ -35,17 +35,16 @@ _PUBLISH_INBOUND = """
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return ''
 end
-redis.call('SET', KEYS[4], 'user_message', 'EX', ARGV[2])
 redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
 local message_id = redis.call(
   'XADD', KEYS[2], '*',
-  'task_id', ARGV[3],
+  'task_id', ARGV[2],
   'kind', 'passive.turn',
   'priority', '0',
-  'session_key', ARGV[4],
-  'payload_json', ARGV[5]
+  'session_key', ARGV[3],
+  'payload_json', ARGV[4]
 )
-redis.call('SADD', KEYS[3], ARGV[3])
+redis.call('SADD', KEYS[3], ARGV[2])
 return message_id
 """
 
@@ -69,14 +68,9 @@ class QueueMessage:
     session_key: str
     payload_json: str
 
-@dataclass(frozen=True, slots=True)
-class PendingEntry:
-    message_id: str
-    consumer_id: str
-
 
 class RedisTaskQueue:
-    """后台任务的优先级队列与短期执行状态。"""
+    """提供幂等发布、Pending 重放、读取和 ACK。"""
 
     def __init__(
         self,
@@ -123,10 +117,8 @@ class RedisTaskQueue:
         await self.redis.sadd(self.queued_task_ids_key, task.task_id)
         return _text(message_id)
 
-    async def publish_task_once(
-        self, task: AgentTask, *, ttl_seconds: int = 86400
-    ) -> str | None:
-        """以任务 ID 做 Redis 幂等，避免 Scheduler 重启重复投递同一时间桶。"""
+    async def publish_task_once(self, task: AgentTask, *, ttl_seconds: int = 86400) -> str | None:
+        """按稳定任务 ID 幂等发布，避免生产器重启造成重复投递。"""
         key = f"{self.namespace}:task:{task.task_id}"
         result = await self.redis.eval(
             _PUBLISH_ONCE,
@@ -148,9 +140,7 @@ class RedisTaskQueue:
         self,
         message: InboundMessage,
         *,
-        stop_key: str,
         ttl_seconds: int = 86400,
-        preemption_ttl_seconds: int = 1800,
     ) -> str | None:
         identity = str(message.metadata.get("message_id") or "").strip()
         if not identity:
@@ -171,13 +161,11 @@ class RedisTaskQueue:
         )
         result = await self.redis.eval(
             _PUBLISH_INBOUND,
-            4,
+            3,
             f"{self.namespace}:task:{task_id}",
             self.stream_key(0),
             self.queued_task_ids_key,
-            stop_key,
             ttl_seconds,
-            preemption_ttl_seconds,
             task_id,
             message.session_key,
             payload_json,
@@ -187,17 +175,43 @@ class RedisTaskQueue:
 
     async def read_next(self, *, consumer_id: str) -> QueueMessage | None:
         try:
-            return await self._read_next_from_existing_groups(consumer_id=consumer_id)
+            return await self._read_from_existing_groups(consumer_id=consumer_id, entry_id=">")
         except ResponseError as exc:
             if "NOGROUP" not in str(exc):
                 raise
             await self.ensure_consumer_groups()
-            return await self._read_next_from_existing_groups(consumer_id=consumer_id)
+            return await self._read_from_existing_groups(consumer_id=consumer_id, entry_id=">")
 
-    async def _read_next_from_existing_groups(
+    async def read_pending(self, *, consumer_id: str) -> QueueMessage | None:
+        """读取固定 consumer 自己尚未 ACK 的 Pending 消息。"""
+        try:
+            return await self._read_from_existing_groups(consumer_id=consumer_id, entry_id="0")
+        except ResponseError as exc:
+            if "NOGROUP" not in str(exc):
+                raise
+            await self.ensure_consumer_groups()
+            return await self._read_from_existing_groups(consumer_id=consumer_id, entry_id="0")
+
+    async def read_priority(
+        self, priority: int, *, consumer_id: str, entry_id: str = ">"
+    ) -> QueueMessage | None:
+        """读取指定优先级的新消息，用于运行中的 P0 抢占检查。"""
+        stream = self.stream_key(priority)
+        response = cast(
+            list[tuple[str | bytes, list[tuple[str | bytes, dict[object, object]]]]],
+            await self.redis.xreadgroup(self.group, consumer_id, {stream: entry_id}, count=1),
+        )
+        if not response:
+            return None
+        _, entries = response[0]
+        message_id, fields = entries[0]
+        return _queue_message(stream, message_id, fields)
+
+    async def _read_from_existing_groups(
         self,
         *,
         consumer_id: str,
+        entry_id: str,
     ) -> QueueMessage | None:
         for priority in range(4):
             stream = self.stream_key(priority)
@@ -211,7 +225,7 @@ class RedisTaskQueue:
                 await self.redis.xreadgroup(
                     self.group,
                     consumer_id,
-                    {stream: ">"},
+                    {stream: entry_id},
                     count=1,
                 ),
             )
@@ -245,37 +259,7 @@ class RedisTaskQueue:
                 pipeline.sismember(self.queued_task_ids_key, task_id)
             present = await pipeline.execute()
         return tuple(
-            task_id
-            for task_id, exists in zip(task_ids, present, strict=True)
-            if not exists
-        )
-
-    async def pending_entries(
-        self,
-        *,
-        priority: int,
-        min_idle_ms: int,
-        after_message_id: str | None = None,
-        count: int = 20,
-    ) -> tuple[PendingEntry, ...]:
-        minimum = "-" if after_message_id is None else f"({after_message_id}"
-        raw = cast(
-            list[dict[object, object]],
-            await self.redis.xpending_range(
-                self.stream_key(priority),
-                self.group,
-                min=minimum,
-                max="+",
-                count=count,
-                idle=min_idle_ms,
-            ),
-        )
-        return tuple(
-            PendingEntry(
-                message_id=_text(_mapping_field(item, "message_id")),
-                consumer_id=_text(_mapping_field(item, "consumer")),
-            )
-            for item in raw
+            task_id for task_id, exists in zip(task_ids, present, strict=True) if not exists
         )
 
     async def load_message(self, *, priority: int, message_id: str) -> QueueMessage | None:
@@ -289,28 +273,6 @@ class RedisTaskQueue:
         entry_id, fields = entries[0]
         return _queue_message(stream, entry_id, fields)
 
-    async def claim_pending(
-        self,
-        message: QueueMessage,
-        *,
-        consumer_id: str,
-        min_idle_ms: int,
-    ) -> QueueMessage | None:
-        claimed = cast(
-            list[tuple[str | bytes, dict[object, object]]],
-            await self.redis.xclaim(
-                message.stream,
-                self.group,
-                consumer_id,
-                min_idle_ms,
-                [message.message_id],
-            ),
-        )
-        if not claimed:
-            return None
-        message_id, fields = claimed[0]
-        return _queue_message(message.stream, message_id, fields)
-
 
 def _text(value: object) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
@@ -323,15 +285,6 @@ def _field(fields: dict[object, object], name: str) -> str:
     if value is None:
         raise ValueError(f"Redis 任务缺少字段: {name}")
     return _text(value)
-
-
-def _mapping_field(fields: dict[object, object], name: str) -> object:
-    value = fields.get(name)
-    if value is None:
-        value = fields.get(name.encode())
-    if value is None:
-        raise ValueError(f"Redis Pending 记录缺少字段: {name}")
-    return value
 
 
 def _queue_message(
@@ -350,4 +303,4 @@ def _queue_message(
     )
 
 
-__all__ = ["PendingEntry", "PublishedTask", "QueueMessage", "RedisTaskQueue"]
+__all__ = ["PublishedTask", "QueueMessage", "RedisTaskQueue"]

@@ -9,15 +9,15 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
+from uuid import NAMESPACE_URL, uuid5
 
+from memopilot.persistence.conversation import ConversationRepository, StaleActivityError
 from memopilot.proactive.drift import DRIFT_SYSTEM_PROMPT
-from memopilot.proactive.drift_runtime import DriftRunState, build_drift_tool_registry
+from memopilot.proactive.drift_tools import DriftRunState, build_drift_tool_registry
 from memopilot.proactive.store import ProactiveRepository
 from memopilot.runtime.engine import AgentRuntime, TurnInput, TurnResult
 from memopilot.runtime.outbound import OutboundDispatch, OutboundPort
 from memopilot.runtime.tools import ToolRegistry
-from memopilot.tasks.lease import SessionLease
-from memopilot.tasks.operational import OperationalRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,12 +30,12 @@ class DriftSkillSelector(Protocol):
     async def select(self) -> str: ...
 
 
-class DriftRuntime:
+class DriftTurnPipeline:
     """执行 Drift；定时、主动和记忆任务由各自领域处理器负责。"""
 
     def __init__(
         self,
-        repository: OperationalRepository,
+        repository: ConversationRepository,
         runtime: AgentRuntime,
         *,
         outbound: OutboundPort | None = None,
@@ -62,7 +62,6 @@ class DriftRuntime:
         task_id: str,
         session_key: str,
         payload: dict[str, object],
-        lease: SessionLease,
         now: datetime,
     ) -> DriftResult:
         if self.drift_selector is None:
@@ -70,10 +69,8 @@ class DriftRuntime:
         activity_version = _required_integer(payload, "activity_version")
 
         def assert_current() -> None:
-            self.repository.assert_current_fence_and_activity(
-                lease,
-                expected_activity_version=activity_version,
-            )
+            if self.repository.get_activity_version(session_key) != activity_version:
+                raise StaleActivityError("用户活跃状态已经变化，丢弃陈旧 Drift 任务")
 
         assert_current()
         skill_name = await self.drift_selector.select()
@@ -90,6 +87,9 @@ class DriftRuntime:
                     chat_id=_required_text(payload, "chat_id"),
                     content=text,
                     media=media,
+                    metadata={
+                        "provider_uuid": str(uuid5(NAMESPACE_URL, f"memopilot:drift:{task_id}"))
+                    },
                 )
             )
 
@@ -122,7 +122,6 @@ class DriftRuntime:
                 tools=drift_tools,
                 execution_assert_current=assert_current,
                 memory_assert_current=assert_current,
-                memory_fenced_write=lambda: self.repository.fenced_write(lease),
             )
         except BaseException as exc:
             with suppress(Exception):
@@ -192,4 +191,4 @@ def _resolve_drift_workspace(value: object, configured: Path | None) -> Path:
     return Path(str(value or configured or ".")).resolve()
 
 
-__all__ = ["DriftRuntime", "DriftResult", "DriftSkillSelector"]
+__all__ = ["DriftTurnPipeline", "DriftResult", "DriftSkillSelector"]

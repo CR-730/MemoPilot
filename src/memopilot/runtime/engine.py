@@ -61,7 +61,7 @@ from memopilot.runtime.react import (
     ToolCallRecord,
 )
 from memopilot.runtime.tool_search import ToolDiscoveryState, format_deferred_tools_hint
-from memopilot.runtime.tools import ToolRegistry
+from memopilot.runtime.tools import ToolExecutor, ToolRegistry
 from memopilot.scheduling.tool_context import (
     bind_schedule_tool_context,
     reset_schedule_tool_context,
@@ -158,6 +158,7 @@ class AgentRuntime:
         provider: ChatProvider,
         tools: ToolRegistry,
         *,
+        tool_executor: ToolExecutor | None = None,
         max_iterations: int = 10,
         modules: Sequence[PhaseModule] = (),
         memory_engine: MemoryQueryEngine | None = None,
@@ -174,6 +175,7 @@ class AgentRuntime:
     ) -> None:
         self._provider = provider
         self._tools = tools
+        self._tool_executor = tool_executor or ToolExecutor(tools)
         self._max_iterations = max_iterations
         self._memory_engine = memory_engine
         self._memory_profile = memory_profile
@@ -399,6 +401,7 @@ class AgentRuntime:
             react = await ReActEngine(
                 self._provider,
                 active_tools,
+                tool_executor=self._tool_executor.for_registry(active_tools),
                 max_iterations=self._max_iterations,
                 observer=execution,
                 event_bus=self._event_bus,

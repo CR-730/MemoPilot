@@ -16,7 +16,6 @@ from jsonschema.validators import validator_for
 from memopilot.extensions.hooks import (
     HookContext,
     HookEvent,
-    HookOutcome,
     HookTraceItem,
     ToolExecStatus,
     ToolExecutionRequest,
@@ -85,35 +84,15 @@ class ToolObservation:
                 raise ValueError("成功的工具 Observation 状态必须是 success")
             return
         if self.status == "success":
-            derived: ToolExecStatus = (
-                "denied" if self.error_type == "hook_denied" else "error"
-            )
+            derived: ToolExecStatus = "denied" if self.error_type == "hook_denied" else "error"
             object.__setattr__(self, "status", derived)
-
-    @property
-    def legacy_hook_trace(self) -> tuple[str, ...]:
-        """供仍只展示摘要的旧调用方读取；事实源保持结构化。"""
-        return tuple(
-            f"{item.hook_name}:{item.event}:"
-            f"{'matched' if item.matched else 'unmatched'}:{item.decision}"
-            for item in self.hook_trace
-        )
-
-    @property
-    def pre_hook_trace(self) -> tuple[HookTraceItem, ...]:
-        return tuple(item for item in self.hook_trace if item.event == "pre_tool_use")
-
-    @property
-    def post_hook_trace(self) -> tuple[HookTraceItem, ...]:
-        return tuple(item for item in self.hook_trace if item.event != "pre_tool_use")
 
     @property
     def content(self) -> str:
         payload: dict[str, Any] = {"ok": self.ok, "status": self.status}
         if self.ok:
-            if (
-                isinstance(self.result, dict)
-                and isinstance(self.result.get("content_blocks"), list)
+            if isinstance(self.result, dict) and isinstance(
+                self.result.get("content_blocks"), list
             ):
                 payload["result"] = self.result.get("text") or "工具执行完成。"
             else:
@@ -131,18 +110,13 @@ class ToolRegistry:
     def __init__(
         self,
         tools: Iterable[Tool] = (),
-        *,
-        hooks: Iterable[ToolHook] = (),
     ) -> None:
         self._tools: dict[str, Tool] = {}
         self._metadata: dict[str, ToolMeta] = {}
         self._documents: dict[str, ToolDocument] = {}
         self._search_backend = KeywordSearchBackend()
-        self._hooks: list[ToolHook] = []
         for tool in tools:
             self.register(tool)
-        for hook in hooks:
-            self.register_hook(hook)
 
     def register(
         self,
@@ -162,8 +136,7 @@ class ToolRegistry:
             raise ValueError(f"工具 {tool.name} 的 timeout_seconds 必须大于 0")
         if not _is_async_callable(tool.handler):
             raise ValueError(
-                f"工具 {tool.name} 必须提供异步 Handler；"
-                "阻塞操作应使用可取消的异步实现或子进程"
+                f"工具 {tool.name} 必须提供异步 Handler；阻塞操作应使用可取消的异步实现或子进程"
             )
         validator_class = validator_for(tool.parameters)
         try:
@@ -230,23 +203,6 @@ class ToolRegistry:
         self._metadata.pop(tool_name, None)
         self._documents.pop(tool_name, None)
         self._search_backend.remove(tool_name)
-
-    def register_hook(self, hook: ToolHook) -> None:
-        if any(existing.hook_id == hook.hook_id for existing in self._hooks):
-            raise ValueError(f"ToolHook 重复: {hook.hook_id}")
-        self._hooks.append(hook)
-
-    def register_hooks(self, hooks: Iterable[ToolHook]) -> None:
-        previous = list(self._hooks)
-        try:
-            for hook in hooks:
-                self.register_hook(hook)
-        except Exception:
-            self._hooks = previous
-            raise
-
-    def unregister_hook(self, hook_id: str) -> None:
-        self._hooks = [hook for hook in self._hooks if hook.hook_id != hook_id]
 
     def schemas(
         self,
@@ -344,276 +300,65 @@ class ToolRegistry:
         blocked_reason: str | None = None,
         blocked_error_type: str = "tool_not_loaded",
     ) -> ToolObservation:
-        execution_request = request or ToolExecutionRequest(
-            call_id=call.id,
-            tool_name=call.name,
-            arguments=dict(call.arguments),
-        )
-        execution_request.call_id = call.id
-        execution_request.tool_name = call.name
-        execution_request.arguments = dict(call.arguments)
+        """执行单个工具；Hook 编排由 ToolExecutor 独占。"""
+        del request
         tool = self._tools.get(call.name)
         if tool is None:
-            return await self._run_after_hooks(
-                call.name,
-                self._failure(call, "unknown_tool", f"工具不存在: {call.name}"),
-                execution_request,
-            )
+            return self._failure(call, "unknown_tool", f"工具不存在: {call.name}")
         if call.argument_error is not None:
-            return await self._run_after_hooks(
-                call.name,
-                self._failure(call, "invalid_arguments", call.argument_error),
-                execution_request,
-            )
-        original_arguments = dict(call.arguments)
-        final_arguments = dict(call.arguments)
-        hook_trace: list[HookTraceItem] = []
-        extra_messages: list[str] = []
-        for hook in self._hooks:
-            if hook.event != "pre_tool_use" and hook.before is None:
-                continue
-            matched = False
-            try:
-                if hook.event == "pre_tool_use":
-                    context = HookContext(
-                        event="pre_tool_use",
-                        request=execution_request,
-                        current_arguments=dict(final_arguments),
-                    )
-                    matched = hook.matches(context)
-                    if not matched:
-                        hook_trace.append(
-                            HookTraceItem(
-                                hook_name=hook.hook_id,
-                                event="pre_tool_use",
-                                matched=False,
-                            )
-                        )
-                        continue
-                    decision = await hook.run(context)
-                else:
-                    matched = True
-                    decision = await self._run_legacy_pre_hook(
-                        hook,
-                        execution_request,
-                        final_arguments,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                hook_trace.append(
-                    HookTraceItem(
-                        hook_name=hook.hook_id,
-                        event="pre_tool_use",
-                        matched=matched,
-                        reason=f"hook failed: {exc}",
-                    )
-                )
-                return self._failure(
-                    call,
-                    "hook_error",
-                    f"工具前置 Hook 异常: {hook.hook_id}",
-                    original_arguments=original_arguments,
-                    final_arguments=final_arguments,
-                    hook_trace=tuple(hook_trace),
-                    extra_messages=tuple(extra_messages),
-                )
-            if decision.extra_message:
-                extra_messages.append(decision.extra_message)
-            hook_trace.append(
-                HookTraceItem(
-                    hook_name=hook.hook_id,
-                    event="pre_tool_use",
-                    matched=True,
-                    decision=decision.decision,
-                    reason=decision.reason,
-                    extra_message=decision.extra_message,
-                )
-            )
-            if decision.decision == "deny":
-                return self._failure(
-                    call,
-                    "hook_denied",
-                    decision.reason or "Hook 已拒绝工具调用",
-                    status="denied",
-                    original_arguments=original_arguments,
-                    final_arguments=final_arguments,
-                    hook_trace=tuple(hook_trace),
-                    extra_messages=tuple(extra_messages),
-                )
-            if decision.updated_input is not None:
-                final_arguments = dict(decision.updated_input)
+            return self._failure(call, "invalid_arguments", call.argument_error)
+        arguments = dict(call.arguments)
         if blocked_reason is not None:
             return self._failure(
                 call,
                 blocked_error_type,
                 blocked_reason,
-                original_arguments=original_arguments,
-                final_arguments=final_arguments,
-                hook_trace=tuple(hook_trace),
-                extra_messages=tuple(extra_messages),
+                original_arguments=arguments,
+                final_arguments=arguments,
                 retryable=True,
             )
         try:
-            validator_for(tool.parameters)(tool.parameters).validate(final_arguments)
+            validator_for(tool.parameters)(tool.parameters).validate(arguments)
         except ValidationError as exc:
-            return await self._run_after_hooks(
-                call.name,
-                self._failure(
-                    call,
-                    "invalid_arguments",
-                    exc.message,
-                    original_arguments=original_arguments,
-                    final_arguments=final_arguments,
-                    hook_trace=tuple(hook_trace),
-                ),
-                execution_request,
-                extra_messages=extra_messages,
+            return self._failure(
+                call,
+                "invalid_arguments",
+                exc.message,
+                original_arguments=arguments,
+                final_arguments=arguments,
             )
         try:
             async with asyncio.timeout(tool.timeout_seconds):
                 try:
-                    result = await tool.handler(**final_arguments)
+                    result = await tool.handler(**arguments)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    return await self._run_after_hooks(
-                        call.name,
-                        self._failure(
-                            call,
-                            str(getattr(exc, "error_type", "tool_execution_error")),
-                            f"{type(exc).__name__}: {exc}",
-                            original_arguments=original_arguments,
-                            final_arguments=final_arguments,
-                            hook_trace=tuple(hook_trace),
-                            retryable=bool(getattr(exc, "retryable", False)),
-                        ),
-                        execution_request,
-                        extra_messages=extra_messages,
+                    return self._failure(
+                        call,
+                        str(getattr(exc, "error_type", "tool_execution_error")),
+                        f"{type(exc).__name__}: {exc}",
+                        original_arguments=arguments,
+                        final_arguments=arguments,
+                        retryable=bool(getattr(exc, "retryable", False)),
                     )
-        except TimeoutError:
-            return await self._run_after_hooks(
-                call.name,
-                self._failure(
-                    call,
-                    "tool_timeout",
-                    f"工具执行超过 {tool.timeout_seconds:g} 秒",
-                    original_arguments=original_arguments,
-                    final_arguments=final_arguments,
-                    hook_trace=tuple(hook_trace),
-                ),
-                execution_request,
-                extra_messages=extra_messages,
-            )
         except asyncio.CancelledError:
             raise
-        observation = ToolObservation(
+        except TimeoutError:
+            return self._failure(
+                call,
+                "tool_timeout",
+                f"工具执行超过 {tool.timeout_seconds:g} 秒",
+                original_arguments=arguments,
+                final_arguments=arguments,
+            )
+        return ToolObservation(
             call_id=call.id,
             tool_name=call.name,
             ok=True,
             result=result,
-            original_arguments=original_arguments,
-            final_arguments=final_arguments,
-            hook_trace=tuple(hook_trace),
-            extra_messages=tuple(extra_messages),
-            status="success",
-        )
-        return await self._run_after_hooks(
-            call.name,
-            observation,
-            execution_request,
-            extra_messages=extra_messages,
-        )
-
-    async def _run_legacy_pre_hook(
-        self,
-        hook: ToolHook,
-        request: ToolExecutionRequest,
-        arguments: dict[str, Any],
-    ) -> HookOutcome:
-        if hook.before is None:
-            return HookOutcome()
-        decision = await hook.before(request.tool_name, dict(arguments))
-        if decision is None:
-            return HookOutcome()
-        return HookOutcome(
-            decision="deny" if decision.denied else "pass",
-            updated_input=(
-                dict(decision.arguments) if decision.arguments is not None else None
-            ),
-            reason=decision.reason or "",
-        )
-
-    async def _run_after_hooks(
-        self,
-        tool_name: str,
-        observation: ToolObservation,
-        request: ToolExecutionRequest,
-        *,
-        extra_messages: list[str] | None = None,
-    ) -> ToolObservation:
-        hook_trace: list[HookTraceItem] = list(observation.hook_trace)
-        messages = list(observation.extra_messages)
-        if extra_messages:
-            messages = list(extra_messages)
-        for hook in self._hooks:
-            expected: HookEvent = (
-                "post_tool_use" if observation.status == "success" else "post_tool_error"
-            )
-            if hook.after is None and hook.event != expected:
-                continue
-            matched = False
-            try:
-                if hook.after is not None:
-                    matched = True
-                    await hook.after(tool_name, observation)
-                    outcome = HookOutcome()
-                else:
-                    context = HookContext(
-                        event=expected,
-                        request=request,
-                        current_arguments=dict(observation.final_arguments or {}),
-                        result=observation.result if observation.ok else "",
-                        error=(observation.error_message or "") if not observation.ok else "",
-                    )
-                    matched = hook.matches(context)
-                    if not matched:
-                        hook_trace.append(
-                            HookTraceItem(
-                                hook_name=hook.hook_id,
-                                event=expected,
-                                matched=False,
-                            )
-                        )
-                        continue
-                    outcome = await hook.run(context)
-                    if outcome.extra_message:
-                        messages.append(outcome.extra_message)
-                hook_trace.append(
-                    HookTraceItem(
-                        hook_name=hook.hook_id,
-                        event=expected,
-                        matched=True,
-                        decision=outcome.decision,
-                        reason=outcome.reason,
-                        extra_message=outcome.extra_message,
-                    )
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                hook_trace.append(
-                    HookTraceItem(
-                        hook_name=hook.hook_id,
-                        event=expected,
-                        matched=matched,
-                        reason=f"hook failed: {exc}",
-                    )
-                )
-        return replace(
-            observation,
-            hook_trace=tuple(hook_trace),
-            extra_messages=tuple(messages),
+            original_arguments=arguments,
+            final_arguments=arguments,
         )
 
     @staticmethod
@@ -644,4 +389,174 @@ class ToolRegistry:
         )
 
 
-__all__ = ["Tool", "ToolHandler", "ToolObservation", "ToolRegistry"]
+class ToolExecutor:
+    """在统一入口编排 ToolHook，Registry 只提供工具查找和低层调用。"""
+
+    def __init__(self, registry: ToolRegistry, hooks: Iterable[ToolHook] = ()) -> None:
+        self._registry = registry
+        self._hooks: list[ToolHook] = []
+        self.register_hooks(hooks)
+
+    def register_hook(self, hook: ToolHook) -> None:
+        if any(item.hook_id == hook.hook_id for item in self._hooks):
+            raise ValueError(f"ToolHook 重复: {hook.hook_id}")
+        self._hooks.append(hook)
+
+    def register_hooks(self, hooks: Iterable[ToolHook]) -> None:
+        for hook in hooks:
+            self.register_hook(hook)
+
+    def unregister_hook(self, hook_id: str) -> None:
+        self._hooks = [hook for hook in self._hooks if hook.hook_id != hook_id]
+
+    def for_registry(self, registry: ToolRegistry) -> ToolExecutor:
+        """为临时工具集派生执行器，同时保留同一组 Hook。"""
+        if registry is self._registry:
+            return self
+        return ToolExecutor(registry, tuple(self._hooks))
+
+    async def execute(
+        self,
+        call: FunctionCall,
+        *,
+        request: ToolExecutionRequest | None = None,
+        blocked_reason: str | None = None,
+        blocked_error_type: str = "tool_not_loaded",
+    ) -> ToolObservation:
+        request = request or ToolExecutionRequest(call.id, call.name, dict(call.arguments))
+        original = dict(call.arguments)
+        arguments = dict(call.arguments)
+        trace: list[HookTraceItem] = []
+        messages: list[str] = []
+        for hook in self._hooks:
+            if hook.event != "pre_tool_use":
+                continue
+            context = HookContext("pre_tool_use", request, dict(arguments))
+            try:
+                matched = hook.matches(context)
+                if not matched:
+                    trace.append(HookTraceItem(hook.hook_id, "pre_tool_use", False))
+                    continue
+                outcome = await hook.run(context)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                trace.append(
+                    HookTraceItem(hook.hook_id, "pre_tool_use", True, reason=f"hook failed: {exc}")
+                )
+                return self._observation(
+                    call,
+                    "hook_error",
+                    f"工具前置 Hook 异常: {hook.hook_id}",
+                    original,
+                    arguments,
+                    trace,
+                    messages,
+                )
+            trace.append(
+                HookTraceItem(
+                    hook.hook_id,
+                    "pre_tool_use",
+                    True,
+                    outcome.decision,
+                    outcome.reason,
+                    outcome.extra_message,
+                )
+            )
+            if outcome.extra_message:
+                messages.append(outcome.extra_message)
+            if outcome.decision == "deny":
+                return self._observation(
+                    call,
+                    "hook_denied",
+                    outcome.reason or "Hook 已拒绝工具调用",
+                    original,
+                    arguments,
+                    trace,
+                    messages,
+                    status="denied",
+                )
+            if outcome.updated_input is not None:
+                arguments = dict(outcome.updated_input)
+        observation = await self._registry.execute(
+            FunctionCall(call.id, call.name, arguments, call.argument_error),
+            request=request,
+            blocked_reason=blocked_reason,
+            blocked_error_type=blocked_error_type,
+        )
+        observation = replace(
+            observation,
+            original_arguments=original,
+            final_arguments=arguments,
+            hook_trace=tuple(trace),
+            extra_messages=tuple(messages),
+        )
+        return await self._run_post_hooks(request, observation)
+
+    async def _run_post_hooks(
+        self, request: ToolExecutionRequest, observation: ToolObservation
+    ) -> ToolObservation:
+        event: HookEvent = "post_tool_use" if observation.ok else "post_tool_error"
+        trace = list(observation.hook_trace)
+        messages = list(observation.extra_messages)
+        for hook in self._hooks:
+            if hook.event != event:
+                continue
+            context = HookContext(
+                event,
+                request,
+                dict(observation.final_arguments or {}),
+                observation.result,
+                observation.error_message or "",
+            )
+            try:
+                matched = hook.matches(context)
+                if not matched:
+                    trace.append(HookTraceItem(hook.hook_id, event, False))
+                    continue
+                outcome = await hook.run(context)
+                if outcome.extra_message:
+                    messages.append(outcome.extra_message)
+                trace.append(
+                    HookTraceItem(
+                        hook.hook_id,
+                        event,
+                        True,
+                        outcome.decision,
+                        outcome.reason,
+                        outcome.extra_message,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                trace.append(HookTraceItem(hook.hook_id, event, True, reason=f"hook failed: {exc}"))
+        return replace(observation, hook_trace=tuple(trace), extra_messages=tuple(messages))
+
+    @staticmethod
+    def _observation(
+        call: FunctionCall,
+        error_type: str,
+        error_message: str,
+        original: dict[str, Any],
+        arguments: dict[str, Any],
+        trace: list[HookTraceItem],
+        messages: list[str],
+        *,
+        status: ToolExecStatus = "error",
+    ) -> ToolObservation:
+        return ToolObservation(
+            call.id,
+            call.name,
+            False,
+            error_type=error_type,
+            error_message=error_message,
+            original_arguments=original,
+            final_arguments=arguments,
+            hook_trace=tuple(trace),
+            extra_messages=tuple(messages),
+            status=status,
+        )
+
+
+__all__ = ["Tool", "ToolExecutor", "ToolHandler", "ToolObservation", "ToolRegistry"]

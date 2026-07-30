@@ -13,7 +13,7 @@ from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse
 from memopilot.runtime.phases import estimate_messages_tokens
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tool_search import ToolDiscoveryState, ToolSearchTool
-from memopilot.runtime.tools import ToolObservation, ToolRegistry
+from memopilot.runtime.tools import ToolExecutor, ToolObservation, ToolRegistry
 
 _SUMMARY_PROMPT = """当前任务需要先暂停继续调用工具，请直接输出给用户看的中文阶段性回复。
 必须基于已有上下文，不要编造结果。
@@ -99,6 +99,7 @@ class ReActEngine:
         provider: ChatProvider,
         tools: ToolRegistry,
         *,
+        tool_executor: ToolExecutor | None = None,
         max_iterations: int = 10,
         observer: ReActObserver | None = None,
         event_bus: EventBus | None = None,
@@ -114,6 +115,7 @@ class ReActEngine:
             raise ValueError("max_iterations 必须大于 0")
         self._provider = provider
         self._tools = tools
+        self._tool_executor = tool_executor or ToolExecutor(tools)
         self._max_iterations = max_iterations
         self._observer = observer
         self._event_bus = event_bus
@@ -378,7 +380,7 @@ class ReActEngine:
                 call.name,
                 _log_preview(call.arguments, 120),
             )
-            observation = await self._tools.execute(
+            observation = await self._tool_executor.execute(
                 call,
                 request=ToolExecutionRequest(
                     call_id=call.id,

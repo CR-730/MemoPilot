@@ -30,7 +30,6 @@ from uuid import uuid4
 import time
 from typing import Any, Callable, cast
 
-from .legacy_base import Tool
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +251,7 @@ def _bg_timeout(task_id: str) -> None:
 # ── ShellTool ────────────────────────────────────────────────────────
 
 
-class ShellTool(Tool):
+class ShellTool:
     """在系统命令解释器中执行命令，返回结构化结果"""
 
     name = "shell"
@@ -649,7 +648,7 @@ class ShellTool(Tool):
 # ── ShellTaskOutputTool ──────────────────────────────────────────────
 
 
-class ShellTaskOutputTool(Tool):
+class ShellTaskOutputTool:
     """读取后台 shell 任务的当前输出，可选择阻塞等待完成。"""
 
     name = "task_output"
@@ -777,7 +776,7 @@ class ShellTaskOutputTool(Tool):
 # ── ShellTaskStopTool ────────────────────────────────────────────────
 
 
-class ShellTaskStopTool(Tool):
+class ShellTaskStopTool:
     """停止并清理一个后台 shell 任务。"""
 
     name = "task_stop"

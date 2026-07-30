@@ -1,14 +1,14 @@
-"""运行时会话历史端口实现。"""
+"""从会话仓储装载并展开模型历史消息。"""
 
 from __future__ import annotations
 
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.runtime.contracts import ChatMessage
 from memopilot.runtime.history import expand_history
-from memopilot.tasks.operational import OperationalRepository
 
 
 class OperationalSessionManager:
-    def __init__(self, repository: OperationalRepository) -> None:
+    def __init__(self, repository: ConversationRepository) -> None:
         self._repository = repository
 
     def get_history(self, session_key: str, limit: int) -> tuple[ChatMessage, ...]:

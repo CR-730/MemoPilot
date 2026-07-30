@@ -1,4 +1,4 @@
-"""消息窗口归档、Manifest 驱动的多文件提交与恢复。"""
+"""将旧对话整理为带 Manifest 的长期记忆候选。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import json
 import re
 import sqlite3
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -15,7 +14,6 @@ from uuid import NAMESPACE_URL, uuid5
 
 from memopilot.memory.markdown import MarkdownMemoryStore
 from memopilot.persistence.migrations import connect_database
-from memopilot.tasks.operational import FenceToken, OperationalRepository
 
 
 class ConsolidationExtractor(Protocol):
@@ -70,8 +68,6 @@ class ConsolidationService:
         session_key: str,
         *,
         assert_current: Callable[[], None] | None = None,
-        lease: FenceToken | None = None,
-        fenced_write: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> ConsolidationResult | None:
         guard = assert_current or (lambda: None)
         guard()
@@ -97,8 +93,6 @@ class ConsolidationService:
         result = self._write_and_commit(
             manifest,
             assert_current=guard,
-            lease=lease,
-            fenced_write=fenced_write or nullcontext,
         )
         return result
 
@@ -226,8 +220,6 @@ class ConsolidationService:
         manifest: sqlite3.Row,
         *,
         assert_current: Callable[[], None],
-        lease: FenceToken | None,
-        fenced_write: Callable[[], AbstractContextManager[None]],
     ) -> ConsolidationResult:
         consolidation_id = str(manifest["consolidation_id"])
         output = _json_object(manifest["model_output_json"])
@@ -242,13 +234,12 @@ class ConsolidationService:
                 name, consolidation_id, content_hash
             ):
                 assert_current()
-                with fenced_write():
-                    self.markdown.append_artifact(
-                        name,
-                        consolidation_id=consolidation_id,
-                        content=content,
-                        content_hash=content_hash,
-                    )
+                self.markdown.append_artifact(
+                    name,
+                    consolidation_id=consolidation_id,
+                    content=content,
+                    content_hash=content_hash,
+                )
                 states[name] = "written"
                 assert_current()
                 self._save_artifact_states(consolidation_id, states)
@@ -258,14 +249,13 @@ class ConsolidationService:
             self.markdown.contains_artifact(name, consolidation_id, hashes[name])
             for name in artifacts
         ):
-            raise RuntimeError("归档文件校验失败，不允许发布向量任务")
+            raise RuntimeError("整理结果提交失败，未找到对应 Manifest")
         window = _json_object(output.get("_window"))
         assert_current()
         self._commit_manifest(
             consolidation_id,
             session_key=str(manifest["session_key"]),
             last_position=int(str(window["last_position"])),
-            lease=lease,
         )
         return ConsolidationResult(
             consolidation_id=consolidation_id,
@@ -302,14 +292,11 @@ class ConsolidationService:
         *,
         session_key: str,
         last_position: int,
-        lease: FenceToken | None,
     ) -> None:
         now = datetime.now(UTC).isoformat()
         connection = connect_database(self.database)
         connection.execute("BEGIN IMMEDIATE")
         try:
-            if lease is not None:
-                OperationalRepository.require_current_fence(connection, lease)
             connection.execute(
                 "UPDATE sessions SET last_consolidated_position = MAX("
                 "last_consolidated_position, ?), updated_at = ? WHERE session_key = ?",
@@ -346,13 +333,13 @@ def _validated_artifacts(value: object) -> dict[str, str]:
         if name not in allowed and not re.fullmatch(r"journal/\d{4}-\d{2}-\d{2}\.md", name)
     }
     if unsupported:
-        raise ValueError(f"Consolidation 返回了不支持的文件: {sorted(unsupported)}")
+        raise ValueError(f"Consolidation 包含不支持的字段: {sorted(unsupported)}")
     for name in result:
         if name.startswith("journal/"):
             try:
                 date.fromisoformat(Path(name).stem)
             except ValueError:
-                raise ValueError(f"Consolidation journal 日期无效: {name}") from None
+                raise ValueError(f"Consolidation journal 文件名非法: {name}") from None
     return result
 
 
@@ -365,7 +352,7 @@ def _journal_artifacts_from_history_entries(entries: list[str]) -> dict[str, str
         try:
             day = date.fromisoformat(match.group(1)).isoformat()
         except ValueError:
-            raise ValueError(f"history_entry 日期无效: {match.group(1)}") from None
+            raise ValueError(f"history_entry 文件名非法: {match.group(1)}") from None
         by_date.setdefault(day, []).append(entry)
     return {f"journal/{day}.md": "\n".join(summaries) for day, summaries in by_date.items()}
 
@@ -432,7 +419,7 @@ def _json_object(value: object) -> dict[str, object]:
         return {str(key): item for key, item in value.items()}
     loaded = json.loads(str(value))
     if not isinstance(loaded, dict):
-        raise ValueError("期望 JSON 对象")
+        raise ValueError("模型输出不是合法 JSON")
     return {str(key): item for key, item in loaded.items()}
 
 

@@ -139,7 +139,7 @@ async def _launch(executable: Path, host: str, port: int) -> RedisProcess:
         "--save",
         "",
         "--appendonly",
-        "no",
+        "yes",
         "--protected-mode",
         "yes",
         stdout=asyncio.subprocess.DEVNULL,

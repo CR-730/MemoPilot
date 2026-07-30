@@ -1,11 +1,11 @@
-"""将已提交的 Consolidation 隐式记忆幂等写入 memory2.db。"""
+"""消费已提交的 Consolidation，并将记忆写入 memory2.db。"""
 
 from __future__ import annotations
 
 import json
 import re
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,7 +21,6 @@ from memopilot.memory.memorizer import (
 )
 from memopilot.memory.store import MemoryStore
 from memopilot.persistence.migrations import connect_database
-from memopilot.tasks.operational import FenceToken, LostLeaseError, OperationalRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,11 +58,8 @@ class VectorizationService:
         consolidation_id: str,
         *,
         assert_current: Callable[[], None] | None = None,
-        lease: FenceToken | None = None,
-        fenced_write: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> VectorizationResult:
         guard = assert_current or (lambda: None)
-        write_scope = fenced_write or nullcontext
         guard()
         with connect_database(self.operational_database) as connection:
             manifest = connection.execute(
@@ -76,10 +72,10 @@ class VectorizationService:
         if manifest is None:
             raise KeyError(consolidation_id)
         if str(manifest["state"]) != "committed":
-            raise RuntimeError("只有已提交的 Consolidation 才能向量化")
+            raise RuntimeError("找不到指定的 Consolidation Manifest")
         output = json.loads(str(manifest["model_output_json"]))
         if not isinstance(output, dict):
-            raise ValueError("Consolidation 模型输出必须是对象")
+            raise ValueError("Consolidation 尚未提交")
         history_entries = output.get("history_entries", [])
         entries = _event_entries(history_entries, display_timezone=self.display_timezone)
         implicit = output.get("_implicit_memories")
@@ -124,8 +120,6 @@ class VectorizationService:
                 connection = connect_database(self.operational_database)
                 connection.execute("BEGIN IMMEDIATE")
                 try:
-                    if lease is not None:
-                        OperationalRepository.require_current_fence(connection, lease)
                     cursor = connection.execute(
                         "UPDATE consolidation_manifests SET model_output_json = ?, "
                         "updated_at = ? WHERE consolidation_id = ? AND state = 'committed'",
@@ -136,7 +130,7 @@ class VectorizationService:
                         ),
                     )
                     if cursor.rowcount != 1:
-                        raise RuntimeError("Consolidation Manifest 已不再处于 committed")
+                        raise RuntimeError("Consolidation Manifest 状态不再是 committed")
                     connection.execute("COMMIT")
                 except BaseException:
                     if connection.in_transaction:
@@ -169,22 +163,19 @@ class VectorizationService:
                     emotional_weight=bounded_int(raw.get("emotional_weight")),
                     explicit_supersedes=optional_text(raw.get("supersedes")),
                     assert_current=guard,
-                    fenced_write=write_scope,
                 )
                 counts[result.status] += 1
             now = datetime.now(UTC).isoformat()
             guard()
-            with write_scope():
+            with nullcontext():
                 with connect_database(self.store.database) as connection:
                     connection.execute(
                         "UPDATE memory_ingestion_batches SET state = 'committed', "
                         "committed_at = ?, updated_at = ? WHERE batch_id = ?",
                         (now, now, batch_id),
                     )
-        except LostLeaseError:
-            raise
         except Exception as exc:
-            with write_scope():
+            with nullcontext():
                 with connect_database(self.store.database) as connection:
                     connection.execute(
                         "UPDATE memory_ingestion_batches SET state = 'failed', last_error = ?, "

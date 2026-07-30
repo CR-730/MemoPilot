@@ -1,4 +1,4 @@
-"""基于 PENDING 快照的长期记忆优化器。"""
+"""将 PENDING 记忆优化并发布到长期记忆文件。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Protocol
 
 from memopilot.memory.markdown import MarkdownMemoryStore
-from memopilot.tasks.operational import LostLeaseError
 
 
 class OptimizerModel(Protocol):
@@ -54,7 +53,7 @@ class MemoryOptimizer:
             )
             guard()
             if not memory.strip() or not self_text.strip():
-                raise ValueError("优化器不得提交空 MEMORY.md 或 SELF.md")
+                raise ValueError("优化结果必须同时包含 MEMORY.md 和 SELF.md")
             with write_scope():
                 try:
                     self.markdown.begin_optimizer_publish(
@@ -66,7 +65,7 @@ class MemoryOptimizer:
                     self.markdown.replace("SELF.md", self_text)
                     self.markdown.append(
                         "HISTORY.md",
-                        f"[memory_optimizer] PENDING 归档:\n{pending.strip()}",
+                        f"[memory_optimizer] PENDING 内容：\n{pending.strip()}",
                     )
                     self.markdown.mark_optimizer_publish_committed()
                     self.markdown.recover_optimizer_publish()
@@ -74,9 +73,7 @@ class MemoryOptimizer:
                     self.markdown.recover_optimizer_publish()
                     raise
             return True
-        except BaseException as exc:
-            if isinstance(exc, LostLeaseError):
-                raise
+        except BaseException:
             with write_scope():
                 self.markdown.rollback_pending_snapshot()
             raise

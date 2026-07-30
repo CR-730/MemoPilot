@@ -12,7 +12,6 @@ import html2text
 from lxml import html as lxml_html
 from lxml.etree import ParserError
 
-from .legacy_base import Tool
 from .http import (
     HttpRequester,
     RequestBudget,
@@ -33,7 +32,7 @@ _ACCEPT = {
 }
 
 
-class WebFetchTool(Tool):
+class WebFetchTool:
     """抓取 URL 内容，支持 text / markdown / html 三种格式输出"""
 
     name = "web_fetch"

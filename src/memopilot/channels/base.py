@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
-from memopilot.tasks.operational import SessionIdentityRecord
+from memopilot.persistence.conversation import SessionIdentityRecord
 
 
 class IdentityStore(Protocol):

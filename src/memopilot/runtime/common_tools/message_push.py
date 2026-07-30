@@ -7,12 +7,11 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .legacy_base import Tool
 
 logger = logging.getLogger(__name__)
 
 
-class MessagePushTool(Tool):
+class MessagePushTool:
     name = "message_push"
     description = (
         "向指定渠道的用户主动发送消息、文件或图片。"

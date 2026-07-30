@@ -6,13 +6,12 @@ WebSearch 工具 — 基于 Exa MCP 公开端点，无需 API Key
 import json
 from typing import Any
 
-from .legacy_base import Tool
 
 _MCP_URL = "https://mcp.exa.ai/mcp"
 _DEFAULT_NUM_RESULTS = 8
 
 
-class WebSearchTool(Tool):
+class WebSearchTool:
     """用关键词通过 Exa 搜索互联网，返回标题、内容摘要、URL 列表"""
 
     name = "web_search"

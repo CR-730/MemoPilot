@@ -1,4 +1,4 @@
-"""旧公共工具集到 MemoPilot ToolRegistry 的直接适配。
+"""MemoPilot 内置公共工具的统一构造与注册。
 
 工具本体保留旧实现；本文件只负责把旧的 ``execute`` 合同接到当前
 ``Tool`` 数据类，并把当前 SQLite 消息表适配为旧工具需要的查询接口。
@@ -6,16 +6,19 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 from memopilot.runtime.tools import Tool, ToolRegistry
 
-from .filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from .filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    ToolResult,
+    WriteFileTool,
+)
 from .http import HttpRequester
-from .legacy_base import Tool as LegacyTool
-from .legacy_base import ToolResult
 from .message_lookup import FetchMessagesTool, SearchMessagesTool
 from .message_push import MessagePushTool
 from .shell import ShellTaskOutputTool, ShellTaskStopTool, ShellTool
@@ -157,9 +160,9 @@ class OperationalMessageStoreAdapter:
         }
 
 
-def adapt_legacy_tool(legacy: LegacyTool) -> Tool:
+def _build_tool(implementation: Any) -> Tool:
     async def handler(**arguments: Any) -> Any:
-        result = await legacy.execute(**arguments)
+        result = await implementation.execute(**arguments)
         if isinstance(result, ToolResult):
             if result.content_blocks:
                 return {
@@ -170,9 +173,9 @@ def adapt_legacy_tool(legacy: LegacyTool) -> Tool:
         return result
 
     return Tool(
-        name=legacy.name,
-        description=legacy.description,
-        parameters=legacy.parameters,
+        name=implementation.name,
+        description=implementation.description,
+        parameters=implementation.parameters,
         handler=handler,
         timeout_seconds=30,
         source="builtin:common",
@@ -199,8 +202,7 @@ def build_common_tools(
         WebSearchTool(),
     )
     message_store = OperationalMessageStoreAdapter(repository)
-    legacy_tools: tuple[LegacyTool, ...] = (
-        ToolSearchPlaceholder(),  # 由当前 ToolRegistry 的 tool_search 提供
+    implementations = (
         ShellTool(),
         ShellTaskOutputTool(),
         ShellTaskStopTool(),
@@ -214,18 +216,7 @@ def build_common_tools(
         WriteFileTool(),
         EditFileTool(),
     )
-    return tuple(adapt_legacy_tool(tool) for tool in legacy_tools if tool.name != "tool_search")
-
-
-class ToolSearchPlaceholder(LegacyTool):
-    """占位以保留旧集合顺序；真正实现由当前 ToolSearchTool 注册。"""
-
-    name = "tool_search"
-    description = "由 MemoPilot ToolRegistry 提供的工具搜索。"
-    parameters = {"type": "object", "properties": {}, "additionalProperties": False}
-
-    async def execute(self, **_: Any) -> str:
-        return json.dumps({"error": "tool_search must use the registry implementation"})
+    return tuple(_build_tool(tool) for tool in implementations)
 
 
 def register_common_tools(
@@ -274,7 +265,6 @@ def register_common_tools(
 
 __all__ = [
     "OperationalMessageStoreAdapter",
-    "adapt_legacy_tool",
     "build_common_tools",
     "register_common_tools",
 ]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -54,45 +53,19 @@ class HookTraceItem:
     extra_message: str = ""
 
 
-@dataclass(frozen=True, slots=True)
-class ToolHookDecision:
-    """兼容阶段 5 早期的函数式 pre-hook 返回值。"""
-
-    arguments: Mapping[str, Any] | None = None
-    denied: bool = False
-    reason: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.denied and not (self.reason or "").strip():
-            raise ValueError("Hook 拒绝工具调用时必须提供 reason")
-
-
-BeforeToolHook = Callable[
-    [str, dict[str, object]],
-    Awaitable[ToolHookDecision | None],
-]
-AfterToolHook = Callable[[str, object], Awaitable[None]]
-
-
 class ToolHook:
-    """原型 matches/run Hook，并兼容已有 before/after 函数式用法。"""
+    """统一的工具 Hook 合同。"""
 
     def __init__(
         self,
         hook_id: str,
-        before: BeforeToolHook | None = None,
-        after: AfterToolHook | None = None,
         *,
-        event: HookEvent | None = None,
+        event: HookEvent,
     ) -> None:
         if not hook_id.strip():
             raise ValueError("ToolHook hook_id 不能为空")
-        if event is None and before is None and after is None:
-            raise ValueError(f"ToolHook {hook_id} 至少需要 before、after 或 event")
         self.hook_id = hook_id
         self.name = hook_id
-        self.before = before
-        self.after = after
         self.event = event
 
     def matches(self, context: HookContext) -> bool:
@@ -105,8 +78,6 @@ class ToolHook:
 
 
 __all__ = [
-    "AfterToolHook",
-    "BeforeToolHook",
     "HookContext",
     "HookEvent",
     "HookOutcome",
@@ -114,5 +85,4 @@ __all__ = [
     "ToolExecStatus",
     "ToolExecutionRequest",
     "ToolHook",
-    "ToolHookDecision",
 ]

@@ -8,13 +8,12 @@ from uuid import NAMESPACE_URL, uuid5
 
 from memopilot.bus.events import InboundMessage, TurnCommitted
 from memopilot.extensions.events import EventBus
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.runtime.engine import AgentRuntime, SessionHistoryRequest, TurnInput
 from memopilot.runtime.history import build_tool_chain
 from memopilot.runtime.outbound import DeliveryError, OutboundDispatch, OutboundPort
 from memopilot.runtime.react import ReActProgressObserver
 from memopilot.tasks.agent_task import AgentTask
-from memopilot.tasks.lease import SessionLease
-from memopilot.tasks.operational import OperationalRepository
 
 
 class PassiveTurnPipeline:
@@ -22,7 +21,7 @@ class PassiveTurnPipeline:
         self,
         runtime: AgentRuntime,
         *,
-        repository: OperationalRepository,
+        repository: ConversationRepository,
         outbound: OutboundPort,
         event_bus: EventBus,
         history_limit: int,
@@ -35,20 +34,20 @@ class PassiveTurnPipeline:
             progress_factory,
         )
 
-    async def execute_task(
-        self, task: AgentTask, *, lease: SessionLease, now: datetime
-    ) -> Sequence[AgentTask]:
+    async def execute_task(self, task: AgentTask, *, now: datetime) -> Sequence[AgentTask]:
         del now
         message = _inbound_message(task.payload)
         if message.session_key != task.session_key:
             raise ValueError("passive.turn session_key mismatch")
         self._repository.record_inbound_activity(message)
-        committed = self._repository.commit_turn(message, lease=lease)
+        committed = self._repository.commit_turn(message)
         thinking: str | None = None
         tools_used: list[str] = []
         tool_chain: tuple[dict[str, str], ...] = ()
         cache_prompt_tokens = 0
         cache_hit_tokens = 0
+        cited_memory_ids: tuple[str, ...] = ()
+        explicitly_memorized_ids: tuple[str, ...] = ()
         if committed is None:
             progress = self._progress_factory(message) if self._progress_factory else None
             try:
@@ -74,11 +73,10 @@ class PassiveTurnPipeline:
                     result.react.messages,
                     call_ids=frozenset(item.call.id for item in result.react.tool_chain),
                 ),
-                cited_memory_ids=result.cited_memory_ids,
-                explicitly_memorized_ids=_explicitly_memorized_ids(result.trace),
-                lease=lease,
             )
             assert committed is not None
+            cited_memory_ids = result.cited_memory_ids
+            explicitly_memorized_ids = _explicitly_memorized_ids(result.trace)
             thinking = result.react.thinking
             tools_used = list(dict.fromkeys(item.call.name for item in result.react.tool_chain))
             tool_chain = tuple(
@@ -89,9 +87,7 @@ class PassiveTurnPipeline:
                         item.observation.content
                         if item.observation.ok
                         else str(
-                            item.observation.error_message
-                            or item.observation.error_type
-                            or ""
+                            item.observation.error_message or item.observation.error_type or ""
                         )
                     ),
                 }
@@ -132,7 +128,13 @@ class PassiveTurnPipeline:
         )
         if not sent:
             raise DeliveryError("passive reply delivery was not confirmed")
-        return committed.background_tasks
+        return _memory_tasks(
+            committed.turn_id,
+            committed.assistant_message_id,
+            message,
+            cited_memory_ids=cited_memory_ids,
+            explicitly_memorized_ids=explicitly_memorized_ids,
+        )
 
 
 def _inbound_message(payload: Mapping[str, object]) -> InboundMessage:
@@ -171,6 +173,64 @@ def _explicitly_memorized_ids(trace: Sequence[object]) -> tuple[str, ...]:
         if isinstance(item_id, str) and item_id.strip():
             item_ids.append(item_id.strip())
     return tuple(dict.fromkeys(item_ids))
+
+
+def _memory_tasks(
+    turn_id: str,
+    assistant_message_id: str,
+    message: InboundMessage,
+    *,
+    cited_memory_ids: tuple[str, ...],
+    explicitly_memorized_ids: tuple[str, ...],
+) -> tuple[AgentTask, ...]:
+    def task_id(value: str) -> str:
+        return str(uuid5(NAMESPACE_URL, f"memopilot:task:{value}"))
+
+    tasks = [
+        AgentTask(
+            task_id(f"consolidate:{turn_id}"),
+            "memory.consolidate",
+            3,
+            message.session_key,
+            {
+                "trigger_turn_id": turn_id,
+                "last_message_id": assistant_message_id,
+            },
+            message.timestamp,
+        ),
+        AgentTask(
+            task_id(f"post-response:{turn_id}"),
+            "memory.post_response",
+            3,
+            message.session_key,
+            {
+                "turn_id": turn_id,
+                "protected_ids": list(
+                    dict.fromkeys(
+                        item.strip()
+                        for item in explicitly_memorized_ids
+                        if item.strip()
+                    )
+                ),
+            },
+            message.timestamp,
+        ),
+    ]
+    cited = tuple(
+        dict.fromkeys(item.strip() for item in cited_memory_ids if item.strip())
+    )
+    if cited:
+        tasks.append(
+            AgentTask(
+                task_id(f"memory-reinforce:{turn_id}"),
+                "memory.reinforce",
+                3,
+                message.session_key,
+                {"usage_ref": f"turn:{turn_id}", "item_ids": list(cited)},
+                message.timestamp,
+            )
+        )
+    return tuple(tasks)
 
 
 __all__ = ["PassiveTurnPipeline"]

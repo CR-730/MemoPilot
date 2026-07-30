@@ -230,6 +230,24 @@ class ScheduleRepository:
         finally:
             connection.close()
 
+    def transition_execution(self, execution_id: str, *, outcome: str, now: datetime) -> str:
+        if outcome not in {"running", "succeeded", "failed", "cancelled"}:
+            raise ValueError(f"不支持的定时执行状态: {outcome}")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT state FROM scheduled_executions WHERE execution_id = ?", (execution_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(execution_id)
+            current = str(row["state"])
+            if current in {"succeeded", "failed", "cancelled"}:
+                return current
+            connection.execute(
+                "UPDATE scheduled_executions SET state = ?, updated_at = ? WHERE execution_id = ?",
+                (outcome, _as_utc(now).isoformat(), execution_id),
+            )
+        return outcome
+
     def _record_missed(
         self,
         connection: sqlite3.Connection,

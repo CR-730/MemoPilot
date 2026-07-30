@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
+from uuid import NAMESPACE_URL, uuid5
 from zoneinfo import ZoneInfo
 
 from memopilot.runtime.outbound import DeliveryError, OutboundDispatch, OutboundPort
@@ -19,8 +20,6 @@ from memopilot.scheduling.contracts import (
 from memopilot.scheduling.repository import ScheduleRepository
 from memopilot.scheduling.time_rules import compute_fire_at
 from memopilot.tasks.agent_task import AgentTask
-from memopilot.tasks.lease import SessionLease
-from memopilot.tasks.operational import OperationalRepository
 
 if TYPE_CHECKING:
     from memopilot.runtime.engine import AgentRuntime
@@ -31,12 +30,14 @@ class SchedulerService:
         self,
         repository: ScheduleRepository,
         *,
-        operational: OperationalRepository | None = None,
         runtime: AgentRuntime | None = None,
         outbound: OutboundPort | None = None,
     ) -> None:
         self.repository = repository
-        self._operational = operational
+        self._runtime = runtime
+        self._outbound = outbound
+
+    def bind_executor(self, runtime: AgentRuntime, outbound: OutboundPort) -> None:
         self._runtime = runtime
         self._outbound = outbound
 
@@ -107,16 +108,12 @@ class SchedulerService:
     def scan_due(self, *, now: datetime) -> DueScanResult:
         return self.repository.enqueue_due(now=now)
 
-    async def execute_task(
-        self, task: AgentTask, *, lease: SessionLease, now: datetime
-    ) -> tuple[AgentTask, ...]:
-        if self._operational is None or self._runtime is None or self._outbound is None:
+    async def execute_task(self, task: AgentTask, *, now: datetime) -> tuple[AgentTask, ...]:
+        if self._runtime is None or self._outbound is None:
             raise RuntimeError("SchedulerService 未配置执行依赖")
         payload = task.payload
         execution_id = _required_text(payload, "execution_id")
-        current = self._operational.transition_background_schedule(
-            execution_id, lease=lease, outcome="running", now=now
-        )
+        current = self.repository.transition_execution(execution_id, outcome="running", now=now)
         if current in {"succeeded", "failed", "cancelled"}:
             return ()
         try:
@@ -140,9 +137,7 @@ class SchedulerService:
                     )
                 )
                 if result.react.infrastructure_error:
-                    self._operational.transition_background_schedule(
-                        execution_id, lease=lease, outcome="failed", now=now
-                    )
+                    self.repository.transition_execution(execution_id, outcome="failed", now=now)
                     return ()
                 text = result.reply
             else:
@@ -152,19 +147,23 @@ class SchedulerService:
                     _required_text(payload, "channel"),
                     _required_text(payload, "chat_id"),
                     text,
+                    metadata={
+                        "provider_uuid": str(
+                            uuid5(
+                                NAMESPACE_URL,
+                                f"memopilot:schedule:{execution_id}",
+                            )
+                        )
+                    },
                 )
             ):
                 raise DeliveryError("定时任务结果未明确发送成功")
-            self._operational.transition_background_schedule(
-                execution_id, lease=lease, outcome="succeeded", now=now
-            )
+            self.repository.transition_execution(execution_id, outcome="succeeded", now=now)
             return ()
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, DeliveryError):
             raise
         except BaseException:
-            self._operational.transition_background_schedule(
-                execution_id, lease=lease, outcome="failed", now=now
-            )
+            self.repository.transition_execution(execution_id, outcome="failed", now=now)
             raise
 
 

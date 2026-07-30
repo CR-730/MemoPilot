@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from memopilot.persistence.conversation import MessageRecord
 from memopilot.runtime.contracts import ChatMessage, FunctionCall
-from memopilot.tasks.operational import MessageRecord
 
 _TOOL_RESULT_CHAR_BUDGET = 10_000
 
@@ -20,8 +20,7 @@ def build_tool_chain(
             message.role != "assistant"
             or not message.tool_calls
             or (
-                call_ids is not None
-                and not any(call.id in call_ids for call in message.tool_calls)
+                call_ids is not None and not any(call.id in call_ids for call in message.tool_calls)
             )
         ):
             continue
