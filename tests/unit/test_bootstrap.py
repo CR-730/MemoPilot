@@ -559,6 +559,31 @@ async def test_runtime_bundle_builds_core_runner_when_outbound_is_available(
     await bundle.close_extensions()
 
 
+async def test_scheduler_service_is_shared_by_tools_dispatcher_and_producer(tmp_path: Path) -> None:
+    settings = MemoPilotSettings(
+        workspace=tmp_path,
+        embedding_base_url="https://embedding.example/v1",
+        embedding_model="embedding-model",
+        embedding_dimension=2,
+        _env_file=None,
+    )
+    bundle = await build_runtime_bundle(
+        settings,
+        chat_provider=_ChatProvider(),  # type: ignore[arg-type]
+        embedder=_Embedder(),  # type: ignore[arg-type]
+        outbound=object(),  # type: ignore[arg-type]
+    )
+    try:
+        assert bundle.task_dispatcher is not None
+        assert bundle.task_dispatcher._scheduler is bundle.scheduler_service
+        schedule_tool = bundle.tools.get_tool("schedule")
+        assert schedule_tool is not None
+        closure = schedule_tool.handler.__closure__ or ()
+        assert bundle.scheduler_service in [cell.cell_contents for cell in closure]
+    finally:
+        await bundle.close_extensions()
+
+
 async def test_runtime_starts_local_mcp_tools_without_blocking_core_runtime(
     tmp_path: Path,
 ) -> None:

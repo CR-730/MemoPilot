@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
+from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.contracts import ChatMessage, ModelResponse
 from memopilot.runtime.engine import AgentRuntime, SessionHistoryRequest, TurnInput
+from memopilot.runtime.session import OperationalSessionManager
 from memopilot.runtime.tools import ToolRegistry
+from memopilot.tasks.operational import OperationalRepository
 
 
 def test_session_history_request_is_typed() -> None:
@@ -73,3 +78,53 @@ async def test_session_history_request_requires_manager() -> None:
                 history=SessionHistoryRequest("feishu:chat-1", 20),
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_before_turn_expands_persisted_tool_history_for_provider(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    from memopilot.bus.events import InboundMessage
+
+    message = InboundMessage("cli", "user", "chat", "first", timestamp=now)
+    repository.record_inbound_activity(message)
+    repository.commit_turn(
+        message,
+        assistant_content="final",
+        assistant_tool_chain=(
+            {
+                "text": "calling",
+                "calls": [
+                    {"call_id": "ok", "name": "tool", "arguments": {}, "result": "ok-result"},
+                    {"call_id": "bad", "name": "tool", "arguments": {}, "error": "bad-result"},
+                ],
+            },
+        ),
+    )
+    class CountingManager(OperationalSessionManager):
+        def __init__(self, repository) -> None:  # type: ignore[no-untyped-def]
+            super().__init__(repository)
+            self.calls = []
+
+        def get_history(self, session_key: str, limit: int) -> tuple[ChatMessage, ...]:
+            self.calls.append((session_key, limit))
+            return super().get_history(session_key, limit)
+
+    manager = CountingManager(repository)
+    provider = _Provider()
+    runtime = AgentRuntime(provider, ToolRegistry(), session_manager=manager)
+
+    await runtime.run(
+        TurnInput("cli:chat", "current", history=SessionHistoryRequest("cli:chat", 20))
+    )
+
+    history = [item for item in provider.messages if item.role != "system"]
+    assert [item.role for item in history] == [
+        "user", "assistant", "tool", "tool", "assistant", "user"
+    ]
+    assert [item.tool_call_id for item in history[2:4]] == ["ok", "bad"]
+    assert history[4].content == "final"
+    assert (history[-1].content or "").endswith("current")
+    assert manager.calls == [("cli:chat", 20)]
