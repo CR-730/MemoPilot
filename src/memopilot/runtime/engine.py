@@ -68,12 +68,21 @@ from memopilot.scheduling.tool_context import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class SessionHistoryRequest:
+    session_key: str
+    limit: int
+
+
+type HistoryInput = tuple[ChatMessage, ...] | SessionHistoryRequest
+
+
 @dataclass(frozen=True)
 class TurnInput:
     session_key: str
     content: str
     system_prompt: str = ""
-    history: tuple[ChatMessage, ...] = ()
+    history: HistoryInput = ()
     current_user_content: str | None = None
     resume_snapshot_id: str | None = None
     interrupt_original_message: str | None = None
@@ -110,6 +119,10 @@ class RuntimeStepSink(Protocol):
 
 class LongTermMemoryProfile(Protocol):
     def read(self, name: str) -> str: ...
+
+
+class SessionManager(Protocol):
+    def get_history(self, session_key: str, limit: int) -> tuple[ChatMessage, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -157,6 +170,7 @@ class AgentRuntime:
         tool_search_enabled: bool = False,
         prompt_workspace: Path | None = None,
         context_window_tokens: int = 1_000_000,
+        session_manager: SessionManager | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -166,6 +180,7 @@ class AgentRuntime:
         self._event_bus = event_bus
         self._tool_search_enabled = tool_search_enabled
         self._prompt_workspace = prompt_workspace
+        self._session_manager = session_manager
         if context_window_tokens <= 0:
             raise ValueError("模型上下文窗口必须大于 0")
         self._context_window_tokens = context_window_tokens
@@ -198,6 +213,7 @@ class AgentRuntime:
                     prompt_max_chars,
                     skills,
                     event_bus,
+                    session_manager,
                 ),
                 *memory_modules,
                 *modules,
@@ -785,12 +801,25 @@ class _RuntimeExecution(ReActObserver):
         await self._record(event)
 
 
-async def _before_turn(context: PhaseContext) -> Mapping[str, Any]:
+async def _before_turn(
+    context: PhaseContext, *, session_manager: SessionManager | None
+) -> Mapping[str, Any]:
     turn = context.slots["turn.input"]
     if not isinstance(turn, TurnInput):
         raise TypeError("turn.input 必须是 TurnInput")
     if not turn.session_key or not turn.content.strip():
         raise ValueError("session_key 和用户消息不能为空")
+    if isinstance(turn.history, SessionHistoryRequest):
+        if session_manager is None:
+            raise RuntimeError("SessionHistoryRequest requires SessionManager")
+        request = turn.history
+        history = session_manager.get_history(request.session_key, request.limit)
+        turn = replace(turn, history=history)
+        context.slots["turn.input"] = turn
+        context.slots["before_turn.input"] = _turn_state(turn)
+        context.slots["session:ctx"] = replace(
+            cast(BeforeTurnCtx, context.slots["session:ctx"]), history=history
+        )
     return {"session:ctx": context.slots["session:ctx"]}
 
 
@@ -906,7 +935,7 @@ async def _prompt_render(
     system_prompt = _append_prompt_text(system_prompt, skill_catalog, max_chars=max_chars)
     if system_prompt:
         messages.append(ChatMessage.system(system_prompt))
-    messages.extend(turn.history)
+    messages.extend(cast(tuple[ChatMessage, ...], turn.history))
     if memory_prompt:
         messages.append(ChatMessage.user(_build_context_frame(memory_prompt)))
     messages.append(
@@ -1006,7 +1035,7 @@ async def _build_prompt_context(context: PhaseContext) -> Mapping[str, Any]:
             content=turn.content,
             scope=turn.prompt_scope,
             system_prompt=turn.system_prompt,
-            history=turn.history,
+            history=cast(tuple[ChatMessage, ...], turn.history),
             channel=turn.session_key.partition(":")[0],
             chat_id=turn.session_key.partition(":")[2],
             media=turn.media,
@@ -1131,6 +1160,7 @@ def _default_modules(
     prompt_max_chars: int,
     skills: SkillCatalog | None,
     event_bus: EventBus | None,
+    session_manager: SessionManager | None = None,
 ) -> tuple[FunctionPhaseModule, ...]:
     return (
         FunctionPhaseModule(
@@ -1138,7 +1168,7 @@ def _default_modules(
             "before_turn.build_ctx",
             ("turn.input",),
             ("session:ctx",),
-            _before_turn,
+            partial(_before_turn, session_manager=session_manager),
         ),
         FunctionPhaseModule(
             LifecyclePhase.BEFORE_TURN,
@@ -1321,7 +1351,7 @@ def _turn_state(turn: TurnInput) -> BeforeTurnInput:
         chat_id=chat_id,
         content=turn.content,
         system_prompt=turn.system_prompt,
-        history=turn.history,
+        history=cast(tuple[ChatMessage, ...], turn.history),
         prompt_scope=turn.prompt_scope,
         media=turn.media,
         outbound_metadata=dict(turn.outbound_metadata),
