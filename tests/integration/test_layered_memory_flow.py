@@ -125,6 +125,7 @@ async def test_turn_to_async_archive_vector_and_next_turn_recall(
             _Extractor(),
             keep_count=0,
             min_new_messages=1,
+            recent_turn_count=1,
         ),
         VectorizationService(operational, store, embedder),
         MemoryOptimizer(markdown, _OptimizerModel()),

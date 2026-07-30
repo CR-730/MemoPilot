@@ -135,6 +135,7 @@ async def test_consolidation_window_keeps_recent_messages_and_requires_minimum(
         extractor,
         keep_count=2,
         min_new_messages=4,
+        recent_turn_count=1,
     )
 
     result = await service.run("feishu:chat-1")
@@ -175,6 +176,7 @@ async def test_consolidation_writes_independent_recent_context_and_daily_journal
         recent_context=recent,
         keep_count=2,
         min_new_messages=4,
+        recent_turn_count=1,
     )
 
     await service.run("feishu:chat-1")
@@ -210,6 +212,7 @@ async def test_below_threshold_refreshes_recent_turns_without_model_call(tmp_pat
         extractor,
         keep_count=4,
         min_new_messages=5,
+        recent_turn_count=2,
     )
 
     result = await service.run("feishu:chat-1")
@@ -237,6 +240,7 @@ async def test_history_entries_are_single_source_for_history_and_journal(tmp_pat
         _HistoryEntryExtractor(),
         keep_count=0,
         min_new_messages=1,
+        recent_turn_count=1,
     )
 
     result = await service.run("feishu:chat-1")
@@ -282,6 +286,7 @@ async def test_manifest_resumes_only_missing_artifact_and_publishes_vectorize_on
         extractor,
         keep_count=0,
         min_new_messages=1,
+        recent_turn_count=1,
         failpoint=failpoint,
     )
     with pytest.raises(RuntimeError, match="崩溃"):
@@ -300,6 +305,7 @@ async def test_manifest_resumes_only_missing_artifact_and_publishes_vectorize_on
         extractor,
         keep_count=0,
         min_new_messages=1,
+        recent_turn_count=1,
     )
     result = await resumed.run("feishu:chat-1")
     repeated = await resumed.run("feishu:chat-1")
@@ -325,6 +331,7 @@ async def test_consolidation_does_not_create_manifest_after_losing_lease(tmp_pat
         _Extractor(),
         keep_count=0,
         min_new_messages=1,
+        recent_turn_count=1,
     )
     checks = 0
 
@@ -361,14 +368,15 @@ async def test_consolidation_rechecks_fence_inside_final_transaction(tmp_path: P
         _Extractor(),
         keep_count=0,
         min_new_messages=1,
+        recent_turn_count=1,
     )
 
     with pytest.raises(LostLeaseError, match="已失效"):
         await service.run(
             "feishu:chat-1",
-        assert_current=lambda: None,
-        lease=stale_lease,
-    )
+            assert_current=lambda: None,
+            lease=stale_lease,
+        )
 
 
 @pytest.mark.asyncio
@@ -400,15 +408,111 @@ async def test_30_messages_consolidates_old_ten_and_keeps_hot_twenty(tmp_path: P
     for index in range(1, 16):
         _committed_turn(repository, index=index, user=f"问题-{index}", assistant=f"回答-{index}")
     service = ConsolidationService(
-        database, MarkdownMemoryStore(tmp_path / "memory"), _Extractor(),
-        keep_count=20, min_new_messages=10, recent_turn_count=10,
+        database,
+        MarkdownMemoryStore(tmp_path / "memory"),
+        _Extractor(),
+        keep_count=20,
+        min_new_messages=10,
+        recent_turn_count=10,
     )
 
     result = await service.run("feishu:chat-1")
 
     assert result is not None and result.message_count == 10
     with connect_database(database) as connection:
-        row = connection.execute(
-            "SELECT last_consolidated_position FROM sessions"
-        ).fetchone()
+        row = connection.execute("SELECT last_consolidated_position FROM sessions").fetchone()
     assert row is not None and row[0] == 10
+
+
+def test_recent_turn_count_is_required_and_positive(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    markdown = MarkdownMemoryStore(tmp_path / "memory")
+
+    with pytest.raises(TypeError):
+        ConsolidationService(database, markdown, _Extractor())
+    with pytest.raises(ValueError, match="recent_turn_count"):
+        ConsolidationService(database, markdown, _Extractor(), recent_turn_count=0)
+
+
+def test_recent_turns_are_limited_by_keep_count_and_empty_when_keep_is_zero(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    for index in range(1, 3):
+        _committed_turn(repository, index=index, user=f"问题-{index}", assistant=f"回答-{index}")
+
+    limited = ConsolidationService(
+        database,
+        MarkdownMemoryStore(tmp_path / "memory"),
+        _Extractor(),
+        keep_count=2,
+        min_new_messages=1,
+        recent_turn_count=10,
+    )
+    empty = ConsolidationService(
+        database,
+        MarkdownMemoryStore(tmp_path / "empty"),
+        _Extractor(),
+        keep_count=0,
+        min_new_messages=1,
+        recent_turn_count=1,
+    )
+
+    assert "问题-2" in limited._recent_turns("feishu:chat-1")
+    assert "问题-1" not in limited._recent_turns("feishu:chat-1")
+    assert empty._recent_turns("feishu:chat-1") == ""
+
+
+@pytest.mark.asyncio
+async def test_consolidation_excludes_persisted_tool_chain_results(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    message = InboundMessage(
+        "feishu",
+        "user",
+        "chat-1",
+        "问题",
+        timestamp=NOW,
+        metadata={"message_id": "tool-chain-consolidation"},
+    )
+    repository.record_inbound_activity(message)
+    repository.commit_turn(
+        message,
+        assistant_content="回答",
+        assistant_tool_chain=(
+            {
+                "calls": [
+                    {
+                        "call_id": "call-1",
+                        "name": "tool",
+                        "arguments": {},
+                        "result": "SECRET_TOOL_RESULT",
+                    }
+                ]
+            },
+        ),
+    )
+
+    class CapturingExtractor:
+        conversation = ""
+
+        async def extract(self, conversation: str) -> dict[str, object]:
+            self.conversation = conversation
+            return {}
+
+    extractor = CapturingExtractor()
+    service = ConsolidationService(
+        database,
+        MarkdownMemoryStore(tmp_path / "memory"),
+        extractor,
+        keep_count=0,
+        min_new_messages=1,
+        recent_turn_count=1,
+    )
+
+    assert await service.run("feishu:chat-1") is not None
+    assert "问题" in extractor.conversation and "回答" in extractor.conversation
+    assert "SECRET_TOOL_RESULT" not in extractor.conversation

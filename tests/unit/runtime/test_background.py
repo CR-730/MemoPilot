@@ -12,15 +12,15 @@ from memopilot.extensions.events import EventBus
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.background import CoreRunner
 from memopilot.runtime.common_tools.message_push import MessagePushTool
-from memopilot.runtime.contracts import ChatMessage, FunctionCall
-from memopilot.runtime.engine import TurnResult
+from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse
+from memopilot.runtime.engine import AgentRuntime, TurnResult
 from memopilot.runtime.outbound import (
     DeliveryError,
     OutboundDispatch,
     PushToolOutboundPort,
 )
 from memopilot.runtime.react import ReActResult, ToolCallRecord
-from memopilot.runtime.tools import ToolObservation
+from memopilot.runtime.tools import Tool, ToolObservation, ToolRegistry
 from memopilot.tasks.lease import SessionLease
 from memopilot.tasks.operational import OperationalRepository
 from memopilot.tasks.redis_queue import QueueMessage
@@ -198,12 +198,139 @@ async def test_runner_persists_react_tool_chain_for_next_history(tmp_path: Path)
 
     with pytest.raises(RuntimeError):
         await runner.execute(message, payload=payload, lease=LEASE, now=NOW)
+    await runner.execute(message, payload=payload, lease=LEASE, now=NOW)
 
     saved = repository.list_recent_messages(inbound.session_key, limit=2)[1]
+    assert runtime.calls == 1
     assert saved.tool_chain[0]["calls"] == [
         {"call_id": "call-1", "name": "list_dir", "arguments": {"path": "."}, "result": "目录"}
     ]
     await event_bus.aclose()
+
+
+@pytest.mark.asyncio
+async def test_second_passive_turn_restores_complete_tool_history_for_provider(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    provider = _HistoryProvider(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=(
+                    FunctionCall("call-1", "ok", {"text": "one"}),
+                    FunctionCall("call-2", "fail", {"text": "two"}),
+                ),
+            ),
+            ModelResponse(
+                content=None,
+                tool_calls=(FunctionCall("call-3", "ok", {"text": "three"}),),
+            ),
+            ModelResponse(content="first final", tool_calls=()),
+            ModelResponse(content="second final", tool_calls=()),
+        ]
+    )
+
+    async def ok(*, text: str) -> str:
+        return f"ok:{text}"
+
+    async def fail(*, text: str) -> str:
+        raise RuntimeError(f"failed:{text}")
+
+    runtime = AgentRuntime(
+        provider,
+        ToolRegistry(
+            [
+                Tool("ok", "ok", {"type": "object"}, ok),
+                Tool("fail", "fail", {"type": "object"}, fail),
+            ]
+        ),
+    )
+    event_bus = EventBus()
+    runner = CoreRunner(
+        runtime,
+        repository=repository,
+        outbound=_AlwaysOutbound(),
+        memory_tasks=_Unused(),  # type: ignore[arg-type]
+        proactive=_Unused(),  # type: ignore[arg-type]
+        drift=_Unused(),  # type: ignore[arg-type]
+        event_bus=event_bus,
+    )
+    for index, content in enumerate(("first user", "second user"), start=1):
+        inbound = InboundMessage(
+            "feishu",
+            "user",
+            "chat-1",
+            content,
+            timestamp=NOW,
+            metadata={"message_id": f"history-{index}"},
+        )
+        repository.record_inbound_activity(inbound)
+        if index == 1:
+            repository.allocate_fence(inbound.session_key, owner_id="agent-1", now=NOW)
+        payload = {
+            "channel": "feishu",
+            "sender": "user",
+            "chat_id": "chat-1",
+            "content": content,
+            "timestamp": NOW.isoformat(),
+            "media": [],
+            "metadata": {"message_id": f"history-{index}"},
+        }
+        await runner.execute(
+            QueueMessage(
+                "p0",
+                f"{index}-0",
+                f"task-{index}",
+                "passive.turn",
+                0,
+                inbound.session_key,
+                json.dumps(payload),
+            ),
+            payload=payload,
+            lease=LEASE,
+            now=NOW,
+        )
+
+    request = provider.requests[-1]
+    history = [message for message in request if message.role != "system"]
+    assert [message.role for message in history] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+    ]
+    assert [call.name for call in history[1].tool_calls] == ["ok", "fail"]
+    assert [message.tool_call_id for message in history[2:4]] == ["call-1", "call-2"]
+    assert history[4].tool_calls[0].name == "ok"
+    assert history[5].tool_call_id == "call-3"
+    assert "failed:two" in (history[3].content or "")
+    assert history[6].content == "first final"
+    assert (history[7].content or "").endswith("second user")
+    await event_bus.aclose()
+
+
+class _HistoryProvider:
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        self.responses = responses
+        self.requests: list[tuple[ChatMessage, ...]] = []
+
+    async def complete(self, *, messages: tuple[ChatMessage, ...], tools: object) -> ModelResponse:
+        del tools
+        self.requests.append(tuple(messages))
+        return self.responses.pop(0)
+
+
+class _AlwaysOutbound:
+    async def dispatch(self, outbound: OutboundDispatch) -> bool:
+        del outbound
+        return True
 
 
 @pytest.mark.asyncio
