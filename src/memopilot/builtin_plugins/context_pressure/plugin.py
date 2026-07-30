@@ -16,10 +16,7 @@ class ContextPressureStopModule:
         ctx = slots.get("step:ctx")
         if not isinstance(ctx, AfterStepCtx) or not ctx.has_more:
             return frame
-        if (
-            ctx.context_tokens_estimate
-            <= ctx.context_window_tokens * 80 // 100
-        ):
+        if ctx.context_tokens_estimate <= ctx.context_window_tokens * 80 // 100:
             return frame
         ctx.early_stop = True
         ctx.early_stop_reason = "context_pressure"

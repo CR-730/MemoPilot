@@ -613,3 +613,54 @@ class InvalidFramePlugin(Plugin):
         await manager.phase_modules[0].run(
             PhaseContext(slots={"turn.input": TurnInput("feishu:1", "问题")})
         )
+
+
+@pytest.mark.asyncio
+async def test_prototype_phase_adapter_allows_conditional_frame_exports(tmp_path: Path) -> None:
+    _write_class_plugin(
+        tmp_path,
+        "conditional_frame",
+        '''
+from memopilot.extensions.plugin_base import Plugin
+
+class ConditionalExport:
+    produces = ("step:early_stop_reason",)
+
+    async def run(self, frame):
+        return frame
+
+class ConditionalFramePlugin(Plugin):
+    def after_step_modules(self):
+        return [ConditionalExport()]
+''',
+    )
+    manager = PluginManager([tmp_path], tool_registry=ToolRegistry())
+    await manager.load_all()
+
+    assert await manager.phase_modules[0].run(PhaseContext()) == {}
+
+
+@pytest.mark.asyncio
+async def test_prototype_phase_adapter_keeps_mapping_exports_strict(tmp_path: Path) -> None:
+    _write_class_plugin(
+        tmp_path,
+        "strict_mapping",
+        '''
+from memopilot.extensions.plugin_base import Plugin
+
+class MissingMappingExport:
+    produces = ("plugin:required",)
+
+    async def run(self, frame):
+        return {}
+
+class StrictMappingPlugin(Plugin):
+    def before_turn_modules(self):
+        return [MissingMappingExport()]
+''',
+    )
+    manager = PluginManager([tmp_path], tool_registry=ToolRegistry())
+    await manager.load_all()
+
+    with pytest.raises(RuntimeError, match="plugin:required"):
+        await manager.phase_modules[0].run(PhaseContext())

@@ -5,11 +5,13 @@ from typing import Any
 
 import pytest
 
+from memopilot.runtime.contracts import ChatMessage
 from memopilot.runtime.phases import (
     LifecyclePhase,
     PhaseContext,
     PhaseDefinitionError,
     PhasePipeline,
+    estimate_messages_tokens,
 )
 
 
@@ -164,3 +166,21 @@ async def test_pipeline_rejects_module_that_does_not_return_declared_output() ->
 
     with pytest.raises(RuntimeError, match="prompt.messages"):
         await pipeline.run(PhaseContext())
+
+
+def test_estimate_messages_tokens_uses_prototype_json_budget() -> None:
+    messages = (
+        ChatMessage.system("rule"),
+        ChatMessage.user("hi"),
+    )
+
+    assert estimate_messages_tokens(messages) == 24
+
+
+def test_estimate_messages_tokens_includes_provider_fields_used_by_react() -> None:
+    message = ChatMessage.assistant(
+        content="answer",
+        provider_fields={"reasoning_content": "trace"},
+    )
+
+    assert estimate_messages_tokens((message,)) == 24
