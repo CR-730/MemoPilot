@@ -191,7 +191,7 @@ class OperationalRepository:
         *,
         assistant_content: str | None = None,
         assistant_media: tuple[str, ...] = (),
-        tool_chain: tuple[dict[str, object], ...] = (),
+        assistant_tool_chain: tuple[dict[str, object], ...] = (),
         cited_memory_ids: tuple[str, ...] = (),
         explicitly_memorized_ids: tuple[str, ...] = (),
         lease: FenceToken | None = None,
@@ -253,13 +253,15 @@ class OperationalRepository:
                     and persisted_media != assistant_media
                 ):
                     raise ValueError("同一 Turn 不能以不同媒体重复提交")
+                if assistant_tool_chain and persisted_tool_chain != assistant_tool_chain:
+                    raise ValueError("同一 Turn 不能以不同工具链重复提交")
             elif assistant_content is None:
                 connection.execute("COMMIT")
                 return None
             else:
                 persisted_assistant = assistant_content
                 persisted_media = assistant_media
-                persisted_tool_chain = tool_chain
+                persisted_tool_chain = assistant_tool_chain
                 position = int(
                     connection.execute(
                         "SELECT COALESCE(MAX(session_position), 0) + 1 "
@@ -297,7 +299,7 @@ class OperationalRepository:
                             now_text,
                             position + 1,
                             json.dumps(assistant_media, ensure_ascii=False),
-                            json.dumps(tool_chain, ensure_ascii=False),
+                            json.dumps(assistant_tool_chain, ensure_ascii=False),
                         ),
                     ),
                 )

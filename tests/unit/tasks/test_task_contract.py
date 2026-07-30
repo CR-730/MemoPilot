@@ -119,13 +119,19 @@ def test_commit_turn_persists_tool_chain_and_replay_keeps_it(tmp_path: Path) -> 
     assert repository.commit_turn(
         message,
         assistant_content="回复",
-        tool_chain=tool_chain,
+        assistant_tool_chain=tool_chain,
     ) is not None
     assert repository.commit_turn(message) is not None
     records = repository.list_recent_messages(message.session_key, limit=2)
 
     assert records[0].tool_chain == ()
     assert records[1].tool_chain == tool_chain
+    with pytest.raises(ValueError, match="不同工具链"):
+        repository.commit_turn(
+            message,
+            assistant_content="回复",
+            assistant_tool_chain=({"calls": []},),
+        )
 
 
 def test_commit_turn_fails_explicitly_for_corrupt_tool_chain_json(tmp_path: Path) -> None:

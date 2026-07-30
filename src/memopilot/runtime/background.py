@@ -12,6 +12,7 @@ from uuid import NAMESPACE_URL, uuid5
 from memopilot.bus.events import InboundMessage, TurnCommitted
 from memopilot.extensions.events import EventBus
 from memopilot.runtime.contracts import ChatMessage
+from memopilot.runtime.history import build_tool_chain, expand_history
 from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.outbound import DeliveryError, OutboundDispatch, OutboundPort
 from memopilot.runtime.react import ReActProgressObserver
@@ -160,15 +161,10 @@ class CoreRunner:
         cache_prompt_tokens = 0
         cache_hit_tokens = 0
         if committed is None:
-            history = tuple(
-                ChatMessage.user(record.content)
-                if record.role == "user"
-                else ChatMessage.assistant(content=record.content)
-                for record in self.repository.list_recent_messages(
-                    message.session_key,
-                    limit=self.short_term_message_limit,
+            history = expand_history(
+                self.repository.list_recent_messages(
+                    message.session_key, limit=self.short_term_message_limit
                 )
-                if record.role in {"user", "assistant"}
             )
             progress = self.progress_factory(message) if self.progress_factory else None
             try:
@@ -190,6 +186,10 @@ class CoreRunner:
                 message,
                 assistant_content=result.reply,
                 assistant_media=result.media,
+                assistant_tool_chain=build_tool_chain(
+                    result.react.messages,
+                    call_ids=frozenset(item.call.id for item in result.react.tool_chain),
+                ),
                 cited_memory_ids=result.cited_memory_ids,
                 explicitly_memorized_ids=_explicitly_memorized_ids(result.trace),
                 lease=lease,

@@ -12,13 +12,15 @@ from memopilot.extensions.events import EventBus
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.background import CoreRunner
 from memopilot.runtime.common_tools.message_push import MessagePushTool
+from memopilot.runtime.contracts import ChatMessage, FunctionCall
 from memopilot.runtime.engine import TurnResult
 from memopilot.runtime.outbound import (
     DeliveryError,
     OutboundDispatch,
     PushToolOutboundPort,
 )
-from memopilot.runtime.react import ReActResult
+from memopilot.runtime.react import ReActResult, ToolCallRecord
+from memopilot.runtime.tools import ToolObservation
 from memopilot.tasks.lease import SessionLease
 from memopilot.tasks.operational import OperationalRepository
 from memopilot.tasks.redis_queue import QueueMessage
@@ -132,6 +134,62 @@ async def test_committed_turn_retry_reuses_reply_model_and_event_once(tmp_path: 
     assert [call.content for call in outbound.calls] == ["旧回复", "旧回复"]
     assert len(events) == 1
     assert order == ["event", "send", "send"]
+    await event_bus.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runner_persists_react_tool_chain_for_next_history(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    inbound = InboundMessage(
+        "feishu", "user", "chat-1", "列出目录", timestamp=NOW,
+        metadata={"message_id": "message-tools"},
+    )
+    repository.record_inbound_activity(inbound)
+    repository.allocate_fence(inbound.session_key, owner_id="agent-1", now=NOW)
+    call = FunctionCall("call-1", "list_dir", {"path": "."})
+
+    class Runtime(_Runtime):
+        async def run(self, turn: object, **kwargs: object) -> TurnResult:
+            del turn, kwargs
+            self.calls += 1
+            react = ReActResult(
+                "已查看",
+                (
+                    ChatMessage.assistant(content="我来查看", tool_calls=(call,)),
+                    ChatMessage.tool(call_id="call-1", name="list_dir", content="目录"),
+                    ChatMessage.assistant(content="已查看"),
+                ),
+                1,
+                (ToolCallRecord(1, call, ToolObservation("call-1", "list_dir", True, "目录")),),
+                "completed",
+            )
+            return TurnResult("已查看", (), react, (), ())
+
+    runtime = Runtime()
+    outbound = _Outbound([])
+    event_bus = EventBus()
+    runner = CoreRunner(
+        runtime,  # type: ignore[arg-type]
+        repository=repository,
+        outbound=outbound,
+        memory_tasks=_Unused(),  # type: ignore[arg-type]
+        proactive=_Unused(),  # type: ignore[arg-type]
+        drift=_Unused(),  # type: ignore[arg-type]
+        event_bus=event_bus,
+    )
+    payload = {
+        "channel": "feishu", "sender": "user", "chat_id": "chat-1", "content": "列出目录",
+        "timestamp": NOW.isoformat(), "media": [], "metadata": {"message_id": "message-tools"},
+    }
+    message = QueueMessage("p0", "1-0", "task-tools", "passive.turn", 0, inbound.session_key, json.dumps(payload))
+
+    with pytest.raises(RuntimeError):
+        await runner.execute(message, payload=payload, lease=LEASE, now=NOW)
+
+    saved = repository.list_recent_messages(inbound.session_key, limit=2)[1]
+    assert saved.tool_chain[0]["calls"] == [{"call_id": "call-1", "name": "list_dir", "arguments": {"path": "."}, "result": "目录"}]
     await event_bus.aclose()
 
 
