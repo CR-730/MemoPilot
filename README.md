@@ -85,8 +85,9 @@ Streams / Lease / Priority)]
 | 异步单元 | 职责 |
 | --- | --- |
 | `Channel` 协程 | 维护飞书长连接，把私聊消息作为 P0 任务原子发布到 Redis |
-| `AgentLoop` 协程 | 统一消费被动、主动、定时、Drift 和记忆任务，共用 Lease、Fencing 与 Pending 接管 |
-| `Scheduler` 协程 | 生成主动 Tick、扫描定时任务并向 Redis 发布轻量后台任务 |
+| `AgentLoop` 协程 | 统一消费任务，共用 Lease、Fencing、Pending 接管与 ACK；仅调用 TaskDispatcher |
+| `TaskDispatcher` | 仅按 kind 分流到 PassiveTurnPipeline、MemoryService、ProactiveLoop 或 SchedulerService |
+| `ApplicationScheduler` 协程 | 生成主动 Tick、扫描定时任务并向 Redis 发布轻量任务 |
 
 用户消息以 P0 进入统一队列，并在同一次 Redis Lua 调用中登记稳定任务 ID 与后台停止信号。定时任务、主动检查和记忆维护使用 P1～P3；所有路径共享会话 Lease。
 
