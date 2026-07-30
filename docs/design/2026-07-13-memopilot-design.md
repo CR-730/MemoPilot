@@ -489,4 +489,3 @@ Wake 回放使用固定时钟、历史对话、alert/content/context 事件及�
 10. 外部 stdio MCP 注册、调用和错误 observation。
 11. 独立 `rm` 被改写到恢复目录，危险或交互式 Shell 被拒绝。
 12. FastAPI `/docs` 可以查询 Recall、Wake 和 Schedule 的 Inspector 数据。
-
