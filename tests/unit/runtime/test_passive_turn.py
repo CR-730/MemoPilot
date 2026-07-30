@@ -85,3 +85,24 @@ async def test_replay_reuses_committed_reply_and_stable_send_id(tmp_path) -> Non
         outbound.sent[0].metadata["provider_uuid"],
         outbound.sent[0].metadata["provider_uuid"],
     ]
+
+
+@pytest.mark.asyncio
+async def test_missing_inbound_fields_fail_before_runtime(tmp_path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    runtime = _Runtime()
+    pipeline = PassiveTurnPipeline(
+        runtime,
+        repository=OperationalRepository(database),
+        outbound=_Outbound(),
+        event_bus=EventBus(),
+        history_limit=12,
+    )
+    with pytest.raises(ValueError, match="缺少 channel"):
+        await pipeline.execute_task(
+            AgentTask("t", "passive.turn", 0, "cli:chat", {"timestamp": NOW.isoformat()}, NOW),
+            lease=LEASE,
+            now=NOW,
+        )
+    assert runtime.calls == 0

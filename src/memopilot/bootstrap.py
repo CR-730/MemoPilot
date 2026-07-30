@@ -119,6 +119,7 @@ class RuntimeBundle:
     tools: ToolRegistry
     memory_engine: LayeredMemoryEngine
     memory_tasks: MemoryService
+    scheduler_service: SchedulerService
     runtime: AgentRuntime
     task_dispatcher: TaskDispatcher | None
     skills: SkillCatalog
@@ -508,6 +509,7 @@ async def build_runtime_bundle(
             tools=registry,
             memory_engine=memory_engine,
             memory_tasks=memory_tasks,
+            scheduler_service=schedule_service,
             runtime=runtime,
             task_dispatcher=task_dispatcher,
             skills=active_skills,
@@ -660,17 +662,11 @@ async def build_app_runtime(settings: MemoPilotSettings) -> AppRuntime:
         enabled=settings.memory_optimizer_enabled,
         interval=timedelta(seconds=settings.memory_optimizer_interval_seconds),
     )
-    schedule_service = SchedulerService(
-        ScheduleRepository(
-            settings.operational_database,
-            busy_timeout_seconds=settings.sqlite_busy_timeout_seconds,
-        )
-    )
     scheduler = ApplicationScheduler(
         _TaskProducer(
             repository,
             memory_scheduler=memory_scheduler,
-            schedule_service=schedule_service,
+            schedule_service=runtime.scheduler_service,
             proactive_tick_seconds=settings.proactive_tick_seconds,
             proactive_enabled=settings.proactive_enabled,
         ),

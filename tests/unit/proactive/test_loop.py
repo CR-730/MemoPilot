@@ -44,10 +44,21 @@ class _Outbound:
         return self.sent
 
 
-def _loop(proactive: _ProactiveService, outbound: _Outbound) -> ProactiveLoop:
+class _Drift:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def execute_task(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls.append(kwargs)
+
+
+def _loop(
+    proactive: _ProactiveService, outbound: _Outbound, drift: _Drift | None = None
+) -> ProactiveLoop:
     return ProactiveLoop(
         service_factory=lambda session, activity, lease: proactive,
         outbound=outbound,
+        drift=drift or _Drift(),
     )
 
 

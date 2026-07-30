@@ -140,11 +140,16 @@ def _inbound_message(payload: Mapping[str, object]) -> InboundMessage:
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
     metadata, media = payload.get("metadata"), payload.get("media")
+    channel, sender, chat_id, content = (
+        str(payload.get(key) or "").strip() for key in ("channel", "sender", "chat_id", "content")
+    )
+    if not all((channel, sender, chat_id, content)):
+        raise ValueError("passive.turn 缺少 channel、sender、chat_id 或 content")
     return InboundMessage(
-        str(payload.get("channel") or ""),
-        str(payload.get("sender") or ""),
-        str(payload.get("chat_id") or ""),
-        str(payload.get("content") or ""),
+        channel,
+        sender,
+        chat_id,
+        content,
         timestamp=timestamp,
         media=[str(item) for item in media] if isinstance(media, list) else [],
         metadata={str(key): value for key, value in metadata.items()}

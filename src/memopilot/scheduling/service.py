@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
@@ -122,41 +123,49 @@ class SchedulerService:
         if not isinstance(task_payload, Mapping):
             raise ValueError("schedule.run payload.payload 必须是对象")
         mode = _required_text(payload, "execution_mode")
-        if mode == "instant":
-            text = _required_text(task_payload, "message")
-        elif mode == "agent":
-            from memopilot.runtime.engine import TurnInput
+        try:
+            if mode == "instant":
+                text = _required_text(task_payload, "message")
+            elif mode == "agent":
+                from memopilot.runtime.engine import TurnInput
 
-            result = await self._runtime.run(
-                TurnInput(
-                    session_key=task.session_key,
-                    content=_required_text(task_payload, "prompt"),
-                    prompt_scope="scheduled",
-                    received_at=now,
-                    allowed_tool_risks=frozenset({"read-only", "write"}),
-                    memory_source_ref=f"task:{task.task_id}",
+                result = await self._runtime.run(
+                    TurnInput(
+                        task.session_key,
+                        _required_text(task_payload, "prompt"),
+                        prompt_scope="scheduled",
+                        received_at=now,
+                        allowed_tool_risks=frozenset({"read-only", "write"}),
+                        memory_source_ref=f"task:{task.task_id}",
+                    )
                 )
-            )
-            if result.react.infrastructure_error:
-                self._operational.transition_background_schedule(
-                    execution_id, lease=lease, outcome="failed", now=now
+                if result.react.infrastructure_error:
+                    self._operational.transition_background_schedule(
+                        execution_id, lease=lease, outcome="failed", now=now
+                    )
+                    return ()
+                text = result.reply
+            else:
+                raise ValueError(f"未知 schedule execution_mode: {mode}")
+            if not await self._outbound.dispatch(
+                OutboundDispatch(
+                    _required_text(payload, "channel"),
+                    _required_text(payload, "chat_id"),
+                    text,
                 )
-                return ()
-            text = result.reply
-        else:
-            raise ValueError(f"未知 schedule execution_mode: {mode}")
-        if not await self._outbound.dispatch(
-            OutboundDispatch(
-                channel=_required_text(payload, "channel"),
-                chat_id=_required_text(payload, "chat_id"),
-                content=text,
+            ):
+                raise DeliveryError("定时任务结果未明确发送成功")
+            self._operational.transition_background_schedule(
+                execution_id, lease=lease, outcome="succeeded", now=now
             )
-        ):
-            raise DeliveryError("定时任务结果未明确发送成功")
-        self._operational.transition_background_schedule(
-            execution_id, lease=lease, outcome="succeeded", now=now
-        )
-        return ()
+            return ()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, DeliveryError):
+            raise
+        except BaseException:
+            self._operational.transition_background_schedule(
+                execution_id, lease=lease, outcome="failed", now=now
+            )
+            raise
 
 
 def _required_text(payload: Mapping[str, object], key: str) -> str:

@@ -50,7 +50,7 @@ class ProactiveLoop:
         *,
         service_factory: ProactiveServiceFactory,
         outbound: OutboundPort,
-        drift: DriftTaskRunner | None = None,
+        drift: DriftTaskRunner,
     ) -> None:
         self._service_factory = service_factory
         self._outbound = outbound
@@ -102,8 +102,6 @@ class ProactiveLoop:
 
     async def _execute_drift(
         self, task: AgentTask, *, lease: SessionLease, now: datetime) -> None:
-        if self._drift is None:
-            raise RuntimeError("未配置 Drift 运行时")
         await self._drift.execute_task(
             task_id=task.task_id,
             session_key=task.session_key,
