@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from memopilot.runtime.contracts import FunctionCall
-from memopilot.runtime.tools import Tool, ToolRegistry
+from memopilot.runtime.tools import Tool, ToolExecutor, ToolRegistry
 
 
 async def _echo(*, text: str) -> dict[str, str]:
@@ -178,3 +178,12 @@ async def test_successful_tool_result_is_serializable_observation() -> None:
     assert '"ok": true' in observation.content
     assert not hasattr(observation, "side_effect_status")
     assert not hasattr(_tool(), "side_effect_class")
+
+
+async def test_executor_owns_tool_invocation() -> None:
+    observation = await ToolExecutor(ToolRegistry([_tool()])).execute(
+        FunctionCall(id="1", name="echo", arguments={"text": "hello"})
+    )
+
+    assert observation.ok is True
+    assert observation.result == {"echo": "hello"}

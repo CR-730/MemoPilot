@@ -14,6 +14,7 @@ import pytest
 from memopilot.bus.events import InboundMessage
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.plugin_manager import PluginManager
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import (
     DatabaseKind,
     connect_database,
@@ -34,14 +35,12 @@ from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.session import OperationalSessionManager
 from memopilot.runtime.task_dispatcher import TaskDispatcher
 from memopilot.runtime.tools import Tool, ToolRegistry
-from memopilot.scheduling.scheduler import ApplicationScheduler
-from memopilot.tasks.lease import SessionLease
-from memopilot.tasks.operational import OperationalRepository
+from memopilot.scheduling.scheduler import ScheduledTurnPipeline
 from memopilot.tasks.redis_queue import QueueMessage
 
 _BUILTIN_ROOT = Path(__file__).parents[2] / "src" / "memopilot" / "builtin_plugins"
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
-_LEASE = SessionLease("cli:chat", "agent-1", 1, "lease", "value")
+_LEASE = object()
 
 
 class _Provider(ChatProvider):
@@ -79,6 +78,16 @@ class _Queue:
         message, self.message = self.message, None
         return message
 
+    async def read_pending(self, *, consumer_id: str) -> QueueMessage | None:
+        del consumer_id
+        return None
+
+    async def read_priority(
+        self, priority: int, *, consumer_id: str, entry_id: str = ">"
+    ) -> QueueMessage | None:
+        del priority, consumer_id, entry_id
+        return None
+
     async def acknowledge(self, message: object) -> None:
         del message
         self.acked = True
@@ -87,52 +96,12 @@ class _Queue:
         self.published.append(task)
         return "2-0"
 
-    async def pending_entries(self, **kwargs: object) -> list[object]:
-        del kwargs
-        return []
-
-
-class _Leases:
-    ttl_ms = 30_000
-
-    async def acquire(
-        self,
-        session_key: str,
-        *,
-        owner_id: str,
-        now: datetime,
-    ) -> SessionLease:
-        del session_key, owner_id, now
-        return _LEASE
-
-    async def renew(self, lease: object, *, now: datetime) -> bool:
-        del lease, now
-        return True
-
-    async def release(self, lease: object) -> bool:
-        del lease
-        return True
-
-    async def is_absent(self, session_key: str) -> bool:
-        del session_key
-        return True
-
-
-class _Coordinator:
-    async def clear_background_stop(self, session_key: str) -> None:
-        del session_key
-
-    async def stop_reason(self, session_key: str) -> None:
-        del session_key
-        return None
-
-
 async def _load(
     plugin_dirs: list[Path],
     *,
     workspace: Path,
     tools: ToolRegistry | None = None,
-    repository: OperationalRepository | None = None,
+    repository: ConversationRepository | None = None,
     bus: EventBus | None = None,
 ) -> PluginManager:
     manager = PluginManager(
@@ -147,7 +116,7 @@ async def _load(
 
 
 def _commit_turn(
-    repository: OperationalRepository,
+    repository: ConversationRepository,
     index: int,
     user: str,
     assistant: str,
@@ -196,7 +165,7 @@ async def test_undo_removes_latest_complete_turn_and_rolls_cursor(
 ) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     _commit_turn(repository, 1, "第一问", "第一答")
     _commit_turn(repository, 2, "第二问", "第二答")
     with connect_database(database) as connection:
@@ -256,7 +225,7 @@ async def test_meme_runs_through_agent_loop_and_sends_clean_text_and_image(
     )
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     inbound = InboundMessage(
         "cli",
         "user",
@@ -266,7 +235,6 @@ async def test_meme_runs_through_agent_loop_and_sends_clean_text_and_image(
         metadata={"message_id": "meme-message"},
     )
     repository.record_inbound_activity(inbound)
-    assert repository.allocate_fence("cli:chat", owner_id="agent-1", now=_NOW) == 1
 
     async def echo(*, text: str) -> str:
         return text
@@ -370,14 +338,7 @@ async def test_meme_runs_through_agent_loop_and_sends_clean_text_and_image(
         del delay
         loop_holder["loop"].stop()
 
-    loop = AgentLoop(
-        queue,
-        _Leases(),
-        dispatcher,
-        owner_id="agent-1",
-        session_coordinator=_Coordinator(),
-        sleep=stop_after_idle,
-    )
+    loop = AgentLoop(queue, dispatcher, sleep=stop_after_idle)  # type: ignore[arg-type]
     loop_holder["loop"] = loop
     caplog.set_level(logging.INFO)
 
@@ -441,11 +402,11 @@ async def test_scheduler_logs_start_and_stop(caplog: Any) -> None:
             raise asyncio.CancelledError
 
     caplog.set_level(logging.INFO)
-    service = ApplicationScheduler(_Scheduler(), object())  # type: ignore[arg-type]
+    service = ScheduledTurnPipeline(_Scheduler(), object())  # type: ignore[arg-type]
 
     with pytest.raises(asyncio.CancelledError):
         await service.run_forever()
 
     log_text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "ApplicationScheduler started" in log_text
-    assert "ApplicationScheduler stopped" in log_text
+    assert "ScheduledTurnPipeline started" in log_text
+    assert "ScheduledTurnPipeline stopped" in log_text

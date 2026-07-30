@@ -3,15 +3,14 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from memopilot.bus.events import InboundMessage
 from memopilot.memory.consolidation import ConsolidationService
 from memopilot.memory.markdown import MarkdownMemoryStore
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
-from memopilot.tasks.operational import LostLeaseError, OperationalRepository
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
@@ -90,7 +89,7 @@ def test_daily_journal_rejects_path_escape_and_is_idempotent(tmp_path: Path) -> 
 
 
 def _committed_turn(
-    repository: OperationalRepository,
+    repository: ConversationRepository,
     *,
     index: int,
     user: str,
@@ -120,7 +119,7 @@ async def test_consolidation_window_keeps_recent_messages_and_requires_minimum(
 ) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     for index in range(1, 4):
         _committed_turn(
             repository,
@@ -159,7 +158,7 @@ async def test_consolidation_writes_independent_recent_context_and_daily_journal
 ) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     for index in range(1, 4):
         _committed_turn(
             repository,
@@ -192,7 +191,7 @@ async def test_consolidation_writes_independent_recent_context_and_daily_journal
 async def test_below_threshold_refreshes_recent_turns_without_model_call(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     for index in range(1, 3):
         _committed_turn(
             repository,
@@ -231,7 +230,7 @@ async def test_below_threshold_refreshes_recent_turns_without_model_call(tmp_pat
 async def test_history_entries_are_single_source_for_history_and_journal(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     _committed_turn(repository, index=1, user="问题-1", assistant="回答-1")
     markdown = MarkdownMemoryStore(tmp_path / "memory")
     service = ConsolidationService(
@@ -265,7 +264,7 @@ async def test_manifest_resumes_only_missing_artifact_and_publishes_vectorize_on
 ) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     for index in range(1, 3):
         _committed_turn(
             repository,
@@ -319,71 +318,10 @@ async def test_manifest_resumes_only_missing_artifact_and_publishes_vectorize_on
 
 
 @pytest.mark.asyncio
-async def test_consolidation_does_not_create_manifest_after_losing_lease(tmp_path: Path) -> None:
-    database = tmp_path / "operational.db"
-    migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
-    _committed_turn(repository, index=1, user="问题-1", assistant="回答-1")
-    _committed_turn(repository, index=2, user="问题-2", assistant="回答-2")
-    service = ConsolidationService(
-        database,
-        MarkdownMemoryStore(tmp_path / "memory"),
-        _Extractor(),
-        keep_count=0,
-        min_new_messages=1,
-        recent_turn_count=1,
-    )
-    checks = 0
-
-    def assert_current() -> None:
-        nonlocal checks
-        checks += 1
-        if checks >= 2:
-            raise LostLeaseError("模拟提取期间失权")
-
-    with pytest.raises(LostLeaseError, match="失权"):
-        await service.run("feishu:chat-1", assert_current=assert_current)
-
-    with connect_database(database) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM consolidation_manifests").fetchone()[0] == 0
-
-
-@pytest.mark.asyncio
-async def test_consolidation_rechecks_fence_inside_final_transaction(tmp_path: Path) -> None:
-    database = tmp_path / "operational.db"
-    migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
-    _committed_turn(repository, index=1, user="问题-1", assistant="回答-1")
-    _committed_turn(repository, index=2, user="问题-2", assistant="回答-2")
-    stale_epoch = repository.allocate_fence("feishu:chat-1", owner_id="stale", now=NOW)
-    stale_lease = SimpleNamespace(
-        session_key="feishu:chat-1",
-        owner_id="stale",
-        epoch=stale_epoch,
-    )
-    repository.allocate_fence("feishu:chat-1", owner_id="current", now=NOW)
-    service = ConsolidationService(
-        database,
-        MarkdownMemoryStore(tmp_path / "memory"),
-        _Extractor(),
-        keep_count=0,
-        min_new_messages=1,
-        recent_turn_count=1,
-    )
-
-    with pytest.raises(LostLeaseError, match="已失效"):
-        await service.run(
-            "feishu:chat-1",
-            assert_current=lambda: None,
-            lease=stale_lease,
-        )
-
-
-@pytest.mark.asyncio
 async def test_29_messages_only_refreshes_explicit_recent_turn_count(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     for index in range(1, 16):
         _committed_turn(repository, index=index, user=f"问题-{index}", assistant=f"回答-{index}")
     with connect_database(database) as connection:
@@ -404,7 +342,7 @@ async def test_29_messages_only_refreshes_explicit_recent_turn_count(tmp_path: P
 async def test_30_messages_consolidates_old_ten_and_keeps_hot_twenty(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     for index in range(1, 16):
         _committed_turn(repository, index=index, user=f"问题-{index}", assistant=f"回答-{index}")
     service = ConsolidationService(
@@ -439,7 +377,7 @@ def test_recent_turns_are_limited_by_keep_count_and_empty_when_keep_is_zero(
 ) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     for index in range(1, 3):
         _committed_turn(repository, index=index, user=f"问题-{index}", assistant=f"回答-{index}")
 
@@ -469,7 +407,7 @@ def test_recent_turns_are_limited_by_keep_count_and_empty_when_keep_is_zero(
 async def test_consolidation_excludes_persisted_tool_chain_results(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     message = InboundMessage(
         "feishu",
         "user",

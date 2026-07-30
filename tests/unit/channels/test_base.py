@@ -5,16 +5,16 @@ from pathlib import Path
 
 from memopilot.bus.events import InboundMessage
 from memopilot.channels.base import AttachmentStore, MessageDeduper, SessionIdentityIndex
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
-from memopilot.tasks.operational import OperationalRepository
 
 NOW = datetime(2026, 7, 14, 9, 0, tzinfo=UTC)
 
 
-def _repository(tmp_path: Path) -> OperationalRepository:
+def _repository(tmp_path: Path) -> ConversationRepository:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    return OperationalRepository(database)
+    return ConversationRepository(database)
 
 
 def test_attachment_store_writes_under_workspace_uploads(tmp_path: Path) -> None:

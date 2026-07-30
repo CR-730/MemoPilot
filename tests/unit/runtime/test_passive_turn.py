@@ -6,6 +6,7 @@ import pytest
 
 from memopilot.bus.events import InboundMessage
 from memopilot.extensions.events import EventBus
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.contracts import ChatMessage
 from memopilot.runtime.engine import TurnResult
@@ -13,11 +14,8 @@ from memopilot.runtime.outbound import DeliveryError, OutboundDispatch
 from memopilot.runtime.passive_turn import PassiveTurnPipeline
 from memopilot.runtime.react import ReActResult
 from memopilot.tasks.agent_task import AgentTask
-from memopilot.tasks.lease import SessionLease
-from memopilot.tasks.operational import OperationalRepository
 
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
-LEASE = SessionLease("cli:chat", "agent", 1, "key", "value")
 
 
 class _Runtime:
@@ -45,12 +43,11 @@ class _Outbound:
 async def test_replay_reuses_committed_reply_and_stable_send_id(tmp_path) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     message = InboundMessage(
         "cli", "user", "chat", "hi", timestamp=NOW, metadata={"message_id": "m1"}
     )
     repository.record_inbound_activity(message)
-    repository.allocate_fence(message.session_key, owner_id="agent", now=NOW)
     outbound = _Outbound()
     pipeline = PassiveTurnPipeline(
         _Runtime(),
@@ -76,9 +73,9 @@ async def test_replay_reuses_committed_reply_and_stable_send_id(tmp_path) -> Non
     )
 
     with pytest.raises(DeliveryError):
-        await pipeline.execute_task(task, lease=LEASE, now=NOW)
+        await pipeline.execute_task(task, now=NOW)
     outbound.ok = True
-    await pipeline.execute_task(task, lease=LEASE, now=NOW)
+    await pipeline.execute_task(task, now=NOW)
 
     assert pipeline._runtime.calls == 1
     assert [item.metadata["provider_uuid"] for item in outbound.sent] == [
@@ -94,7 +91,7 @@ async def test_missing_inbound_fields_fail_before_runtime(tmp_path) -> None:
     runtime = _Runtime()
     pipeline = PassiveTurnPipeline(
         runtime,
-        repository=OperationalRepository(database),
+        repository=ConversationRepository(database),
         outbound=_Outbound(),
         event_bus=EventBus(),
         history_limit=12,
@@ -102,7 +99,6 @@ async def test_missing_inbound_fields_fail_before_runtime(tmp_path) -> None:
     with pytest.raises(ValueError, match="缺少 channel"):
         await pipeline.execute_task(
             AgentTask("t", "passive.turn", 0, "cli:chat", {"timestamp": NOW.isoformat()}, NOW),
-            lease=LEASE,
             now=NOW,
         )
     assert runtime.calls == 0

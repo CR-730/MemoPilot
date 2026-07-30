@@ -7,6 +7,7 @@ from pathlib import Path
 from memopilot.bus.events import InboundMessage, TurnCommitted
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.plugin_manager import PluginManager
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import (
     DatabaseKind,
     connect_database,
@@ -21,7 +22,6 @@ from memopilot.runtime.contracts import (
 from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tools import Tool, ToolRegistry
-from memopilot.tasks.operational import OperationalRepository
 
 _BUILTIN_ROOT = Path(__file__).parents[3] / "src" / "memopilot" / "builtin_plugins"
 _STATUS_DIR = _BUILTIN_ROOT / "status_commands"
@@ -47,7 +47,7 @@ class _Provider(ChatProvider):
 
 async def _load_status(
     tmp_path: Path,
-    repository: OperationalRepository,
+    repository: ConversationRepository,
 ) -> PluginManager:
     manager = PluginManager(
         [_STATUS_DIR],
@@ -61,7 +61,7 @@ async def _load_status(
 
 
 def _commit_turn(
-    repository: OperationalRepository,
+    repository: ConversationRepository,
     index: int,
     user: str,
     assistant: str,
@@ -84,7 +84,7 @@ async def test_memory_status_short_circuits_provider_and_reads_repository(
 ) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     _commit_turn(repository, 1, "第一个问题", "第一个回答")
     _commit_turn(repository, 2, "第二个问题", "第二个回答")
     with connect_database(database) as connection:
@@ -176,7 +176,7 @@ async def test_real_cache_usage_is_aggregated_observed_and_displayed(
 
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     status = await _load_status(tmp_path, repository)
     blocked_provider = _Provider()
     result = await AgentRuntime(

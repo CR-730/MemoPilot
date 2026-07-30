@@ -13,7 +13,7 @@ from memopilot.runtime.contracts import (
 )
 from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.providers import ChatProvider
-from memopilot.runtime.tools import Tool, ToolRegistry
+from memopilot.runtime.tools import Tool, ToolExecutor, ToolRegistry
 
 
 class _Provider(ChatProvider):
@@ -118,9 +118,11 @@ async def test_plugin_decorators_fire_through_real_agent_runtime(tmp_path: Path)
     bus = EventBus()
     manager = PluginManager([tmp_path], event_bus=bus, tool_registry=tools)
     await manager.load_all()
-    tools.register_hooks(manager.tool_hooks)
+    executor = ToolExecutor(tools, manager.tool_hooks)
 
-    result = await AgentRuntime(_Provider(), tools, event_bus=bus).run(
+    result = await AgentRuntime(
+        _Provider(), tools, event_bus=bus, tool_executor=executor
+    ).run(
         TurnInput(session_key="feishu:chat-1", content="删除 a")
     )
 

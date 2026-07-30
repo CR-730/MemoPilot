@@ -3,25 +3,28 @@ from pathlib import Path
 
 import pytest
 
+from memopilot.persistence.conversation import (
+    ConversationRepository,
+    MultiplePrivateSessionsError,
+)
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
 from memopilot.scheduling.contracts import DueScanResult
-from memopilot.scheduling.repository import ScheduleRepository
-from memopilot.scheduling.scheduler import ApplicationScheduler, _TaskProducer
+from memopilot.scheduling.scheduler import ScheduledTurnPipeline
 from memopilot.scheduling.service import SchedulerService
 from memopilot.tasks.agent_task import AgentTask
-from memopilot.tasks.operational import MultiplePrivateSessionsError, OperationalRepository
+from memopilot.tasks.producer import TaskProducer
 
 NOW = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
 
 
-def _repository(tmp_path: Path) -> OperationalRepository:
+def _repository(tmp_path: Path) -> ConversationRepository:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    return OperationalRepository(database)
+    return ConversationRepository(database)
 
 
 def _add_session(
-    repository: OperationalRepository,
+    repository: ConversationRepository,
     *,
     session_key: str = "feishu:chat-1",
     chat_id: str = "chat-1",
@@ -39,22 +42,18 @@ def _add_session(
         )
 
 
-class _Memory:
-    def tick(self, *, now: datetime):
-        return AgentTask("memory-1", "memory.optimize", 3, "system:memory", {}, now)
-
-
 class _Schedules:
     def scan_due(self, *, now: datetime) -> DueScanResult:
         del now
         return DueScanResult()
 
 
-def _scheduler(repository: OperationalRepository) -> _TaskProducer:
-    return _TaskProducer(
+def _scheduler(repository: ConversationRepository) -> TaskProducer:
+    return TaskProducer(
         repository,
-        memory_scheduler=_Memory(),
         schedule_service=_Schedules(),
+        memory_optimizer_enabled=True,
+        memory_optimizer_interval=timedelta(hours=1),
         proactive_tick_seconds=1800,
     )
 
@@ -86,7 +85,7 @@ def test_multiple_private_sessions_are_rejected(tmp_path: Path) -> None:
     _add_session(repository)
     _add_session(repository, session_key="feishu:chat-2", chat_id="chat-2")
 
-    with pytest.raises(MultiplePrivateSessionsError, match="只支持一个飞书私聊"):
+    with pytest.raises(MultiplePrivateSessionsError):
         _scheduler(repository).tick(now=NOW)
 
 
@@ -103,10 +102,10 @@ async def test_scheduler_process_publishes_each_background_task_once(tmp_path: P
             return task.task_id
 
     queue = Queue()
-    process = ApplicationScheduler(_scheduler(repository), queue)
+    process = ScheduledTurnPipeline(_scheduler(repository), queue)
 
     assert await process.run_once(now=NOW) == 2
-    assert queue.ids[0] == "memory-1"
+    assert queue.ids[0].startswith("memory.optimize:")
     assert queue.ids[1].startswith("proactive.tick:")
 
 
@@ -125,20 +124,20 @@ async def test_scheduler_publishes_proactive_without_duplicate_busy_gate(
             return task.task_id
 
     queue = Queue()
-    process = ApplicationScheduler(_scheduler(repository), queue)
+    process = ScheduledTurnPipeline(_scheduler(repository), queue)
 
     assert await process.run_once(now=NOW) == 2
-    assert queue.ids[0] == "memory-1"
+    assert queue.ids[0].startswith("memory.optimize:")
     assert queue.ids[1].startswith("proactive.tick:")
 
 
 @pytest.mark.asyncio
 async def test_schedule_runtime_failure_marks_execution_failed_and_reraises(tmp_path: Path) -> None:
-    class Operational:
+    class Repository:
         def __init__(self) -> None:
             self.outcomes = []
 
-        def transition_background_schedule(self, execution_id, *, lease, outcome, now):  # type: ignore[no-untyped-def]
+        def transition_execution(self, execution_id, *, outcome, now):  # type: ignore[no-untyped-def]
             self.outcomes.append(outcome)
             return None
 
@@ -150,10 +149,9 @@ async def test_schedule_runtime_failure_marks_execution_failed_and_reraises(tmp_
         async def dispatch(self, value):  # type: ignore[no-untyped-def]
             return True
 
-    operational = Operational()
+    repository = Repository()
     service = SchedulerService(
-        ScheduleRepository(tmp_path / "schedule.db"),
-        operational=operational,
+        repository,  # type: ignore[arg-type]
         runtime=Runtime(),
         outbound=Outbound(),
     )  # type: ignore[arg-type]
@@ -172,8 +170,8 @@ async def test_schedule_runtime_failure_marks_execution_failed_and_reraises(tmp_
         NOW,
     )
     with pytest.raises(RuntimeError, match="provider failed"):
-        await service.execute_task(task, lease=object(), now=NOW)  # type: ignore[arg-type]
-    assert operational.outcomes == ["running", "failed"]
+        await service.execute_task(task, now=NOW)
+    assert repository.outcomes == ["running", "failed"]
 
 
 @pytest.mark.asyncio
@@ -181,21 +179,20 @@ async def test_schedule_runtime_failure_marks_execution_failed_and_reraises(tmp_
 async def test_schedule_invalid_running_payload_marks_failed_and_reraises(
     tmp_path: Path, payload: dict[str, object]
 ) -> None:
-    class Operational:
+    class Repository:
         def __init__(self) -> None:
             self.outcomes: list[str] = []
 
-        def transition_background_schedule(self, execution_id, *, lease, outcome, now):  # type: ignore[no-untyped-def]
+        def transition_execution(self, execution_id, *, outcome, now):  # type: ignore[no-untyped-def]
             self.outcomes.append(outcome)
 
     service = SchedulerService(
-        ScheduleRepository(tmp_path / "schedule.db"),
-        operational=Operational(),
+        Repository(),  # type: ignore[arg-type]
         runtime=object(),
         outbound=object(),
     )  # type: ignore[arg-type]
-    operational = service._operational
+    repository = service.repository
     task = AgentTask("t", "schedule.run", 1, "cli:chat", {"execution_id": "e", **payload}, NOW)
     with pytest.raises(ValueError):
-        await service.execute_task(task, lease=object(), now=NOW)  # type: ignore[arg-type]
-    assert operational.outcomes == ["running", "failed"]
+        await service.execute_task(task, now=NOW)
+    assert repository.outcomes == ["running", "failed"]

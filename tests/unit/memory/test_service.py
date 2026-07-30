@@ -7,10 +7,8 @@ import pytest
 
 from memopilot.memory.service import MemoryService
 from memopilot.tasks.agent_task import AgentTask
-from memopilot.tasks.lease import SessionLease
 
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
-LEASE = SessionLease("s", "o", 1, "k", "v")
 
 
 class _Repo:
@@ -21,7 +19,7 @@ class _Repo:
         self.fences.append(lease)
 
     def fenced_write(self, lease):  # type: ignore[no-untyped-def]
-        assert lease is LEASE
+        del lease
         return nullcontext()
 
 
@@ -44,12 +42,12 @@ class _Async:
         ("memory.post_response", {"turn_id": "t", "protected_ids": ["p"]}, "post"),
     ],
 )
-async def test_memory_service_routes_task_with_fence(kind, payload, target) -> None:  # type: ignore[no-untyped-def]
+async def test_memory_service_routes_task(kind, payload, target) -> None:  # type: ignore[no-untyped-def]
     repo, consolidation, vector, optimizer, post = _Repo(), _Async(), _Async(), _Async(), _Async()
     service = MemoryService(consolidation, vector, optimizer, repo, post_response=post)  # type: ignore[arg-type]
-    await service.execute_task(AgentTask("id", kind, 3, "s", payload, NOW), lease=LEASE, now=NOW)
+    await service.execute_task(AgentTask("id", kind, 3, "s", payload, NOW), now=NOW)
     assert {"vector": vector, "optimizer": optimizer, "post": post}[target].calls
-    assert repo.fences[0] is LEASE
+    assert repo.fences == []
 
 
 @pytest.mark.asyncio
@@ -66,11 +64,10 @@ async def test_consolidate_then_vectorize_and_reinforce_keep_contract() -> None:
     vector.store = store
     service = MemoryService(consolidation, vector, _Async(), repo)  # type: ignore[arg-type]
     await service.execute_task(
-        AgentTask("a", "memory.consolidate", 3, "s", {}, NOW), lease=LEASE, now=NOW
+        AgentTask("a", "memory.consolidate", 3, "s", {}, NOW), now=NOW
     )
     await service.execute_task(
         AgentTask("b", "memory.reinforce", 3, "s", {"usage_ref": "u", "item_ids": ["x"]}, NOW),
-        lease=LEASE,
         now=NOW,
     )
     assert vector.calls[0][0] == ("c1",)
@@ -82,5 +79,5 @@ async def test_unknown_memory_kind_is_rejected() -> None:
     service = MemoryService(_Async(), _Async(), _Async(), _Repo())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="不支持"):
         await service.execute_task(
-            AgentTask("x", "memory.nope", 3, "s", {}, NOW), lease=LEASE, now=NOW
+            AgentTask("x", "memory.nope", 3, "s", {}, NOW), now=NOW
         )

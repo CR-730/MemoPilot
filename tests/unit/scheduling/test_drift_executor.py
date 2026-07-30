@@ -1,10 +1,8 @@
 from datetime import UTC, datetime
-from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
-from memopilot.proactive.drift_executor import DriftRuntime
+from memopilot.proactive.drift_executor import DriftTurnPipeline
 from memopilot.runtime.contracts import FunctionCall
 from memopilot.runtime.engine import TurnResult
 from memopilot.runtime.react import ReActResult
@@ -28,18 +26,10 @@ class _Repository:
     def __init__(self) -> None:
         self.checks: list[int] = []
 
-    def assert_current_fence_and_activity(
-        self,
-        lease: Any,
-        *,
-        expected_activity_version: int,
-    ) -> None:
-        del lease
-        self.checks.append(expected_activity_version)
-
-    def fenced_write(self, lease: Any):
-        del lease
-        return SimpleNamespace(__enter__=lambda: None, __exit__=lambda *args: None)
+    def get_activity_version(self, session_key: str) -> int:
+        del session_key
+        self.checks.append(4)
+        return 4
 
 
 class _Runtime:
@@ -78,7 +68,7 @@ class _Selector:
 async def test_drift_executes_direct_task_without_job_or_run() -> None:
     repository = _Repository()
     runtime = _Runtime()
-    router = DriftRuntime(
+    router = DriftTurnPipeline(
         repository,  # type: ignore[arg-type]
         runtime,  # type: ignore[arg-type]
         drift_selector=_Selector(),
@@ -88,7 +78,6 @@ async def test_drift_executes_direct_task_without_job_or_run() -> None:
         task_id="drift-1",
         session_key="feishu:chat-1",
         payload={"chat_id": "chat-1", "activity_version": 4},
-        lease=SimpleNamespace(session_key="feishu:chat-1", owner_id="runner", epoch=1),
         now=NOW,
     )
 
@@ -99,7 +88,7 @@ async def test_drift_executes_direct_task_without_job_or_run() -> None:
 
 @pytest.mark.asyncio
 async def test_drift_without_finish_is_failed() -> None:
-    router = DriftRuntime(
+    router = DriftTurnPipeline(
         _Repository(),  # type: ignore[arg-type]
         _Runtime(finish=False),  # type: ignore[arg-type]
         drift_selector=_Selector(),
@@ -108,8 +97,7 @@ async def test_drift_without_finish_is_failed() -> None:
     result = await router.execute_task(
         task_id="drift-1",
         session_key="feishu:chat-1",
-        payload={"chat_id": "chat-1", "activity_version": 1},
-        lease=SimpleNamespace(session_key="feishu:chat-1", owner_id="runner", epoch=1),
+        payload={"chat_id": "chat-1", "activity_version": 4},
         now=NOW,
     )
 
@@ -118,7 +106,7 @@ async def test_drift_without_finish_is_failed() -> None:
 
 @pytest.mark.asyncio
 async def test_drift_runtime_error_is_not_hidden() -> None:
-    router = DriftRuntime(
+    router = DriftTurnPipeline(
         _Repository(),  # type: ignore[arg-type]
         _Runtime(fail=True),  # type: ignore[arg-type]
         drift_selector=_Selector(),
@@ -128,7 +116,6 @@ async def test_drift_runtime_error_is_not_hidden() -> None:
         await router.execute_task(
             task_id="drift-1",
             session_key="feishu:chat-1",
-            payload={"chat_id": "chat-1", "activity_version": 1},
-            lease=SimpleNamespace(session_key="feishu:chat-1", owner_id="runner", epoch=1),
+            payload={"chat_id": "chat-1", "activity_version": 4},
             now=NOW,
         )

@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from memopilot.extensions.events import EventBus
-from memopilot.extensions.hooks import ToolHook, ToolHookDecision
+from memopilot.extensions.hooks import HookContext, HookOutcome, ToolHook
 from memopilot.runtime.contracts import (
     ChatMessage,
     FunctionCall,
@@ -18,7 +18,7 @@ from memopilot.runtime.contracts import (
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.react import ReActEngine
 from memopilot.runtime.tool_search import ToolSearchTool
-from memopilot.runtime.tools import Tool, ToolRegistry
+from memopilot.runtime.tools import Tool, ToolExecutor, ToolRegistry
 
 
 class _FakeProvider(ChatProvider):
@@ -297,16 +297,18 @@ async def test_react_blocks_direct_call_to_hidden_tool_without_running_handler()
     hook_calls: list[str] = []
     registry = _discovery_registry(calls)
 
-    async def audit_hidden(tool_name: str, arguments: dict[str, object]):
-        del arguments
-        hook_calls.append(tool_name)
-        return ToolHookDecision()
+    class Audit(ToolHook):
+        def matches(self, context: HookContext) -> bool:
+            return True
 
-    registry.register_hook(ToolHook("audit-hidden", before=audit_hidden))
+        async def run(self, context: HookContext) -> HookOutcome:
+            hook_calls.append(context.request.tool_name)
+            return HookOutcome()
 
     result = await ReActEngine(
         provider,
         registry,
+        tool_executor=ToolExecutor(registry, [Audit("audit-hidden", event="pre_tool_use")]),
         tool_search_enabled=True,
     ).run((ChatMessage.user("weather"),))
 
@@ -462,14 +464,12 @@ async def test_react_emits_distinct_denied_and_error_tool_statuses(
     handler: Any,
     expected_status: str,
 ) -> None:
-    async def guard(
-        tool_name: str,
-        arguments: dict[str, object],
-    ) -> ToolHookDecision:
-        del tool_name, arguments
-        if denied:
-            return ToolHookDecision(denied=True, reason="blocked")
-        return ToolHookDecision()
+    class Guard(ToolHook):
+        def matches(self, context: HookContext) -> bool:
+            return True
+
+        async def run(self, context: HookContext) -> HookOutcome:
+            return HookOutcome(decision="deny", reason="blocked") if denied else HookOutcome()
 
     call = FunctionCall(id="c1", name="echo", arguments={"text": "x"})
     provider = _FakeProvider([_response(calls=(call,)), _response("已处理")])
@@ -481,9 +481,10 @@ async def test_react_emits_distinct_denied_and_error_tool_statuses(
         observer=True,
     )
     registry = _registry(handler)
-    registry.register_hook(ToolHook("guard", before=guard))
-
-    result = await ReActEngine(provider, registry, event_bus=bus).run(
+    result = await ReActEngine(
+        provider, registry, event_bus=bus,
+        tool_executor=ToolExecutor(registry, [Guard("guard", event="pre_tool_use")]),
+    ).run(
         (ChatMessage.user("执行"),)
     )
 

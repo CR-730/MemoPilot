@@ -1,6 +1,6 @@
+from memopilot.persistence.conversation import MessageRecord
 from memopilot.runtime.contracts import ChatMessage, FunctionCall
 from memopilot.runtime.history import build_tool_chain, expand_history
-from memopilot.tasks.operational import MessageRecord
 
 
 def test_history_expands_assistant_tool_calls_results_and_final_reply() -> None:

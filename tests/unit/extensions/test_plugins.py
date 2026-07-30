@@ -7,6 +7,7 @@ import pytest
 
 from memopilot.extensions.decorators import on_before_turn, on_tool_pre, tool
 from memopilot.extensions.events import EventBus
+from memopilot.extensions.hooks import HookContext, ToolExecutionRequest
 from memopilot.extensions.plugin_base import Plugin
 from memopilot.extensions.plugin_manager import PluginManager
 from memopilot.extensions.prompts import PromptBlock, PromptRenderer
@@ -48,7 +49,7 @@ async def test_class_plugin_uses_prototype_lifecycle_context_and_decorators(
         "weather",
         '''
 from memopilot.extensions.decorators import on_before_turn, on_tool_pre, tool
-from memopilot.extensions.hooks import ToolHookDecision
+from memopilot.extensions.hooks import HookOutcome
 from memopilot.extensions.plugin_base import Plugin
 
 class WeatherPlugin(Plugin):
@@ -74,7 +75,7 @@ class WeatherPlugin(Plugin):
     async def normalize_city(self, event):
         arguments = dict(event["arguments"])
         arguments["city"] = arguments["city"].strip()
-        return ToolHookDecision(arguments=arguments)
+        return HookOutcome(updated_input=arguments)
 ''',
     )
     (plugin_dir / "manifest.yaml").write_text(
@@ -337,9 +338,15 @@ class ContextPlugin(Plugin):
     plugin = manager.get_plugin(instance)
     assert plugin.context.kv_store.get("called") == "shell"
     assert plugin.context.kv_store.get("status") == "success"
-    decision = await manager.tool_hooks[0].before("shell", {"command": "rm a"})
-    assert decision is not None
-    assert decision.arguments == {"command": "safe"}
+    hook = manager.tool_hooks[0]
+    outcome = await hook.run(
+        HookContext(
+            event="pre_tool_use",
+            request=ToolExecutionRequest("", "shell", {"command": "rm a"}),
+            current_arguments={"command": "rm a"},
+        )
+    )
+    assert outcome.updated_input == {"command": "safe"}
 
 
 @pytest.mark.asyncio

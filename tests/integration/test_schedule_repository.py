@@ -1,13 +1,9 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
-
-import pytest
 
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
 from memopilot.scheduling.contracts import CreateSchedule
 from memopilot.scheduling.repository import ScheduleRepository
-from memopilot.tasks.operational import LostLeaseError, OperationalRepository
 
 NOW = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
 
@@ -56,9 +52,7 @@ def test_create_list_and_cancel_are_session_scoped(tmp_path: Path) -> None:
 
     assert repository.list_for_session("feishu:chat-1") == (task,)
     assert repository.cancel("feishu:other", task_id=task.task_id, now=NOW) == ()
-    assert repository.cancel("feishu:chat-1", task_id=task.task_id, now=NOW) == (
-        task.task_id,
-    )
+    assert repository.cancel("feishu:chat-1", task_id=task.task_id, now=NOW) == (task.task_id,)
     assert repository.list_for_session("feishu:chat-1") == ()
 
 
@@ -117,42 +111,3 @@ def test_expired_one_shot_is_recorded_as_skipped(tmp_path: Path) -> None:
 
     assert result.queued == ()
     assert result.missed[0].state == "skipped"
-
-
-def test_background_execution_transition_is_fenced_and_terminal(tmp_path: Path) -> None:
-    schedules = _repository(tmp_path)
-    _create(schedules)
-    execution = schedules.enqueue_due(now=NOW).queued[0]
-    operational = OperationalRepository(schedules.database)
-    epoch = operational.allocate_fence("feishu:chat-1", owner_id="runner", now=NOW)
-    lease = SimpleNamespace(session_key="feishu:chat-1", owner_id="runner", epoch=epoch)
-
-    assert (
-        operational.transition_background_schedule(
-            execution.execution_id,
-            lease=lease,
-            outcome="running",
-            now=NOW,
-        )
-        == "running"
-    )
-    assert (
-        operational.transition_background_schedule(
-            execution.execution_id,
-            lease=lease,
-            outcome="succeeded",
-            now=NOW,
-        )
-        == "succeeded"
-    )
-    with pytest.raises(LostLeaseError):
-        operational.transition_background_schedule(
-            execution.execution_id,
-            lease=SimpleNamespace(
-                session_key="feishu:chat-1",
-                owner_id="runner",
-                epoch=epoch - 1,
-            ),
-            outcome="running",
-            now=NOW,
-        )

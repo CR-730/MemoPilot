@@ -7,11 +7,11 @@ from typing import Any, cast
 import pytest
 
 from memopilot.config import MemoPilotSettings
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import migrate_all_databases
 from memopilot.runtime.common_tools import register_common_tools
 from memopilot.runtime.common_tools.http import HttpRequester
 from memopilot.runtime.tools import ToolRegistry
-from memopilot.tasks.operational import OperationalRepository
 
 COMMON_TOOL_NAMES = {
     "shell",
@@ -37,7 +37,7 @@ class _UnusedHttpRequester:
 def _register(
     registry: ToolRegistry,
     settings: MemoPilotSettings,
-    repository: OperationalRepository,
+    repository: ConversationRepository,
 ) -> None:
     register_common_tools(
         registry,
@@ -47,10 +47,10 @@ def _register(
     )
 
 
-def _repository(tmp_path: Path) -> tuple[MemoPilotSettings, OperationalRepository]:
+def _repository(tmp_path: Path) -> tuple[MemoPilotSettings, ConversationRepository]:
     settings = MemoPilotSettings(workspace=tmp_path, _env_file=None)
     migrate_all_databases(settings)
-    return settings, OperationalRepository(settings.operational_database)
+    return settings, ConversationRepository(settings.operational_database)
 
 
 async def test_common_toolset_contains_old_public_tools(tmp_path: Path) -> None:

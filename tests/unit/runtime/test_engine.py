@@ -28,7 +28,7 @@ from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.phases import LifecyclePhase
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tool_search import ToolSearchTool
-from memopilot.runtime.tools import Tool, ToolRegistry
+from memopilot.runtime.tools import Tool, ToolExecutor, ToolRegistry
 from memopilot.scheduling.tool_context import current_schedule_tool_context
 
 CITATION_PLUGIN_DIR = (
@@ -854,9 +854,9 @@ async def test_runtime_audit_keeps_denied_status_and_structured_hook_details() -
         ]
     )
     tools = _tools()
-    tools.register_hook(_DenyHook("policy", event="pre_tool_use"))
+    executor = ToolExecutor(tools, [_DenyHook("policy", event="pre_tool_use")])
 
-    result = await AgentRuntime(provider, tools).run(
+    result = await AgentRuntime(provider, tools, tool_executor=executor).run(
         TurnInput(session_key="fake:1", content="echo hi")
     )
 

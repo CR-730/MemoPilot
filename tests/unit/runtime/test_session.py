@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.contracts import ChatMessage, ModelResponse
 from memopilot.runtime.engine import AgentRuntime, SessionHistoryRequest, TurnInput
 from memopilot.runtime.session import OperationalSessionManager
 from memopilot.runtime.tools import ToolRegistry
-from memopilot.tasks.operational import OperationalRepository
 
 
 def test_session_history_request_is_typed() -> None:
@@ -31,9 +31,7 @@ class _Provider:
     def __init__(self) -> None:
         self.messages: tuple[ChatMessage, ...] = ()
 
-    async def complete(
-        self, *, messages: Sequence[ChatMessage], tools: object
-    ) -> ModelResponse:
+    async def complete(self, *, messages: Sequence[ChatMessage], tools: object) -> ModelResponse:
         del tools
         self.messages = tuple(messages)
         return ModelResponse(content="ok", tool_calls=(), finish_reason="stop")
@@ -84,7 +82,7 @@ async def test_session_history_request_requires_manager() -> None:
 async def test_before_turn_expands_persisted_tool_history_for_provider(tmp_path: Path) -> None:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    repository = OperationalRepository(database)
+    repository = ConversationRepository(database)
     now = datetime(2026, 7, 30, tzinfo=UTC)
     from memopilot.bus.events import InboundMessage
 
@@ -103,6 +101,7 @@ async def test_before_turn_expands_persisted_tool_history_for_provider(tmp_path:
             },
         ),
     )
+
     class CountingManager(OperationalSessionManager):
         def __init__(self, repository) -> None:  # type: ignore[no-untyped-def]
             super().__init__(repository)
@@ -122,7 +121,12 @@ async def test_before_turn_expands_persisted_tool_history_for_provider(tmp_path:
 
     history = [item for item in provider.messages if item.role != "system"]
     assert [item.role for item in history] == [
-        "user", "assistant", "tool", "tool", "assistant", "user"
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "assistant",
+        "user",
     ]
     assert [item.tool_call_id for item in history[2:4]] == ["ok", "bad"]
     assert history[4].content == "final"

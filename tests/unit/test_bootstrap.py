@@ -445,7 +445,7 @@ class Rewrite(Plugin):
         embedder=_Embedder(),  # type: ignore[arg-type]
     )
 
-    observation = await bundle.tools.execute(
+    observation = await bundle.tool_executor.execute(
         FunctionCall("call-1", "plugin_echo", {"value": "original"})
     )
     assert observation.result == "rewritten"

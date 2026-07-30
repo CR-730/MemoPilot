@@ -11,7 +11,6 @@ from redis.asyncio import Redis
 from memopilot.bus.events import InboundMessage
 from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.redis_queue import PublishedTask, RedisTaskQueue
-from memopilot.tasks.session_coordination import RedisSessionCoordinator
 
 NOW = datetime(2026, 7, 13, 9, 0, tzinfo=UTC)
 
@@ -50,11 +49,10 @@ async def test_background_task_publish_is_atomic_and_idempotent(redis_client: Re
 
 
 @pytest.mark.asyncio
-async def test_inbound_publish_atomically_creates_p0_and_stop_signal(
+async def test_inbound_publish_atomically_creates_only_one_p0(
     redis_client: Redis,
 ) -> None:
     queue = RedisTaskQueue(redis_client)
-    coordinator = RedisSessionCoordinator(redis_client)
     message = InboundMessage(
         "feishu",
         "user",
@@ -64,30 +62,14 @@ async def test_inbound_publish_atomically_creates_p0_and_stop_signal(
         metadata={"message_id": "message-1"},
     )
 
-    first = await queue.publish_inbound(
-        message,
-        stop_key=coordinator.stop_key(message.session_key),
-    )
-    second = await queue.publish_inbound(
-        message,
-        stop_key=coordinator.stop_key(message.session_key),
-    )
+    first = await queue.publish_inbound(message)
+    second = await queue.publish_inbound(message)
 
     assert first is not None
     assert second is None
     assert await redis_client.xlen(queue.stream_key(0)) == 1
     assert await redis_client.scard(queue.queued_task_ids_key) == 1
-    assert await coordinator.background_stop_requested(message.session_key) is True
-    await coordinator.clear_background_stop(message.session_key)
-
-    assert (
-        await queue.publish_inbound(
-            message,
-            stop_key=coordinator.stop_key(message.session_key),
-        )
-        is None
-    )
-    assert await coordinator.background_stop_requested(message.session_key) is False
+    assert await queue.publish_inbound(message) is None
 
 
 @pytest.mark.asyncio

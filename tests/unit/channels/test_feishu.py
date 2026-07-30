@@ -15,14 +15,14 @@ import pytest
 from memopilot.channels.base import AttachmentStore, SessionIdentityIndex
 from memopilot.channels.contracts import InterruptAcknowledgement
 from memopilot.channels.feishu import FeishuApiError, FeishuChannel
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
-from memopilot.tasks.operational import OperationalRepository
 
 
-def _repository(tmp_path: Path) -> OperationalRepository:
+def _repository(tmp_path: Path) -> ConversationRepository:
     database = tmp_path / "operational.db"
     migrate_database(database, DatabaseKind.OPERATIONAL)
-    return OperationalRepository(database)
+    return ConversationRepository(database)
 
 
 def _event(

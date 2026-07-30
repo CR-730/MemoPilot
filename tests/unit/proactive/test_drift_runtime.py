@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from memopilot.proactive.drift_runtime import DriftRunState, build_drift_tool_registry
+from memopilot.proactive.drift_tools import DriftRunState, build_drift_tool_registry
 from memopilot.runtime.contracts import FunctionCall
 from memopilot.runtime.tools import Tool, ToolRegistry
 

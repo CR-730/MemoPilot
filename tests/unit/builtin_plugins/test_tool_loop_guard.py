@@ -5,7 +5,7 @@ from pathlib import Path
 from memopilot.extensions.hooks import ToolExecutionRequest
 from memopilot.extensions.plugin_manager import PluginManager
 from memopilot.runtime.contracts import FunctionCall
-from memopilot.runtime.tools import Tool, ToolObservation, ToolRegistry
+from memopilot.runtime.tools import Tool, ToolExecutor, ToolObservation, ToolRegistry
 
 PLUGIN_DIR = (
     Path(__file__).resolve().parents[3]
@@ -42,7 +42,7 @@ async def test_third_identical_tool_batch_is_denied_but_changed_batch_runs() -> 
     )
     manager = PluginManager([PLUGIN_DIR], tool_registry=registry)
     await manager.load_all()
-    registry.register_hooks(manager.tool_hooks)
+    executor = ToolExecutor(registry, manager.tool_hooks)
 
     call_sequence = 0
 
@@ -65,7 +65,7 @@ async def test_third_identical_tool_batch_is_denied_but_changed_batch_runs() -> 
             tool_name = str(call["tool_name"])
             arguments = dict(call["arguments"])
             observations.append(
-                await registry.execute(
+                await executor.execute(
                     FunctionCall(str(call["call_id"]), tool_name, arguments),
                     request=ToolExecutionRequest(
                         call_id=str(call["call_id"]),
