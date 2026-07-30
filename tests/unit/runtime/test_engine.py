@@ -771,6 +771,7 @@ async def test_context_pressure_counts_tool_result_before_next_provider_call() -
     from pathlib import Path
 
     from memopilot.extensions.plugin_manager import PluginManager
+    from memopilot.runtime.phases import estimate_messages_tokens
 
     async def large_echo(*, text: str) -> str:
         return text
@@ -793,7 +794,7 @@ async def test_context_pressure_counts_tool_result_before_next_provider_call() -
         [
             ModelResponse(
                 content="working",
-                tool_calls=(FunctionCall("c1", "echo", {"text": "x" * 300_000}),),
+                tool_calls=(FunctionCall("c1", "echo", {"text": "x" * 3_000}),),
                 finish_reason="tool_calls",
             ),
             ModelResponse(content="must not run", tool_calls=()),
@@ -810,13 +811,15 @@ async def test_context_pressure_counts_tool_result_before_next_provider_call() -
         provider,
         tools,
         modules=modules,
-        context_window_tokens=100_000,
+        context_window_tokens=1_000,
     ).run(
-        TurnInput(session_key="fake:1", content="x" * 2_100_000)
+        TurnInput(session_key="fake:1", content="question")
     )
 
     assert len(provider.requests) == 1
+    assert estimate_messages_tokens(provider.requests[0]) <= 800
     assert result.react.exit_reason == "context_pressure"
+    assert [record.observation.result for record in result.react.tool_chain] == ["x" * 3_000]
 
 
 async def test_runtime_audit_keeps_denied_status_and_structured_hook_details() -> None:
