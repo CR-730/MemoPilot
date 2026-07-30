@@ -408,4 +408,7 @@ async def test_30_messages_consolidates_old_ten_and_keeps_hot_twenty(tmp_path: P
 
     assert result is not None and result.message_count == 10
     with connect_database(database) as connection:
-        assert connection.execute("SELECT last_consolidated_position FROM sessions").fetchone()[0] == 10
+        row = connection.execute(
+            "SELECT last_consolidated_position FROM sessions"
+        ).fetchone()
+    assert row is not None and row[0] == 10

@@ -11,9 +11,8 @@ from uuid import NAMESPACE_URL, uuid5
 
 from memopilot.bus.events import InboundMessage, TurnCommitted
 from memopilot.extensions.events import EventBus
-from memopilot.runtime.contracts import ChatMessage
-from memopilot.runtime.history import build_tool_chain, expand_history
 from memopilot.runtime.engine import AgentRuntime, TurnInput
+from memopilot.runtime.history import build_tool_chain, expand_history
 from memopilot.runtime.outbound import DeliveryError, OutboundDispatch, OutboundPort
 from memopilot.runtime.react import ReActProgressObserver
 from memopilot.tasks.background import BackgroundTask

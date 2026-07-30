@@ -19,12 +19,19 @@ def build_tool_chain(
         if (
             message.role != "assistant"
             or not message.tool_calls
-            or (call_ids is not None and not any(call.id in call_ids for call in message.tool_calls))
+            or (
+                call_ids is not None
+                and not any(call.id in call_ids for call in message.tool_calls)
+            )
         ):
             continue
         following = working[index + 1 :]
         next_group = next(
-            (offset for offset, item in enumerate(following) if item.role == "assistant" and item.tool_calls),
+            (
+                offset
+                for offset, item in enumerate(following)
+                if item.role == "assistant" and item.tool_calls
+            ),
             len(following),
         )
         results = {
@@ -54,7 +61,10 @@ def build_tool_chain(
 def expand_history(records: Iterable[MessageRecord]) -> tuple[ChatMessage, ...]:
     history: list[ChatMessage] = []
     records = tuple(records)
-    start = next((index for index, record in enumerate(records) if record.role == "user"), len(records))
+    start = next(
+        (index for index, record in enumerate(records) if record.role == "user"),
+        len(records),
+    )
     for record in records[start:]:
         if record.role == "user":
             history.append(ChatMessage.user(record.content))
@@ -69,7 +79,7 @@ def expand_history(records: Iterable[MessageRecord]) -> tuple[ChatMessage, ...]:
             reasoning = group.get("reasoning_content")
             history.append(
                 ChatMessage.assistant(
-                    content=group.get("text") if isinstance(group.get("text"), str) else None,
+                    content=_group_text(group),
                     tool_calls=function_calls,
                     provider_fields={"reasoning_content": reasoning}
                     if isinstance(reasoning, str)
@@ -101,6 +111,11 @@ def _function_call(value: object) -> FunctionCall:
     if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
         raise ValueError("持久化工具链调用缺少 ID 或名称")
     return FunctionCall(call_id, name, arguments)
+
+
+def _group_text(group: dict[str, object]) -> str | None:
+    text = group.get("text")
+    return text if isinstance(text, str) else None
 
 
 def _truncate_tool_result(content: object) -> str:

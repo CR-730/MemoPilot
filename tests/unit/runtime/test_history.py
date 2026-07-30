@@ -12,9 +12,7 @@ def test_history_expands_assistant_tool_calls_results_and_final_reply() -> None:
     )
     records = (
         MessageRecord("u", "s", "user", "列出目录", "t", 1, "now"),
-        MessageRecord(
-            "a", "s", "assistant", "已查看", "t", 2, "now", build_tool_chain(messages)
-        ),
+        MessageRecord("a", "s", "assistant", "已查看", "t", 2, "now", build_tool_chain(messages)),
     )
 
     history = expand_history(records)
@@ -34,8 +32,20 @@ def test_history_truncates_large_tool_results_from_both_ends() -> None:
     records = (
         MessageRecord("u", "s", "user", "问题", "t", 0, "now"),
         MessageRecord(
-            "a", "s", "assistant", "完成", "t", 1, "now",
-            ({"calls": [{"call_id": "call-1", "name": "tool", "arguments": {}, "result": result}]},),
+            "a",
+            "s",
+            "assistant",
+            "完成",
+            "t",
+            1,
+            "now",
+            (
+                {
+                    "calls": [
+                        {"call_id": "call-1", "name": "tool", "arguments": {}, "result": result}
+                    ]
+                },
+            ),
         ),
     )
 
@@ -57,7 +67,8 @@ def test_history_skips_leading_assistant_until_user_boundary() -> None:
     history = expand_history(records)
 
     assert [(item.role, item.content) for item in history] == [
-        ("user", "新问题"), ("assistant", "新回答")
+        ("user", "新问题"),
+        ("assistant", "新回答"),
     ]
 
 

@@ -143,7 +143,11 @@ async def test_runner_persists_react_tool_chain_for_next_history(tmp_path: Path)
     migrate_database(database, DatabaseKind.OPERATIONAL)
     repository = OperationalRepository(database)
     inbound = InboundMessage(
-        "feishu", "user", "chat-1", "列出目录", timestamp=NOW,
+        "feishu",
+        "user",
+        "chat-1",
+        "列出目录",
+        timestamp=NOW,
         metadata={"message_id": "message-tools"},
     )
     repository.record_inbound_activity(inbound)
@@ -180,16 +184,25 @@ async def test_runner_persists_react_tool_chain_for_next_history(tmp_path: Path)
         event_bus=event_bus,
     )
     payload = {
-        "channel": "feishu", "sender": "user", "chat_id": "chat-1", "content": "列出目录",
-        "timestamp": NOW.isoformat(), "media": [], "metadata": {"message_id": "message-tools"},
+        "channel": "feishu",
+        "sender": "user",
+        "chat_id": "chat-1",
+        "content": "列出目录",
+        "timestamp": NOW.isoformat(),
+        "media": [],
+        "metadata": {"message_id": "message-tools"},
     }
-    message = QueueMessage("p0", "1-0", "task-tools", "passive.turn", 0, inbound.session_key, json.dumps(payload))
+    message = QueueMessage(
+        "p0", "1-0", "task-tools", "passive.turn", 0, inbound.session_key, json.dumps(payload)
+    )
 
     with pytest.raises(RuntimeError):
         await runner.execute(message, payload=payload, lease=LEASE, now=NOW)
 
     saved = repository.list_recent_messages(inbound.session_key, limit=2)[1]
-    assert saved.tool_chain[0]["calls"] == [{"call_id": "call-1", "name": "list_dir", "arguments": {"path": "."}, "result": "目录"}]
+    assert saved.tool_chain[0]["calls"] == [
+        {"call_id": "call-1", "name": "list_dir", "arguments": {"path": "."}, "result": "目录"}
+    ]
     await event_bus.aclose()
 
 
