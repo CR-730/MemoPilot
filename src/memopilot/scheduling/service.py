@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from zoneinfo import ZoneInfo
 
+from memopilot.runtime.outbound import DeliveryError, OutboundDispatch, OutboundPort
 from memopilot.scheduling.contracts import (
     CreateSchedule,
     DueScanResult,
@@ -16,11 +17,27 @@ from memopilot.scheduling.contracts import (
 )
 from memopilot.scheduling.repository import ScheduleRepository
 from memopilot.scheduling.time_rules import compute_fire_at
+from memopilot.tasks.agent_task import AgentTask
+from memopilot.tasks.lease import SessionLease
+from memopilot.tasks.operational import OperationalRepository
+
+if TYPE_CHECKING:
+    from memopilot.runtime.engine import AgentRuntime
 
 
-class ScheduleService:
-    def __init__(self, repository: ScheduleRepository) -> None:
+class SchedulerService:
+    def __init__(
+        self,
+        repository: ScheduleRepository,
+        *,
+        operational: OperationalRepository | None = None,
+        runtime: AgentRuntime | None = None,
+        outbound: OutboundPort | None = None,
+    ) -> None:
         self.repository = repository
+        self._operational = operational
+        self._runtime = runtime
+        self._outbound = outbound
 
     def schedule(
         self,
@@ -89,5 +106,64 @@ class ScheduleService:
     def scan_due(self, *, now: datetime) -> DueScanResult:
         return self.repository.enqueue_due(now=now)
 
+    async def execute_task(
+        self, task: AgentTask, *, lease: SessionLease, now: datetime
+    ) -> tuple[AgentTask, ...]:
+        if self._operational is None or self._runtime is None or self._outbound is None:
+            raise RuntimeError("SchedulerService 未配置执行依赖")
+        payload = task.payload
+        execution_id = _required_text(payload, "execution_id")
+        current = self._operational.transition_background_schedule(
+            execution_id, lease=lease, outcome="running", now=now
+        )
+        if current in {"succeeded", "failed", "cancelled"}:
+            return ()
+        task_payload = payload.get("payload")
+        if not isinstance(task_payload, Mapping):
+            raise ValueError("schedule.run payload.payload 必须是对象")
+        mode = _required_text(payload, "execution_mode")
+        if mode == "instant":
+            text = _required_text(task_payload, "message")
+        elif mode == "agent":
+            from memopilot.runtime.engine import TurnInput
 
-__all__ = ["ScheduleService"]
+            result = await self._runtime.run(
+                TurnInput(
+                    session_key=task.session_key,
+                    content=_required_text(task_payload, "prompt"),
+                    prompt_scope="scheduled",
+                    received_at=now,
+                    allowed_tool_risks=frozenset({"read-only", "write"}),
+                    memory_source_ref=f"task:{task.task_id}",
+                )
+            )
+            if result.react.infrastructure_error:
+                self._operational.transition_background_schedule(
+                    execution_id, lease=lease, outcome="failed", now=now
+                )
+                return ()
+            text = result.reply
+        else:
+            raise ValueError(f"未知 schedule execution_mode: {mode}")
+        if not await self._outbound.dispatch(
+            OutboundDispatch(
+                channel=_required_text(payload, "channel"),
+                chat_id=_required_text(payload, "chat_id"),
+                content=text,
+            )
+        ):
+            raise DeliveryError("定时任务结果未明确发送成功")
+        self._operational.transition_background_schedule(
+            execution_id, lease=lease, outcome="succeeded", now=now
+        )
+        return ()
+
+
+def _required_text(payload: Mapping[str, object], key: str) -> str:
+    value = str(payload.get(key) or "").strip()
+    if not value:
+        raise ValueError(f"Agent 任务缺少 {key}")
+    return value
+
+
+__all__ = ["SchedulerService"]

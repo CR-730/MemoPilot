@@ -30,7 +30,7 @@ class DriftSkillSelector(Protocol):
     async def select(self) -> str: ...
 
 
-class DriftExecutor:
+class DriftRuntime:
     """执行 Drift；定时、主动和记忆任务由各自领域处理器负责。"""
 
     def __init__(
@@ -192,4 +192,4 @@ def _resolve_drift_workspace(value: object, configured: Path | None) -> Path:
     return Path(str(value or configured or ".")).resolve()
 
 
-__all__ = ["DriftExecutor", "DriftResult", "DriftSkillSelector"]
+__all__ = ["DriftRuntime", "DriftResult", "DriftSkillSelector"]

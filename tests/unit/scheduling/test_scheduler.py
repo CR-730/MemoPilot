@@ -5,7 +5,7 @@ import pytest
 
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
 from memopilot.scheduling.contracts import DueScanResult
-from memopilot.scheduling.scheduler import SchedulerService, SystemScheduler
+from memopilot.scheduling.scheduler import ApplicationScheduler, _TaskProducer
 from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.operational import MultiplePrivateSessionsError, OperationalRepository
 
@@ -48,8 +48,8 @@ class _Schedules:
         return DueScanResult()
 
 
-def _scheduler(repository: OperationalRepository) -> SystemScheduler:
-    return SystemScheduler(
+def _scheduler(repository: OperationalRepository) -> _TaskProducer:
+    return _TaskProducer(
         repository,
         memory_scheduler=_Memory(),
         schedule_service=_Schedules(),
@@ -101,7 +101,7 @@ async def test_scheduler_process_publishes_each_background_task_once(tmp_path: P
             return task.task_id
 
     queue = Queue()
-    process = SchedulerService(_scheduler(repository), queue)
+    process = ApplicationScheduler(_scheduler(repository), queue)
 
     assert await process.run_once(now=NOW) == 2
     assert queue.ids[0] == "memory-1"
@@ -123,7 +123,7 @@ async def test_scheduler_publishes_proactive_without_duplicate_busy_gate(
             return task.task_id
 
     queue = Queue()
-    process = SchedulerService(_scheduler(repository), queue)
+    process = ApplicationScheduler(_scheduler(repository), queue)
 
     assert await process.run_once(now=NOW) == 2
     assert queue.ids[0] == "memory-1"

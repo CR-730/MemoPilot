@@ -9,7 +9,7 @@ from memopilot.persistence.migrations import (
 from memopilot.runtime.contracts import FunctionCall
 from memopilot.runtime.tools import ToolRegistry
 from memopilot.scheduling.repository import ScheduleRepository
-from memopilot.scheduling.service import ScheduleService
+from memopilot.scheduling.service import SchedulerService
 from memopilot.scheduling.tool_context import (
     bind_schedule_tool_context,
     reset_schedule_tool_context,
@@ -35,7 +35,7 @@ def _registry(tmp_path):
             (now, now),
         )
     repository = ScheduleRepository(database)
-    return ToolRegistry(build_schedule_tools(ScheduleService(repository))), repository
+    return ToolRegistry(build_schedule_tools(SchedulerService(repository))), repository
 
 
 async def test_schedule_tool_uses_trusted_session_and_received_at(tmp_path) -> None:

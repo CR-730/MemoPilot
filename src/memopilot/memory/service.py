@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from datetime import datetime
 
 from memopilot.memory.consolidation import ConsolidationService
 from memopilot.memory.optimizer import MemoryOptimizer
 from memopilot.memory.post_response import OperationalPostResponseService
 from memopilot.memory.vectorization import VectorizationService
-from memopilot.tasks.operational import FenceToken, OperationalRepository
+from memopilot.tasks.agent_task import AgentTask
+from memopilot.tasks.lease import SessionLease
+from memopilot.tasks.operational import OperationalRepository
 
 
-class MemoryTaskRouter:
+class MemoryService:
     def __init__(
         self,
         consolidation: ConsolidationService,
@@ -26,14 +29,11 @@ class MemoryTaskRouter:
         self.repository = repository
         self.post_response = post_response
 
-    async def execute(
-        self,
-        *,
-        kind: str,
-        session_key: str,
-        payload: dict[str, object],
-        lease: FenceToken,
-    ) -> None:
+    async def execute_task(
+        self, task: AgentTask, *, lease: SessionLease, now: datetime
+    ) -> tuple[AgentTask, ...]:
+        del now
+        kind, session_key, payload = task.kind, task.session_key, task.payload
         def assert_current() -> None:
             self.repository.assert_current_fence(lease)
 
@@ -55,7 +55,7 @@ class MemoryTaskRouter:
                     lease=lease,
                     fenced_write=fenced_write,
                 )
-            return
+            return ()
         if kind == "memory.vectorize":
             consolidation_id = str(payload.get("consolidation_id") or "")
             if not consolidation_id:
@@ -66,13 +66,13 @@ class MemoryTaskRouter:
                 lease=lease,
                 fenced_write=fenced_write,
             )
-            return
+            return ()
         if kind == "memory.optimize":
             await self.optimizer.run(
                 assert_current=assert_current,
                 fenced_write=fenced_write,
             )
-            return
+            return ()
         if kind == "memory.post_response":
             if self.post_response is None:
                 raise RuntimeError("memory.post_response 未装配")
@@ -92,7 +92,7 @@ class MemoryTaskRouter:
                 assert_current=assert_current,
                 fenced_write=fenced_write,
             )
-            return
+            return ()
         if kind == "memory.reinforce":
             usage_ref = str(payload.get("usage_ref") or "")
             raw_ids = payload.get("item_ids")
@@ -105,8 +105,8 @@ class MemoryTaskRouter:
                     item_ids,
                     usage_ref=usage_ref,
                 )
-            return
+            return ()
         raise ValueError(f"不支持的记忆任务: {kind}")
 
 
-__all__ = ["MemoryTaskRouter"]
+__all__ = ["MemoryService"]

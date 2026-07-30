@@ -9,7 +9,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 
-from memopilot.runtime.background import CoreRunner
+from memopilot.runtime.task_dispatcher import TaskDispatcher
 from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.lease import SessionLease, SessionLeaseManager
 from memopilot.tasks.operational import LostLeaseError, StaleActivityError
@@ -26,7 +26,7 @@ class AgentLoop:
         self,
         queue: RedisTaskQueue,
         leases: SessionLeaseManager,
-        runner: CoreRunner,
+        dispatcher: TaskDispatcher,
         *,
         owner_id: str,
         session_coordinator: RedisSessionCoordinator,
@@ -44,7 +44,7 @@ class AgentLoop:
             raise ValueError("轮询间隔必须大于 0")
         self._queue = queue
         self._leases = leases
-        self._runner = runner
+        self._dispatcher = dispatcher
         self._owner_id = owner_id
         self._coordinator = session_coordinator
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -170,9 +170,15 @@ class AgentLoop:
         lease: SessionLease,
     ) -> tuple[Sequence[AgentTask], str | None]:
         execution = asyncio.create_task(
-            self._runner.execute(
-                message,
-                payload=payload,
+            self._dispatcher.dispatch(
+                AgentTask(
+                    message.task_id,
+                    message.kind,
+                    message.priority,
+                    message.session_key,
+                    payload,
+                    self._clock(),
+                ),
                 lease=lease,
                 now=self._clock(),
             )

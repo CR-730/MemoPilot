@@ -8,6 +8,7 @@ from typing import Protocol
 
 from memopilot.proactive.service import ProactiveOutcome
 from memopilot.runtime.outbound import DeliveryError, OutboundDispatch, OutboundPort
+from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.lease import SessionLease
 
 
@@ -25,6 +26,18 @@ class ProactiveExecutionService(Protocol):
         self, outcome: ProactiveOutcome, *, confirmed_at: datetime | None = None
     ) -> bool: ...
 
+
+class DriftTaskRunner(Protocol):
+    async def execute_task(
+        self,
+        *,
+        task_id: str,
+        session_key: str,
+        payload: dict[str, object],
+        lease: SessionLease,
+        now: datetime,
+    ) -> object: ...
+
 ProactiveServiceFactory = Callable[
     [str, int, SessionLease],
     ProactiveExecutionService,
@@ -37,19 +50,30 @@ class ProactiveLoop:
         *,
         service_factory: ProactiveServiceFactory,
         outbound: OutboundPort,
+        drift: DriftTaskRunner | None = None,
     ) -> None:
         self._service_factory = service_factory
         self._outbound = outbound
+        self._drift = drift
 
     async def execute_task(
         self,
+        task: AgentTask,
         *,
-        task_id: str,
-        session_key: str,
-        payload: dict[str, object],
         lease: SessionLease,
         now: datetime,
-    ) -> str:
+    ) -> tuple[AgentTask, ...]:
+        if task.kind == "drift.run":
+            await self._execute_drift(task, lease=lease, now=now)
+            return ()
+        if task.kind != "proactive.tick":
+            raise ValueError(f"不支持的主动任务: {task.kind}")
+        return await self._execute_tick(task, lease=lease, now=now)
+
+    async def _execute_tick(
+        self, task: AgentTask, *, lease: SessionLease, now: datetime
+    ) -> tuple[AgentTask, ...]:
+        task_id, session_key, payload = task.task_id, task.session_key, task.payload
         chat_id = _required_text(payload, "chat_id")
         channel = _required_text(payload, "channel")
         activity_version = _integer(payload.get("activity_version"))
@@ -62,9 +86,10 @@ class ProactiveLoop:
             now=now,
         )
         if outcome.action == "drift":
-            return "drift"
+            await self._execute_drift(task, lease=lease, now=now)
+            return ()
         if outcome.action != "send":
-            return "succeeded"
+            return ()
         if outcome.decision_id is None:
             raise RuntimeError("Proactive send outcome 缺少 decision_id")
         sent = await self._outbound.dispatch(
@@ -72,8 +97,20 @@ class ProactiveLoop:
         )
         if sent:
             service.finalize_confirmed(outcome, confirmed_at=now)
-            return "succeeded"
+            return ()
         raise DeliveryError("主动消息未明确发送成功")
+
+    async def _execute_drift(
+        self, task: AgentTask, *, lease: SessionLease, now: datetime) -> None:
+        if self._drift is None:
+            raise RuntimeError("未配置 Drift 运行时")
+        await self._drift.execute_task(
+            task_id=task.task_id,
+            session_key=task.session_key,
+            payload=task.payload,
+            lease=lease,
+            now=now,
+        )
 
 
 def _required_text(payload: Mapping[str, object], key: str) -> str:

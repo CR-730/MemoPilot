@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from memopilot.runtime.tools import Tool
 from memopilot.scheduling.contracts import ScheduledTask
-from memopilot.scheduling.service import ScheduleService
+from memopilot.scheduling.service import SchedulerService
 from memopilot.scheduling.tool_context import (
     ScheduleToolContext,
     current_schedule_tool_context,
 )
 
 
-def build_schedule_tools(service: ScheduleService) -> tuple[Tool, Tool, Tool]:
+def build_schedule_tools(service: SchedulerService) -> tuple[Tool, Tool, Tool]:
     async def schedule_handler(
         schedule_kind: str,
         when: str,

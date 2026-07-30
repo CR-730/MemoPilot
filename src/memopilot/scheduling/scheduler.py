@@ -31,7 +31,7 @@ class SystemTickResult:
     proactive: AgentTask | None
 
 
-class SystemScheduler:
+class _TaskProducer:
     """组合记忆、定时任务和主动唤醒三类生产器。"""
 
     def __init__(
@@ -93,12 +93,12 @@ class SystemScheduler:
             await self.sleep(self.poll_interval_seconds)
 
 
-class SchedulerService:
+class ApplicationScheduler:
     """生成到期任务并发布到 Redis。"""
 
     def __init__(
         self,
-        scheduler: SystemScheduler,
+        scheduler: _TaskProducer,
         queue: object,
         *,
         max_publish_per_tick: int = 100,
@@ -120,7 +120,7 @@ class SchedulerService:
         return published
 
     async def run_forever(self) -> None:
-        logger.info("SchedulerService started")
+        logger.info("ApplicationScheduler started")
         try:
             while True:
                 try:
@@ -131,7 +131,7 @@ class SchedulerService:
                     logger.exception("Scheduler 周期失败，下次轮询继续")
                 await self.scheduler.sleep(self.scheduler.poll_interval_seconds)
         finally:
-            logger.info("SchedulerService stopped")
+            logger.info("ApplicationScheduler stopped")
 
 
-__all__ = ["SchedulerService", "SystemScheduler", "SystemTickResult"]
+__all__ = ["ApplicationScheduler", "SystemTickResult"]

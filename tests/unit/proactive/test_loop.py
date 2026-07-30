@@ -8,6 +8,7 @@ import pytest
 from memopilot.proactive.loop import ProactiveLoop
 from memopilot.proactive.service import ProactiveOutcome
 from memopilot.runtime.outbound import OutboundDispatch
+from memopilot.tasks.agent_task import AgentTask
 
 NOW = datetime(2026, 7, 21, 12, tzinfo=UTC)
 
@@ -64,14 +65,15 @@ async def test_proactive_reply_dispatches_then_commits_decision() -> None:
     outbound = _Outbound(True)
 
     result = await _loop(proactive, outbound).execute_task(
-        task_id="proactive-1",
-        session_key="feishu:chat-1",
-        payload={"channel": "cli", "chat_id": "chat-1", "activity_version": 4},
+        AgentTask(
+            "proactive-1", "proactive.tick", 2, "feishu:chat-1",
+            {"channel": "cli", "chat_id": "chat-1", "activity_version": 4}, NOW,
+        ),
         lease=SimpleNamespace(),
         now=NOW,
     )
 
-    assert result == "succeeded"
+    assert result == ()
     assert outbound.calls == [
         OutboundDispatch(channel="cli", chat_id="chat-1", content="警报")
     ]
@@ -91,9 +93,10 @@ async def test_proactive_send_failure_stays_retryable() -> None:
 
     with pytest.raises(RuntimeError, match="明确发送成功"):
         await _loop(proactive, _Outbound(False)).execute_task(
-            task_id="proactive-1",
-            session_key="feishu:chat-1",
-            payload={"channel": "cli", "chat_id": "chat-1", "activity_version": 4},
+            AgentTask(
+                "proactive-1", "proactive.tick", 2, "feishu:chat-1",
+                {"channel": "cli", "chat_id": "chat-1", "activity_version": 4}, NOW,
+            ),
             lease=SimpleNamespace(),
             now=NOW,
         )

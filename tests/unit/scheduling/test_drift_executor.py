@@ -4,10 +4,10 @@ from typing import Any
 
 import pytest
 
+from memopilot.proactive.drift_executor import DriftRuntime
 from memopilot.runtime.contracts import FunctionCall
 from memopilot.runtime.engine import TurnResult
 from memopilot.runtime.react import ReActResult
-from memopilot.scheduling.drift_executor import DriftExecutor
 
 NOW = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
 
@@ -78,7 +78,7 @@ class _Selector:
 async def test_drift_executes_direct_task_without_job_or_run() -> None:
     repository = _Repository()
     runtime = _Runtime()
-    router = DriftExecutor(
+    router = DriftRuntime(
         repository,  # type: ignore[arg-type]
         runtime,  # type: ignore[arg-type]
         drift_selector=_Selector(),
@@ -99,7 +99,7 @@ async def test_drift_executes_direct_task_without_job_or_run() -> None:
 
 @pytest.mark.asyncio
 async def test_drift_without_finish_is_failed() -> None:
-    router = DriftExecutor(
+    router = DriftRuntime(
         _Repository(),  # type: ignore[arg-type]
         _Runtime(finish=False),  # type: ignore[arg-type]
         drift_selector=_Selector(),
@@ -118,7 +118,7 @@ async def test_drift_without_finish_is_failed() -> None:
 
 @pytest.mark.asyncio
 async def test_drift_runtime_error_is_not_hidden() -> None:
-    router = DriftExecutor(
+    router = DriftRuntime(
         _Repository(),  # type: ignore[arg-type]
         _Runtime(fail=True),  # type: ignore[arg-type]
         drift_selector=_Selector(),

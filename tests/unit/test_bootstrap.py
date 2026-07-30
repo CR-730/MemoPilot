@@ -228,7 +228,7 @@ class RollbackPlugin(Plugin):
 
     monkeypatch.setattr("memopilot.bootstrap.ToolRegistry", CapturingRegistry)
     monkeypatch.setattr("memopilot.bootstrap.EventBus", CapturingBus)
-    monkeypatch.setattr("memopilot.bootstrap.CoreRunner", fail_executor)
+    monkeypatch.setattr("memopilot.bootstrap.TaskDispatcher", fail_executor)
     settings = MemoPilotSettings(
         workspace=tmp_path,
         embedding_base_url="https://embedding.example/v1",
@@ -294,7 +294,7 @@ async def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(
     assert any("shell_restore" in hook_id for hook_id in bundle.hook_ids)
     assert any("shell_safety" in hook_id for hook_id in bundle.hook_ids)
     assert bundle.runtime is not None
-    assert bundle.core_runner is None
+    assert bundle.task_dispatcher is None
     assert bundle.memory_tasks.repository is bundle.repository
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
@@ -323,8 +323,8 @@ async def test_runtime_bundle_injects_one_derived_memory_window(
         outbound=object(),  # type: ignore[arg-type]
     )
     try:
-        assert bundle.core_runner is not None
-        assert bundle.core_runner.short_term_message_limit == 22
+        assert bundle.task_dispatcher is not None
+        assert bundle.task_dispatcher._passive._history_limit == 22
         assert bundle.memory_tasks.consolidation.keep_count == 22
         assert bundle.memory_tasks.consolidation.min_new_messages == 11
         assert bundle.memory_tasks.consolidation.recent_turn_count == 11
@@ -553,9 +553,7 @@ async def test_runtime_bundle_builds_core_runner_when_outbound_is_available(
         schema["function"]["name"] for schema in bundle.tools.schemas()
     }
     assert bundle.memory_tasks.repository is bundle.repository
-    assert bundle.core_runner is not None
-    assert bundle.core_runner.proactive is not None
-    assert bundle.core_runner.drift is not None
+    assert bundle.task_dispatcher is not None
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
     await bundle.close_extensions()
