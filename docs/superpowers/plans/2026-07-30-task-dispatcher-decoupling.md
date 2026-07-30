@@ -53,7 +53,6 @@
 - 创建：`src/memopilot/tasks/agent_task.py`
 - 创建：`src/memopilot/runtime/task_dispatcher.py`
 - 创建：`tests/unit/runtime/test_task_dispatcher.py`
-- 修改：`src/memopilot/runtime/agent_loop.py`
 - 修改：`src/memopilot/tasks/redis_queue.py`
 - 修改：所有 `BackgroundTask` 生产方和测试
 
@@ -103,24 +102,24 @@ TaskDispatcher(
 
 `dispatch()` 只做 kind 选择和参数转交，不解析 payload。
 
-- [ ] **步骤 4：让 AgentLoop 恢复 AgentTask**
+- [ ] **步骤 4：保持生产入口暂不切换**
 
-AgentLoop 保留 QueueMessage 用于 ACK/Claim；解码 `payload_json` 后构造 AgentTask，再交给 Dispatcher。心跳、停止、StaleActivity 和派生任务发布语义不得改变。
+任务 1 只建立可独立验证的合同和纯 Dispatcher。AgentLoop 仍暂时调用现有 CoreRunner，避免在被动、记忆、主动和调度领域入口尚未完成前引入双轨兼容或破坏 MyPy；AgentLoop 到 TaskDispatcher 的原子切换统一放在任务 6。
 
 - [ ] **步骤 5：机械迁移 BackgroundTask 名称**
 
 把生产代码和测试中的 `BackgroundTask` 改为 `AgentTask`，删除旧别名，确保没有双轨名称：
 
 ```powershell
-rg -n "BackgroundTask" src tests
+rg -n "from memopilot.tasks.background|class BackgroundTask" src tests
 ```
 
-预期：无输出。
+预期：无业务队列合同残余。`runtime/common_tools/shell.py` 中表示本地 Shell 子进程状态的私有 `_BackgroundTask` 不属于本次范围。
 
 - [ ] **步骤 6：验证并提交**
 
 ```powershell
-uv run pytest -q tests/unit/runtime/test_task_dispatcher.py tests/unit/runtime/test_agent_loop.py tests/integration/test_redis_task_delivery.py
+uv run pytest -q tests/unit/runtime/test_task_dispatcher.py tests/integration/test_redis_task_delivery.py
 uv run ruff check src/memopilot/tasks src/memopilot/runtime tests/unit/runtime
 uv run mypy
 git diff --check
@@ -460,7 +459,7 @@ uv run pytest -q tests/unit/test_bootstrap.py tests/integration/test_builtin_plu
 
 - [ ] **步骤 3：切换 Bootstrap**
 
-按规格第 9 节顺序组装，共享 SchedulerService 和 SessionManager。AgentLoop 构造参数由 `runner` 改为 `dispatcher`。
+按规格第 9 节顺序组装，共享 SchedulerService 和 SessionManager。AgentLoop 在本任务中才从 QueueMessage 恢复 AgentTask，并将构造参数由 `runner` 原子改为 `dispatcher`；不得用 CoreRunner 实现 Dispatcher 协议，也不得保留双轨兼容。
 
 - [ ] **步骤 4：删除旧代码和旧命名**
 
