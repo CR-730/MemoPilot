@@ -32,7 +32,11 @@ from memopilot.runtime.tools import Tool, ToolRegistry
 from memopilot.scheduling.tool_context import current_schedule_tool_context
 
 CITATION_PLUGIN_DIR = (
-    Path(__file__).resolve().parents[3] / "src" / "memopilot" / "builtin_plugins" / "citation"
+    Path(__file__).resolve().parents[3]
+    / "src"
+    / "memopilot"
+    / "builtin_plugins"
+    / "citation"
 )
 
 
@@ -56,7 +60,9 @@ async def _echo(*, text: str) -> str:
 
 
 async def test_passive_turn_injects_prototype_prompt_assets(tmp_path) -> None:
-    provider = _Provider([ModelResponse(content="收到", tool_calls=(), finish_reason="stop")])
+    provider = _Provider(
+        [ModelResponse(content="收到", tool_calls=(), finish_reason="stop")]
+    )
     received_at = datetime(2026, 7, 23, 20, 30, tzinfo=UTC)
 
     await AgentRuntime(
@@ -81,7 +87,9 @@ async def test_passive_turn_injects_prototype_prompt_assets(tmp_path) -> None:
 
 
 async def test_explicit_system_prompt_is_not_overwritten_by_default_assets(tmp_path) -> None:
-    provider = _Provider([ModelResponse(content="收到", tool_calls=(), finish_reason="stop")])
+    provider = _Provider(
+        [ModelResponse(content="收到", tool_calls=(), finish_reason="stop")]
+    )
 
     await AgentRuntime(
         provider,
@@ -294,7 +302,9 @@ async def test_runtime_traces_outer_phases_around_each_react_step() -> None:
         [
             ModelResponse(
                 content=None,
-                tool_calls=(FunctionCall(id="c1", name="echo", arguments={"text": "hi"}),),
+                tool_calls=(
+                    FunctionCall(id="c1", name="echo", arguments={"text": "hi"}),
+                ),
                 finish_reason="tool_calls",
             ),
             ModelResponse(content="完成", tool_calls=(), finish_reason="stop"),
@@ -350,7 +360,9 @@ async def test_runtime_traces_outer_phases_around_each_react_step() -> None:
         2,
         2,
     ]
-    assert [event.step_type for event in result.trace if event.step_type == "tool"] == ["tool"]
+    assert [event.step_type for event in result.trace if event.step_type == "tool"] == [
+        "tool"
+    ]
 
 
 async def test_runtime_keeps_successful_deferred_tool_in_session_lru() -> None:
@@ -382,7 +394,11 @@ async def test_runtime_keeps_successful_deferred_tool_in_session_lru() -> None:
                 ),
                 ModelResponse(
                     content=None,
-                    tool_calls=(FunctionCall(id="echo", name="echo", arguments={"text": "hi"}),),
+                    tool_calls=(
+                        FunctionCall(
+                            id="echo", name="echo", arguments={"text": "hi"}
+                        ),
+                    ),
                     finish_reason="tool_calls",
                 ),
                 ModelResponse(content="done", tool_calls=(), finish_reason="stop"),
@@ -424,7 +440,6 @@ async def test_runtime_keeps_successful_deferred_tool_in_session_lru() -> None:
 
     def names(index: int) -> list[str]:
         return [item["function"]["name"] for item in provider.calls[index][1]]
-
     assert names(0) == ["tool_search"]
     assert names(1) == ["tool_search", "echo"]
     assert names(3) == ["tool_search", "echo"]
@@ -444,7 +459,9 @@ async def test_alternate_tool_registry_bypasses_main_registry_deferred_search() 
         [
             ModelResponse(
                 content=None,
-                tool_calls=(FunctionCall("special", "special", {"text": "真实执行"}),),
+                tool_calls=(
+                    FunctionCall("special", "special", {"text": "真实执行"}),
+                ),
                 finish_reason="tool_calls",
             ),
             ModelResponse(content="完成", tool_calls=(), finish_reason="stop"),
@@ -536,7 +553,9 @@ async def test_before_reasoning_abort_returns_without_prompt_or_provider_call() 
     assert result.react.iterations == 0
     assert result.react.tool_chain == ()
     assert result.messages[-1] == ChatMessage.assistant(content="reasoning stopped")
-    assert LifecyclePhase.PROMPT_RENDER not in {entry.phase for entry in result.phase_trace}
+    assert LifecyclePhase.PROMPT_RENDER not in {
+        entry.phase for entry in result.phase_trace
+    }
 
 
 async def test_after_step_early_stop_keeps_tool_result_and_skips_next_provider_call() -> None:
@@ -601,7 +620,9 @@ async def test_step_phase_token_estimates_are_not_character_counts() -> None:
             after_messages = context.slots["step.messages"]
             return {}
 
-    provider = _Provider([ModelResponse(content="done", tool_calls=(), finish_reason="stop")])
+    provider = _Provider(
+        [ModelResponse(content="done", tool_calls=(), finish_reason="stop")]
+    )
     await AgentRuntime(
         provider,
         ToolRegistry(),
@@ -792,7 +813,9 @@ async def test_context_pressure_counts_tool_result_before_next_provider_call() -
         tools,
         modules=modules,
         context_window_tokens=1_000,
-    ).run(TurnInput(session_key="fake:1", content="question"))
+    ).run(
+        TurnInput(session_key="fake:1", content="question")
+    )
 
     assert len(provider.requests) == 1
     before_tool_result = (
@@ -822,7 +845,9 @@ async def test_runtime_audit_keeps_denied_status_and_structured_hook_details() -
         [
             ModelResponse(
                 content=None,
-                tool_calls=(FunctionCall(id="c1", name="echo", arguments={"text": "hi"}),),
+                tool_calls=(
+                    FunctionCall(id="c1", name="echo", arguments={"text": "hi"}),
+                ),
                 finish_reason="tool_calls",
             ),
             ModelResponse(content="已解释拒绝", tool_calls=(), finish_reason="stop"),
@@ -991,16 +1016,21 @@ async def test_runtime_prerecall_uses_raw_context_query_and_injects_context_fram
     assert "先读文档" not in (provider.messages[0].content or "")
     context_frame = provider.messages[-2]
     assert context_frame.role == "user"
-    assert context_frame.content.startswith('<system-reminder data-system-context-frame="true">')
+    assert context_frame.content.startswith(
+        '<system-reminder data-system-context-frame="true">'
+    )
     assert "先读文档" in (context_frame.content or "")
     assert "用户是 AI 工程师" in (context_frame.content or "")
     assert "当前正在重构项目" in (context_frame.content or "")
     assert "不是用户陈述，也不是助手结论" in (context_frame.content or "")
     assert provider.messages[-1].role == "user"
-    assert "request_time=2026-07-27T12:34:00+00:00" in (provider.messages[-1].content or "")
+    assert "request_time=2026-07-27T12:34:00+00:00" in (
+        provider.messages[-1].content or ""
+    )
     assert (provider.messages[-1].content or "").endswith("原始问题")
     assert any(
-        entry.module_slot == "before_reasoning.memory_prerecall" for entry in result.phase_trace
+        entry.module_slot == "before_reasoning.memory_prerecall"
+        for entry in result.phase_trace
     )
     recall_events = [event for event in result.trace if event.step_type == "memory_recall"]
     assert recall_events[0].observation == {
@@ -1199,7 +1229,9 @@ async def test_runtime_omits_oversized_active_skill_atomically_with_diagnostic()
         prompt_max_chars=240,
     )
 
-    await runtime.run(TurnInput("feishu:1", "请使用 $huge", system_prompt="CORE-PROMPT"))
+    await runtime.run(
+        TurnInput("feishu:1", "请使用 $huge", system_prompt="CORE-PROMPT")
+    )
 
     prompt = provider.messages[0].content or ""
     assert "CORE-PROMPT" in prompt
@@ -1317,7 +1349,9 @@ async def test_runtime_strips_memory_citation_protocol_and_exposes_used_ids() ->
         ToolRegistry(),
         modules=manager.phase_modules,
         memory_engine=_MemoryEngine(),  # type: ignore[arg-type]
-    ).run(TurnInput(session_key="feishu:chat-1", content="我喜欢什么风格？"))
+    ).run(
+        TurnInput(session_key="feishu:chat-1", content="我喜欢什么风格？")
+    )
 
     assert result.reply == "我记得你偏好简洁。"
     assert result.cited_memory_ids == ("p1",)
