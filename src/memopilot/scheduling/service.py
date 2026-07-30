@@ -119,11 +119,11 @@ class SchedulerService:
         )
         if current in {"succeeded", "failed", "cancelled"}:
             return ()
-        task_payload = payload.get("payload")
-        if not isinstance(task_payload, Mapping):
-            raise ValueError("schedule.run payload.payload 必须是对象")
-        mode = _required_text(payload, "execution_mode")
         try:
+            task_payload = payload.get("payload")
+            if not isinstance(task_payload, Mapping):
+                raise ValueError("schedule.run payload.payload 必须是对象")
+            mode = _required_text(payload, "execution_mode")
             if mode == "instant":
                 text = _required_text(task_payload, "message")
             elif mode == "agent":

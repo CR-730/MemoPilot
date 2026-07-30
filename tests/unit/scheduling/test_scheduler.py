@@ -174,3 +174,28 @@ async def test_schedule_runtime_failure_marks_execution_failed_and_reraises(tmp_
     with pytest.raises(RuntimeError, match="provider failed"):
         await service.execute_task(task, lease=object(), now=NOW)  # type: ignore[arg-type]
     assert operational.outcomes == ["running", "failed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{"execution_mode": "agent"}, {"payload": {}}])
+async def test_schedule_invalid_running_payload_marks_failed_and_reraises(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    class Operational:
+        def __init__(self) -> None:
+            self.outcomes: list[str] = []
+
+        def transition_background_schedule(self, execution_id, *, lease, outcome, now):  # type: ignore[no-untyped-def]
+            self.outcomes.append(outcome)
+
+    service = SchedulerService(
+        ScheduleRepository(tmp_path / "schedule.db"),
+        operational=Operational(),
+        runtime=object(),
+        outbound=object(),
+    )  # type: ignore[arg-type]
+    operational = service._operational
+    task = AgentTask("t", "schedule.run", 1, "cli:chat", {"execution_id": "e", **payload}, NOW)
+    with pytest.raises(ValueError):
+        await service.execute_task(task, lease=object(), now=NOW)  # type: ignore[arg-type]
+    assert operational.outcomes == ["running", "failed"]
