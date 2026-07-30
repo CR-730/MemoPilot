@@ -18,7 +18,7 @@ from memopilot.memory.markdown import MarkdownMemoryStore
 from memopilot.memory.optimizer import MemoryOptimizer
 from memopilot.memory.retrieval import MemoryRetriever
 from memopilot.memory.store import MemoryStore
-from memopilot.memory.tasks import MemoryTaskRouter
+from memopilot.memory.service import MemoryService
 from memopilot.memory.vectorization import VectorizationService
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.agent_loop import AgentLoop
@@ -77,7 +77,7 @@ class _PostResponse:
 
 
 class _MemoryBackgroundExecutor:
-    def __init__(self, router: MemoryTaskRouter) -> None:
+    def __init__(self, router: MemoryService) -> None:
         self.router = router
 
     async def execute(self, message, *, payload, lease, now) -> tuple[()]:
@@ -118,7 +118,7 @@ async def test_turn_to_async_archive_vector_and_next_turn_recall(
     markdown = MarkdownMemoryStore(tmp_path / "markdown")
     store = MemoryStore(memory_database, dimension=2, vector_enabled=False)
     embedder = _Embedder()
-    router = MemoryTaskRouter(
+    router = MemoryService(
         ConsolidationService(
             operational,
             markdown,

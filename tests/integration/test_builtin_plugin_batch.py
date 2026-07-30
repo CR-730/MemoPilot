@@ -32,7 +32,7 @@ from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.outbound import PushToolOutboundPort
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tools import Tool, ToolRegistry
-from memopilot.scheduling.scheduler import SchedulerService
+from memopilot.scheduling.scheduler import ApplicationScheduler
 from memopilot.tasks.lease import SessionLease
 from memopilot.tasks.operational import OperationalRepository
 from memopilot.tasks.redis_queue import QueueMessage
@@ -435,11 +435,11 @@ async def test_scheduler_logs_start_and_stop(caplog: Any) -> None:
             raise asyncio.CancelledError
 
     caplog.set_level(logging.INFO)
-    service = SchedulerService(_Scheduler(), object())  # type: ignore[arg-type]
+    service = ApplicationScheduler(_Scheduler(), object())  # type: ignore[arg-type]
 
     with pytest.raises(asyncio.CancelledError):
         await service.run_forever()
 
     log_text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "SchedulerService started" in log_text
-    assert "SchedulerService stopped" in log_text
+    assert "ApplicationScheduler started" in log_text
+    assert "ApplicationScheduler stopped" in log_text
