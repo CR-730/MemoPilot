@@ -113,3 +113,18 @@ async def test_proactive_send_failure_stays_retryable() -> None:
         )
 
     assert proactive.failed == []
+
+
+@pytest.mark.asyncio
+async def test_tick_drift_and_direct_drift_use_same_runner() -> None:
+    drift = _Drift()
+    service = _ProactiveService(ProactiveOutcome("drift", session_key="feishu:chat-1"))
+    loop = _loop(service, _Outbound(True), drift)
+    payload = {"channel": "cli", "chat_id": "chat-1", "activity_version": 4}
+    for kind in ("proactive.tick", "drift.run"):
+        await loop.execute_task(
+            AgentTask(kind, kind, 2, "feishu:chat-1", payload, NOW),
+            lease=SimpleNamespace(),
+            now=NOW,
+        )
+    assert [call["task_id"] for call in drift.calls] == ["proactive.tick", "drift.run"]

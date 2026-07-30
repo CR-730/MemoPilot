@@ -5,7 +5,9 @@ import pytest
 
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
 from memopilot.scheduling.contracts import DueScanResult
+from memopilot.scheduling.repository import ScheduleRepository
 from memopilot.scheduling.scheduler import ApplicationScheduler, _TaskProducer
+from memopilot.scheduling.service import SchedulerService
 from memopilot.tasks.agent_task import AgentTask
 from memopilot.tasks.operational import MultiplePrivateSessionsError, OperationalRepository
 
@@ -128,3 +130,47 @@ async def test_scheduler_publishes_proactive_without_duplicate_busy_gate(
     assert await process.run_once(now=NOW) == 2
     assert queue.ids[0] == "memory-1"
     assert queue.ids[1].startswith("proactive.tick:")
+
+
+@pytest.mark.asyncio
+async def test_schedule_runtime_failure_marks_execution_failed_and_reraises(tmp_path: Path) -> None:
+    class Operational:
+        def __init__(self) -> None:
+            self.outcomes = []
+
+        def transition_background_schedule(self, execution_id, *, lease, outcome, now):  # type: ignore[no-untyped-def]
+            self.outcomes.append(outcome)
+            return None
+
+    class Runtime:
+        async def run(self, turn):  # type: ignore[no-untyped-def]
+            raise RuntimeError("provider failed")
+
+    class Outbound:
+        async def dispatch(self, value):  # type: ignore[no-untyped-def]
+            return True
+
+    operational = Operational()
+    service = SchedulerService(
+        ScheduleRepository(tmp_path / "schedule.db"),
+        operational=operational,
+        runtime=Runtime(),
+        outbound=Outbound(),
+    )  # type: ignore[arg-type]
+    task = AgentTask(
+        "t",
+        "schedule.run",
+        1,
+        "cli:chat",
+        {
+            "execution_id": "e",
+            "execution_mode": "agent",
+            "payload": {"prompt": "go"},
+            "channel": "cli",
+            "chat_id": "chat",
+        },
+        NOW,
+    )
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await service.execute_task(task, lease=object(), now=NOW)  # type: ignore[arg-type]
+    assert operational.outcomes == ["running", "failed"]
