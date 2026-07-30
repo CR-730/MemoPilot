@@ -320,9 +320,15 @@ async def test_runtime_traces_outer_phases_around_each_react_step() -> None:
         LifecyclePhase.BEFORE_STEP,
         LifecyclePhase.AFTER_STEP,
         LifecyclePhase.AFTER_STEP,
+        LifecyclePhase.AFTER_STEP,
+        LifecyclePhase.AFTER_STEP,
+        LifecyclePhase.AFTER_STEP,
         LifecyclePhase.BEFORE_STEP,
         LifecyclePhase.BEFORE_STEP,
         LifecyclePhase.BEFORE_STEP,
+        LifecyclePhase.AFTER_STEP,
+        LifecyclePhase.AFTER_STEP,
+        LifecyclePhase.AFTER_STEP,
         LifecyclePhase.AFTER_STEP,
         LifecyclePhase.AFTER_STEP,
         LifecyclePhase.AFTER_REASONING,
@@ -337,9 +343,9 @@ async def test_runtime_traces_outer_phases_around_each_react_step() -> None:
         1,
         1,
         1,
-        2,
-        2,
-        2,
+        1,
+        1,
+        1,
         2,
         2,
     ]
@@ -576,6 +582,176 @@ async def test_after_step_early_stop_keeps_tool_result_and_skips_next_provider_c
     assert any(message.role == "tool" for message in result.messages)
 
 
+async def test_after_step_collects_telemetry_before_and_after_typed_fanout() -> None:
+    provider = _Provider([ModelResponse(content="done", tool_calls=())])
+    bus = EventBus()
+    seen: list[dict[str, object]] = []
+
+    class BeforeFanoutTelemetry:
+        phase = LifecyclePhase.AFTER_STEP
+        slot = "test.after_step.pre"
+        requires = ("after_step.copy_input", "step:ctx")
+        produces = ()
+
+        async def run(self, context):
+            context.slots["step:telemetry:pre"] = "visible"
+            return {}
+
+    class AfterFanoutTelemetry:
+        phase = LifecyclePhase.AFTER_STEP
+        slot = "test.after_step.post"
+        requires = ("after_step.fanout", "step:ctx")
+        produces = ()
+
+        async def run(self, context):
+            context.slots["step:telemetry:pre"] = "must not overwrite"
+            context.slots["step:telemetry:post"] = "returned"
+            return {}
+
+    collected: list[dict[str, object]] = []
+
+    class AfterCollectionProbe:
+        phase = LifecyclePhase.AFTER_STEP
+        slot = "test.after_step.probe"
+        requires = ("after_step.collect_post", "step:ctx")
+        produces = ()
+
+        async def run(self, context):
+            collected.append(dict(context.slots["step:ctx"].extra_metadata))
+            return {}
+
+    async def observe(step):
+        seen.append(dict(step.extra_metadata))
+
+    from memopilot.extensions.plugin_events import AfterStepCtx
+
+    bus.on(AfterStepCtx, observe, observer=True)
+    result = await AgentRuntime(
+        provider,
+        _tools(),
+        event_bus=bus,
+        modules=(BeforeFanoutTelemetry(), AfterFanoutTelemetry(), AfterCollectionProbe()),
+    ).run(TurnInput(session_key="fake:1", content="question"))
+
+    assert seen == [{"pre": "visible"}]
+    assert collected == [{"pre": "visible", "post": "returned"}]
+    assert result.react.exit_reason == "completed"
+
+
+async def test_context_pressure_plugin_stops_only_above_token_threshold() -> None:
+    from pathlib import Path
+
+    from memopilot.extensions.plugin_manager import PluginManager
+
+    provider = _Provider(
+        [
+            ModelResponse(
+                content="working",
+                tool_calls=(FunctionCall("c1", "echo", {"text": "done"}),),
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(content="must not run", tool_calls=()),
+        ]
+    )
+    huge_context = "x" * 2_500_000
+
+    builtin_root = Path(__file__).parents[3] / "src" / "memopilot" / "builtin_plugins"
+    manager = PluginManager([builtin_root], tool_registry=_tools())
+    await manager.load_all()
+    modules = tuple(
+        module for module in manager.phase_modules if module.slot == "context_pressure.stop"
+    )
+    assert len(modules) == 1
+
+    result = await AgentRuntime(
+        provider,
+        _tools(),
+        modules=modules,
+    ).run(TurnInput(session_key="fake:1", content=huge_context))
+
+    assert len(provider.requests) == 1
+    assert result.react.exit_reason == "context_pressure"
+
+
+async def test_context_pressure_plugin_allows_token_estimate_at_threshold() -> None:
+    from memopilot.builtin_plugins.context_pressure.plugin import (
+        _CONTEXT_PRESSURE_STOP_THRESHOLD_TOKENS,
+        ContextPressureStopModule,
+    )
+    from memopilot.extensions.plugin_events import AfterStepCtx
+    from memopilot.runtime.phases import PluginPhaseFrame
+
+    frame = PluginPhaseFrame(
+        input=None,
+        slots={
+            "step:ctx": AfterStepCtx(
+                session_key="fake:1",
+                channel="fake",
+                chat_id="1",
+                iteration=1,
+                context_tokens_estimate=_CONTEXT_PRESSURE_STOP_THRESHOLD_TOKENS,
+                tools_called=(),
+                partial_reply="working",
+                tools_used_so_far=(),
+                tool_chain_partial=(),
+                partial_thinking=None,
+                has_more=True,
+            )
+        },
+    )
+
+    await ContextPressureStopModule().run(frame)
+
+    assert "step:early_stop_reason" not in frame.slots
+
+
+async def test_context_pressure_counts_tool_result_before_next_provider_call() -> None:
+    from pathlib import Path
+
+    from memopilot.extensions.plugin_manager import PluginManager
+
+    async def large_echo(*, text: str) -> str:
+        return text
+
+    tools = ToolRegistry(
+        [
+            Tool(
+                name="echo",
+                description="echo",
+                parameters={
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+                handler=large_echo,
+            )
+        ]
+    )
+    provider = _Provider(
+        [
+            ModelResponse(
+                content="working",
+                tool_calls=(FunctionCall("c1", "echo", {"text": "x" * 300_000}),),
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(content="must not run", tool_calls=()),
+        ]
+    )
+    builtin_root = Path(__file__).parents[3] / "src" / "memopilot" / "builtin_plugins"
+    manager = PluginManager([builtin_root], tool_registry=tools)
+    await manager.load_all()
+    modules = tuple(
+        module for module in manager.phase_modules if module.slot == "context_pressure.stop"
+    )
+
+    result = await AgentRuntime(provider, tools, modules=modules).run(
+        TurnInput(session_key="fake:1", content="x" * 2_100_000)
+    )
+
+    assert len(provider.requests) == 1
+    assert result.react.exit_reason == "context_pressure"
+
+
 async def test_runtime_audit_keeps_denied_status_and_structured_hook_details() -> None:
     class _DenyHook(ToolHook):
         async def run(self, context: HookContext) -> HookOutcome:
@@ -676,6 +852,9 @@ async def test_runtime_records_symmetric_step_phases_when_provider_fails() -> No
         LifecyclePhase.BEFORE_STEP,
         LifecyclePhase.BEFORE_STEP,
         LifecyclePhase.BEFORE_STEP,
+        LifecyclePhase.AFTER_STEP,
+        LifecyclePhase.AFTER_STEP,
+        LifecyclePhase.AFTER_STEP,
         LifecyclePhase.AFTER_STEP,
         LifecyclePhase.AFTER_STEP,
     ]

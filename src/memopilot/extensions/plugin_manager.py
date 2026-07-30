@@ -87,6 +87,11 @@ class _PhaseAdapter:
     produces: tuple[str, ...]
     declared_produces: tuple[str, ...]
 
+    @property
+    def optional_produces(self) -> tuple[str, ...]:
+        """PhaseFrame 插件按原型可条件性写入声明的 slot。"""
+        return self.declared_produces
+
     async def run(self, context: PhaseContext) -> dict[str, Any]:
         input_slot = _phase_input_slot(self.phase)
         if input_slot not in context.slots:
@@ -116,12 +121,6 @@ class _PhaseAdapter:
             raise TypeError(
                 "插件 PhaseModule 必须返回 Mapping 或 PluginPhaseFrame: "
                 f"{type(result).__name__}"
-            )
-        missing = set(self.declared_produces).difference(result.slots)
-        if missing:
-            raise RuntimeError(
-                f"插件 PhaseModule {self.slot} 未产生声明的 slot: "
-                + ", ".join(sorted(missing))
             )
         updates = {
             key: value

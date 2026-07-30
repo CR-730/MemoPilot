@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
+
+from memopilot.runtime.contracts import ChatMessage
 
 
 class LifecyclePhase(StrEnum):
@@ -56,6 +59,17 @@ class PhaseDefinitionError(ValueError):
         super().__init__(f"Phase 定义错误 [{kind}]: {joined}")
 
 
+def estimate_messages_tokens(messages: Sequence[ChatMessage]) -> int:
+    """按原型的 JSON 载荷近似估算消息 token。"""
+    if not messages:
+        return 0
+    payload = json.dumps(
+        [message.to_openai(include_provider_fields=True) for message in messages],
+        ensure_ascii=False,
+    )
+    return max(1, len(payload) // 3)
+
+
 class PhasePipeline:
     """按固定生命周期和模块依赖编译、执行 PhaseModule。"""
 
@@ -101,7 +115,8 @@ class PhasePipeline:
                     + ", ".join(sorted(missing_inputs))
                 )
             outputs = dict(await module.run(context))
-            missing_outputs = set(module.produces).difference(outputs)
+            optional_outputs = set(getattr(module, "optional_produces", ()))
+            missing_outputs = set(module.produces).difference(outputs, optional_outputs)
             if missing_outputs:
                 raise RuntimeError(
                     f"PhaseModule {module.slot} 未产生声明的 slot: "
@@ -211,4 +226,5 @@ __all__ = [
     "PhaseModule",
     "PhasePipeline",
     "PluginPhaseFrame",
+    "estimate_messages_tokens",
 ]

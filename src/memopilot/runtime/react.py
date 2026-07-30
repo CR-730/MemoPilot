@@ -71,6 +71,7 @@ class ReActObserver(Protocol):
         iteration: int,
         response: ModelResponse,
         tool_records: Sequence[ToolCallRecord],
+        messages: Sequence[ChatMessage],
     ) -> AfterStepControl | None: ...
 
 
@@ -226,7 +227,7 @@ class ReActEngine:
             )
             if not response.tool_calls:
                 if self._observer is not None:
-                    await self._observer.after_step(iteration, response, ())
+                    await self._observer.after_step(iteration, response, (), working)
                 reply = (response.content or "").strip()
                 if reply:
                     tools_used = [
@@ -268,7 +269,7 @@ class ReActEngine:
             after_control: AfterStepControl | None = None
             if self._observer is not None:
                 after_control = await self._observer.after_step(
-                    iteration, response, step_records
+                    iteration, response, step_records, working
                 )
             if after_control is not None and after_control.early_stop:
                 reason = after_control.early_stop_reason.strip() or "after_step"
@@ -527,11 +528,11 @@ class ReActEngine:
                 error_message=str(exc),
             )
             if self._observer is not None:
-                await self._observer.after_step(final_iteration, failure, ())
+                await self._observer.after_step(final_iteration, failure, (), working)
         else:
             final_thinking = response.thinking
             if self._observer is not None:
-                await self._observer.after_step(final_iteration, response, ())
+                await self._observer.after_step(final_iteration, response, (), working)
         if not reply:
             reply = "当前步骤已经停止；已保留取得的工具结果，但尚未形成完整结论。"
         working.append(ChatMessage.assistant(content=reply))
@@ -572,7 +573,7 @@ class ReActEngine:
             error_message=str(error),
         )
         if self._observer is not None:
-            await self._observer.after_step(iteration, failure, ())
+            await self._observer.after_step(iteration, failure, (), working)
         working.append(ChatMessage.assistant(content=reply))
         return _logged_result(ReActResult(
             reply=reply,

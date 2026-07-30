@@ -45,6 +45,7 @@ from memopilot.runtime.phases import (
     PhaseContext,
     PhaseModule,
     PhasePipeline,
+    estimate_messages_tokens,
 )
 from memopilot.runtime.prompt_assets import (
     build_current_message_time_envelope,
@@ -632,7 +633,7 @@ class _RuntimeExecution(ReActObserver):
                 state.channel,
                 state.chat_id,
                 iteration,
-                _estimate_messages_chars(messages),
+                estimate_messages_tokens(messages),
                 phase_input.visible_names,
             )
         elif phase is LifecyclePhase.AFTER_STEP:
@@ -644,7 +645,7 @@ class _RuntimeExecution(ReActObserver):
                 state.channel,
                 state.chat_id,
                 cast(int, self._context.slots["step.iteration"]),
-                _estimate_messages_chars(messages),
+                estimate_messages_tokens(messages),
                 tuple(record.call.name for record in records),
                 response.content or "",
                 tuple(record.call.name for record in records),
@@ -708,10 +709,12 @@ class _RuntimeExecution(ReActObserver):
         iteration: int,
         response: ModelResponse,
         tool_records: Sequence[ToolCallRecord],
+        messages: Sequence[ChatMessage],
     ) -> AfterStepControl:
         self._iteration = iteration
         self._context.slots["step.response"] = response
         self._context.slots["step.records"] = tuple(tool_records)
+        self._context.slots["step.messages"] = tuple(messages)
         await self._record(
             RuntimeTraceEvent(
                 phase=LifecyclePhase.AFTER_STEP,
@@ -1049,7 +1052,40 @@ async def _after_step(context: PhaseContext) -> Mapping[str, Any]:
     return {"step:ctx": context.slots["step:ctx"]}
 
 
-async def _observe_after_step(context: PhaseContext) -> Mapping[str, Any]:
+async def _collect_after_step_telemetry(context: PhaseContext) -> Mapping[str, Any]:
+    ctx = cast(AfterStepCtx, context.slots["step:ctx"])
+    collected = cast(set[str], context.slots.get("step:telemetry_collected", set()))
+    exports = {
+        key.removeprefix("step:telemetry:"): value
+        for key, value in context.slots.items()
+        if key.startswith("step:telemetry:") and key.removeprefix("step:telemetry:")
+    }
+    new_exports = {key: value for key, value in exports.items() if key not in collected}
+    metadata = dict(ctx.extra_metadata)
+    metadata.update(new_exports)
+    reason = context.slots.get("step:early_stop_reason")
+    stop_reason = reason.strip() if isinstance(reason, str) else ""
+    context.slots["step:ctx"] = replace(
+        ctx,
+        early_stop=bool(stop_reason) or ctx.early_stop,
+        early_stop_reason=stop_reason or ctx.early_stop_reason,
+        extra_metadata=metadata,
+    )
+    context.slots["step:telemetry_collected"] = collected | set(new_exports)
+    return {}
+
+
+async def _fanout_after_step(
+    context: PhaseContext,
+    *,
+    event_bus: EventBus | None,
+) -> Mapping[str, Any]:
+    if event_bus is not None:
+        await event_bus.fanout(cast(AfterStepCtx, context.slots["step:ctx"]))
+    return {}
+
+
+async def _return_after_step(context: PhaseContext) -> Mapping[str, Any]:
     return {"step.observed": context.slots["step:ctx"]}
 
 
@@ -1193,10 +1229,31 @@ def _default_modules(
         ),
         FunctionPhaseModule(
             LifecyclePhase.AFTER_STEP,
-            "after_step.observe",
+            "after_step.collect_pre",
             ("after_step.copy_input", "step:ctx"),
+            (),
+            _collect_after_step_telemetry,
+        ),
+        FunctionPhaseModule(
+            LifecyclePhase.AFTER_STEP,
+            "after_step.fanout",
+            ("after_step.collect_pre", "step:ctx"),
+            (),
+            partial(_fanout_after_step, event_bus=event_bus),
+        ),
+        FunctionPhaseModule(
+            LifecyclePhase.AFTER_STEP,
+            "after_step.collect_post",
+            ("after_step.fanout", "step:ctx"),
+            (),
+            _collect_after_step_telemetry,
+        ),
+        FunctionPhaseModule(
+            LifecyclePhase.AFTER_STEP,
+            "after_step.return",
+            ("after_step.collect_post", "step:ctx"),
             ("step.observed",),
-            _observe_after_step,
+            _return_after_step,
         ),
         FunctionPhaseModule(
             LifecyclePhase.AFTER_REASONING,
