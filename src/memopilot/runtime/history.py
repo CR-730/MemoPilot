@@ -22,9 +22,14 @@ def build_tool_chain(
             or (call_ids is not None and not any(call.id in call_ids for call in message.tool_calls))
         ):
             continue
+        following = working[index + 1 :]
+        next_group = next(
+            (offset for offset, item in enumerate(following) if item.role == "assistant" and item.tool_calls),
+            len(following),
+        )
         results = {
             item.tool_call_id: item.content or ""
-            for item in working[index + 1 :]
+            for item in following[:next_group]
             if item.role == "tool" and item.tool_call_id is not None
         }
         group: dict[str, object] = {
@@ -48,7 +53,9 @@ def build_tool_chain(
 
 def expand_history(records: Iterable[MessageRecord]) -> tuple[ChatMessage, ...]:
     history: list[ChatMessage] = []
-    for record in records:
+    records = tuple(records)
+    start = next((index for index, record in enumerate(records) if record.role == "user"), len(records))
+    for record in records[start:]:
         if record.role == "user":
             history.append(ChatMessage.user(record.content))
             continue

@@ -189,6 +189,8 @@ uv run memopilot run --config config.toml --workspace D:/path/to/workspace
 ```
 
 - 自动预检索在第一次模型推理前注入上下文；`recall_memory` 由模型在 ReAct 中按需调用。
+- 短期历史和 Consolidation 统一由 `memory_window` 派生：默认值 40 对应 20 条热历史、保留 20 条、最少整理 10 条、Recent Turns 10 条；非 4 的倍数先向上对齐。
+- assistant 的历史工具调用会与 Observation 一同持久化并在下一轮恢复；单条工具结果超过 10,000 字符时保留首尾并标注截断。
 - 默认使用原始 Query，不开启 HyDE；`timeline`、`interest`、`procedure` 等意图拥有独立检索路径。
 - Consolidation 负责从已完成对话中提取长期记忆和近期上下文；Post-response 负责处理用户后续纠正。
 - 向量写入使用稳定 `source_ref` 与内容哈希幂等，旧事实不会被静默覆盖。

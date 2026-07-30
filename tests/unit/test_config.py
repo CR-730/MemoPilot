@@ -38,10 +38,10 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
     assert settings.llm_thinking_enabled is False
     assert settings.tool_search_enabled is True
     assert settings.memory_window == 40
-    assert settings.history_limit == 20
-    assert settings.consolidation_keep_count == 20
-    assert settings.consolidation_min_new_messages == 10
-    assert settings.recent_turn_count == 10
+    assert settings.memory_history_limit == 20
+    assert settings.memory_consolidation_keep_count == 20
+    assert settings.memory_consolidation_min_new_messages == 10
+    assert settings.memory_recent_turn_count == 10
     assert settings.memory_score_threshold == 0.45
     assert settings.memory_hotness_alpha == 0.2
     assert settings.memory_hotness_half_life_days == 14
@@ -66,10 +66,10 @@ def test_memory_window_aligns_before_deriving_runtime_windows(
 
     settings = MemoPilotSettings(memory_window=41, _env_file=None)
 
-    assert settings.history_limit == 22
-    assert settings.consolidation_keep_count == 22
-    assert settings.consolidation_min_new_messages == 11
-    assert settings.recent_turn_count == 11
+    assert settings.memory_history_limit == 22
+    assert settings.memory_consolidation_keep_count == 22
+    assert settings.memory_consolidation_min_new_messages == 11
+    assert settings.memory_recent_turn_count == 11
 
 
 def test_environment_overrides_dotenv(

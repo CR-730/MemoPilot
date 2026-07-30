@@ -197,20 +197,20 @@ class MemoPilotSettings(BaseSettings):
         return ()
 
     @property
-    def history_limit(self) -> int:
+    def memory_history_limit(self) -> int:
         return max(4, (self.memory_window + 3) // 4 * 4) // 2
 
     @property
-    def consolidation_keep_count(self) -> int:
-        return self.history_limit
+    def memory_consolidation_keep_count(self) -> int:
+        return self.memory_history_limit
 
     @property
-    def consolidation_min_new_messages(self) -> int:
-        return max(5, self.history_limit // 2)
+    def memory_consolidation_min_new_messages(self) -> int:
+        return max(5, self.memory_history_limit // 2)
 
     @property
-    def recent_turn_count(self) -> int:
-        return max(1, self.history_limit // 2)
+    def memory_recent_turn_count(self) -> int:
+        return max(1, self.memory_history_limit // 2)
 
     @property
     def operational_database(self) -> Path:

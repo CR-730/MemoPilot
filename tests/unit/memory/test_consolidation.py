@@ -366,6 +366,46 @@ async def test_consolidation_rechecks_fence_inside_final_transaction(tmp_path: P
     with pytest.raises(LostLeaseError, match="已失效"):
         await service.run(
             "feishu:chat-1",
-            assert_current=lambda: None,
-            lease=stale_lease,
-        )
+        assert_current=lambda: None,
+        lease=stale_lease,
+    )
+
+
+@pytest.mark.asyncio
+async def test_29_messages_only_refreshes_explicit_recent_turn_count(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    for index in range(1, 16):
+        _committed_turn(repository, index=index, user=f"问题-{index}", assistant=f"回答-{index}")
+    with connect_database(database) as connection:
+        connection.execute("UPDATE sessions SET last_consolidated_position = 1")
+    markdown = MarkdownMemoryStore(tmp_path / "memory")
+    extractor = _Extractor()
+    service = ConsolidationService(
+        database, markdown, extractor, keep_count=20, min_new_messages=10, recent_turn_count=10
+    )
+
+    assert await service.run("feishu:chat-1") is None
+    assert extractor.calls == 0
+    assert "问题-15" in markdown.read("RECENT_CONTEXT.md")
+    assert "问题-10" not in markdown.read("RECENT_CONTEXT.md")
+
+
+@pytest.mark.asyncio
+async def test_30_messages_consolidates_old_ten_and_keeps_hot_twenty(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = OperationalRepository(database)
+    for index in range(1, 16):
+        _committed_turn(repository, index=index, user=f"问题-{index}", assistant=f"回答-{index}")
+    service = ConsolidationService(
+        database, MarkdownMemoryStore(tmp_path / "memory"), _Extractor(),
+        keep_count=20, min_new_messages=10, recent_turn_count=10,
+    )
+
+    result = await service.run("feishu:chat-1")
+
+    assert result is not None and result.message_count == 10
+    with connect_database(database) as connection:
+        assert connection.execute("SELECT last_consolidated_position FROM sessions").fetchone()[0] == 10

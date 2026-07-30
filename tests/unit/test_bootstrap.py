@@ -327,6 +327,7 @@ async def test_runtime_bundle_injects_one_derived_memory_window(
         assert bundle.core_runner.short_term_message_limit == 22
         assert bundle.memory_tasks.consolidation.keep_count == 22
         assert bundle.memory_tasks.consolidation.min_new_messages == 11
+        assert bundle.memory_tasks.consolidation.recent_turn_count == 11
     finally:
         await bundle.close_extensions()
 

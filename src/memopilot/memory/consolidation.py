@@ -51,6 +51,7 @@ class ConsolidationService:
         recent_context: RecentContextCompressor | None = None,
         keep_count: int = 12,
         min_new_messages: int = 5,
+        recent_turn_count: int | None = None,
         failpoint: Callable[[str], None] | None = None,
     ) -> None:
         self.database = database
@@ -59,6 +60,7 @@ class ConsolidationService:
         self.recent_context = recent_context
         self.keep_count = max(0, keep_count)
         self.min_new_messages = max(1, min_new_messages)
+        self.recent_turn_count = max(1, recent_turn_count or keep_count // 2)
         self.failpoint = failpoint
 
     async def run(
@@ -127,7 +129,7 @@ class ConsolidationService:
         return cast(sqlite3.Row | None, row)
 
     def _recent_turns(self, session_key: str) -> str:
-        recent_count = max(1, self.keep_count // 2)
+        recent_count = self.recent_turn_count
         with connect_database(self.database) as connection:
             rows = connection.execute(
                 "SELECT role, content FROM messages WHERE session_key = ? "
