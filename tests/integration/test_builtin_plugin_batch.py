@@ -20,7 +20,6 @@ from memopilot.persistence.migrations import (
     migrate_database,
 )
 from memopilot.runtime.agent_loop import AgentLoop
-from memopilot.runtime.background import CoreRunner
 from memopilot.runtime.common_tools.message_push import MessagePushTool
 from memopilot.runtime.contracts import (
     ChatMessage,
@@ -30,7 +29,10 @@ from memopilot.runtime.contracts import (
 )
 from memopilot.runtime.engine import AgentRuntime, TurnInput
 from memopilot.runtime.outbound import PushToolOutboundPort
+from memopilot.runtime.passive_turn import PassiveTurnPipeline
 from memopilot.runtime.providers import ChatProvider
+from memopilot.runtime.session import OperationalSessionManager
+from memopilot.runtime.task_dispatcher import TaskDispatcher
 from memopilot.runtime.tools import Tool, ToolRegistry
 from memopilot.scheduling.scheduler import ApplicationScheduler
 from memopilot.tasks.lease import SessionLease
@@ -306,6 +308,7 @@ async def test_meme_runs_through_agent_loop_and_sends_clean_text_and_image(
         tools,
         modules=manager.phase_modules,
         event_bus=bus,
+        session_manager=OperationalSessionManager(repository),
     )
     sent_text: list[str] = []
     sent_images: list[str] = []
@@ -330,14 +333,17 @@ async def test_meme_runs_through_agent_loop_and_sends_clean_text_and_image(
 
     push = MessagePushTool()
     push.register_channel("cli", text=send_text, image=send_image)
-    runner = CoreRunner(
-        runtime,
-        repository=repository,
-        outbound=PushToolOutboundPort(push),
-        memory_tasks=_Unused(),
+    dispatcher = TaskDispatcher(
+        passive=PassiveTurnPipeline(
+            runtime,
+            repository=repository,
+            outbound=PushToolOutboundPort(push),
+            event_bus=bus,
+            history_limit=12,
+        ),
+        memory=_Unused(),
         proactive=_Unused(),
-        drift=_Unused(),
-        event_bus=bus,
+        scheduler=_Unused(),
     )
     payload = {
         "channel": "cli",
@@ -367,7 +373,7 @@ async def test_meme_runs_through_agent_loop_and_sends_clean_text_and_image(
     loop = AgentLoop(
         queue,
         _Leases(),
-        runner,
+        dispatcher,
         owner_id="agent-1",
         session_coordinator=_Coordinator(),
         sleep=stop_after_idle,

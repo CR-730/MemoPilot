@@ -75,13 +75,13 @@ class _Coordinator:
         return self.reason
 
 
-class _Runner:
+class _Dispatcher:
     def __init__(self, error: BaseException | None = None) -> None:
         self.error = error
         self.cancelled = False
         self.calls = 0
 
-    async def execute(self, *args: Any, **kwargs: Any) -> tuple[()]:
+    async def dispatch(self, *args: Any, **kwargs: Any) -> tuple[()]:
         del args, kwargs
         self.calls += 1
         if self.error is not None:
@@ -89,12 +89,12 @@ class _Runner:
         return ()
 
 
-class _BlockingRunner(_Runner):
+class _BlockingDispatcher(_Dispatcher):
     def __init__(self) -> None:
         super().__init__()
         self.started = asyncio.Event()
 
-    async def execute(self, *args: Any, **kwargs: Any) -> tuple[()]:
+    async def dispatch(self, *args: Any, **kwargs: Any) -> tuple[()]:
         del args, kwargs
         self.started.set()
         try:
@@ -107,7 +107,7 @@ class _BlockingRunner(_Runner):
 @pytest.mark.asyncio
 async def test_passive_p0_is_executed_and_acked_by_only_agent_loop() -> None:
     queue = _Queue()
-    runner = _Runner()
+    runner = _Dispatcher()
     loop = AgentLoop(
         queue,  # type: ignore[arg-type]
         _Leases(),  # type: ignore[arg-type]
@@ -127,7 +127,7 @@ async def test_send_failure_is_not_acked() -> None:
     loop = AgentLoop(
         queue,  # type: ignore[arg-type]
         _Leases(),  # type: ignore[arg-type]
-        _Runner(DeliveryError("network down")),
+        _Dispatcher(DeliveryError("network down")),
         owner_id="agent-1",
         session_coordinator=_Coordinator(),  # type: ignore[arg-type]
     )
@@ -140,7 +140,7 @@ async def test_send_failure_is_not_acked() -> None:
 @pytest.mark.asyncio
 async def test_preempted_schedule_stays_pending_without_ack_or_republish() -> None:
     queue = _Queue(kind="schedule.run")
-    runner = _BlockingRunner()
+    runner = _BlockingDispatcher()
     loop = AgentLoop(
         queue,  # type: ignore[arg-type]
         _Leases(),  # type: ignore[arg-type]
@@ -159,7 +159,7 @@ async def test_preempted_schedule_stays_pending_without_ack_or_republish() -> No
 @pytest.mark.asyncio
 async def test_user_stop_cancels_and_acks_running_passive_turn() -> None:
     queue = _Queue()
-    runner = _BlockingRunner()
+    runner = _BlockingDispatcher()
     coordinator = _Coordinator()
     loop = AgentLoop(
         queue,  # type: ignore[arg-type]

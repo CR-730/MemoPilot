@@ -17,8 +17,8 @@ from memopilot.memory.engine import LayeredMemoryEngine
 from memopilot.memory.markdown import MarkdownMemoryStore
 from memopilot.memory.optimizer import MemoryOptimizer
 from memopilot.memory.retrieval import MemoryRetriever
-from memopilot.memory.store import MemoryStore
 from memopilot.memory.service import MemoryService
+from memopilot.memory.store import MemoryStore
 from memopilot.memory.vectorization import VectorizationService
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.agent_loop import AgentLoop
@@ -76,18 +76,13 @@ class _PostResponse:
         return ()
 
 
-class _MemoryBackgroundExecutor:
+class _MemoryDispatcher:
     def __init__(self, router: MemoryService) -> None:
         self.router = router
 
-    async def execute(self, message, *, payload, lease, now) -> tuple[()]:
+    async def dispatch(self, task, *, lease, now) -> tuple[()]:
         del now
-        await self.router.execute(
-            kind=message.kind,
-            session_key=message.session_key,
-            payload=payload,
-            lease=lease,
-        )
+        await self.router.execute_task(task, lease=lease, now=NOW)
         return ()
 
 
@@ -140,7 +135,7 @@ async def test_turn_to_async_archive_vector_and_next_turn_recall(
     runner = AgentLoop(
         queue,
         SessionLeaseManager(memory_redis, repository, ttl=timedelta(seconds=2)),
-        _MemoryBackgroundExecutor(router),
+        _MemoryDispatcher(router),
         owner_id="runner-memory",
         session_coordinator=RedisSessionCoordinator(memory_redis),
         clock=lambda: NOW + timedelta(seconds=1),

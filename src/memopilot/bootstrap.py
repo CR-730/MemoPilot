@@ -463,14 +463,6 @@ async def build_runtime_bundle(
                 recent_context=lambda _session_key, _now: markdown.read("RECENT_CONTEXT.md"),
             )
 
-        proactive_loop = (
-            None
-            if outbound is None
-            else ProactiveLoop(
-                outbound=outbound,
-                service_factory=build_proactive_service,
-            )
-        )
         system_jobs = DriftRuntime(
             operational,
             runtime,
@@ -482,8 +474,16 @@ async def build_runtime_bundle(
             shared_tools=registry,
             connected_mcp_servers=lambda: frozenset(mcp_registry.connected_server_ids),
         )
+        proactive_loop = (
+            None
+            if outbound is None
+            else ProactiveLoop(
+                outbound=outbound,
+                service_factory=build_proactive_service,
+                drift=system_jobs,
+            )
+        )
         if outbound is not None and proactive_loop is not None:
-            proactive_loop._drift = system_jobs
             passive = PassiveTurnPipeline(
                 runtime,
                 repository=operational,
