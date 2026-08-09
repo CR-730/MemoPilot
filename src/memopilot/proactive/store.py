@@ -69,6 +69,33 @@ class ProactiveRepository:
     def __init__(self, database: Path) -> None:
         self._database = Path(database)
 
+    def list_source_events(
+        self, session_key: str, source_events: Sequence[tuple[str, str]]
+    ) -> tuple[StoredProactiveEvent, ...]:
+        found: list[StoredProactiveEvent] = []
+        with connect_database(self._database) as connection:
+            for source_id, event_id in source_events:
+                row = connection.execute(
+                    "SELECT reservoir_id, source_id, source_event_id, session_key, kind, "
+                    "occurred_at, "
+                    "payload_json FROM source_events WHERE session_key = ? AND source_id = ? "
+                    "AND source_event_id = ?",
+                    (session_key, source_id, event_id),
+                ).fetchone()
+                if row is not None:
+                    found.append(
+                        StoredProactiveEvent(
+                            reservoir_id=str(row[0]),
+                            source_id=str(row[1]),
+                            source_event_id=str(row[2]),
+                            session_key=str(row[3]),
+                            kind=str(row[4]),
+                            occurred_at=str(row[5]),
+                            payload=json.loads(str(row[6])),
+                        )
+                    )
+        return tuple(found)
+
     def commit_fetch(
         self,
         *,

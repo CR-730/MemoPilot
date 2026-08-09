@@ -174,6 +174,7 @@ async def test_one_tick_batches_all_alerts_in_one_agent_tick(tmp_path: Path) -> 
     outcome = await service.execute("job", SESSION, "chat-1", 1, NOW)
 
     assert outcome.action == "send"
+    assert outcome.evidence_ids == ("source:a1", "source:a2")
     assert engine.calls == ["alert:a1", "alert:a2"]
     assert engine.inputs[0].contents == ()
     assert engine.inputs[0].contexts == ()

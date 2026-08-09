@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha1
 from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
@@ -63,7 +64,8 @@ class VectorizationService:
         guard()
         with connect_database(self.operational_database) as connection:
             manifest = connection.execute(
-                "SELECT m.model_output_json, m.state, s.channel, s.chat_id "
+                "SELECT m.model_output_json, m.state, m.session_key, m.first_message_id, "
+                "m.last_message_id, s.channel, s.chat_id "
                 "FROM consolidation_manifests AS m "
                 "JOIN sessions AS s ON s.session_key = m.session_key "
                 "WHERE m.consolidation_id = ?",
@@ -108,6 +110,12 @@ class VectorizationService:
         scope_channel = str(manifest["channel"] or "")
         scope_chat_id = str(manifest["chat_id"] or "")
         try:
+            source_prefix = _consolidation_message_source_ref(
+                self.operational_database,
+                session_key=str(manifest["session_key"]),
+                first_message_id=str(manifest["first_message_id"]),
+                last_message_id=str(manifest["last_message_id"]),
+            )
             if (
                 self.implicit_extractor is not None
                 and not isinstance(implicit, list)
@@ -139,12 +147,12 @@ class VectorizationService:
                 finally:
                     connection.close()
                 entries.extend(implicit_entries)
-            for index, raw in enumerate(entries):
+            for raw in entries:
                 summary = str(raw.get("summary") or "").strip()
                 kind = str(raw.get("kind") or "event").strip()
                 if not summary or kind not in {"event", "profile", "preference", "procedure"}:
                     continue
-                source_ref = f"consolidation:{consolidation_id}#{index}"
+                source_ref = _entry_source_ref(source_prefix, summary)
                 with connect_database(self.store.database) as connection:
                     source = connection.execute(
                         "SELECT item_id FROM memory_sources WHERE source_ref = ?", (source_ref,)
@@ -184,6 +192,39 @@ class VectorizationService:
                     )
             raise
         return VectorizationResult(**counts)
+
+
+def _consolidation_message_source_ref(
+    database: Path,
+    *,
+    session_key: str,
+    first_message_id: str,
+    last_message_id: str,
+) -> str:
+    with connect_database(database) as connection:
+        boundaries = connection.execute(
+            "SELECT message_id, session_position FROM messages "
+            "WHERE session_key = ? AND message_id IN (?, ?)",
+            (session_key, first_message_id, last_message_id),
+        ).fetchall()
+        positions = {str(row["message_id"]): int(row["session_position"]) for row in boundaries}
+        if first_message_id not in positions or last_message_id not in positions:
+            raise RuntimeError("Consolidation 窗口边界消息无法解析")
+        if positions[first_message_id] > positions[last_message_id]:
+            raise RuntimeError("Consolidation 窗口边界顺序无效")
+        rows = connection.execute(
+            "SELECT message_id FROM messages WHERE session_key = ? "
+            "AND session_position BETWEEN ? AND ? ORDER BY session_position",
+            (session_key, positions[first_message_id], positions[last_message_id]),
+        ).fetchall()
+    if not rows:
+        raise RuntimeError("Consolidation 窗口为空")
+    return json.dumps([str(row["message_id"]) for row in rows], ensure_ascii=False)
+
+
+def _entry_source_ref(source_prefix: str, summary: str) -> str:
+    digest = sha1(summary.strip().encode("utf-8")).hexdigest()[:12]
+    return f"{source_prefix}#h:{digest}"
 
 
 def _event_entries(value: object, *, display_timezone: ZoneInfo) -> list[dict[str, object]]:

@@ -72,6 +72,30 @@ def test_history_skips_leading_assistant_until_user_boundary() -> None:
     ]
 
 
+def test_history_replays_proactive_message_as_single_assistant_message() -> None:
+    records = (
+        MessageRecord(
+            "a", "s", "assistant", "这几篇文章值得看", "t", 1, "now", metadata={
+                "proactive": True,
+                "state_summary_tag": "none",
+            }
+        ),
+    )
+
+    history = expand_history(records)
+
+    assert history == (ChatMessage.assistant(content="[主动推送] 这几篇文章值得看"),)
+
+
+def test_history_replays_full_proactive_message_without_meta_frame() -> None:
+    content = "主动正文" * 200
+    history = expand_history((
+        MessageRecord("a", "s", "assistant", content, "t", 1, "now", metadata={"proactive": True}),
+    ))
+
+    assert history == (ChatMessage.assistant(content=f"[主动推送] {content}"),)
+
+
 def test_tool_chain_does_not_pair_duplicate_call_ids_across_groups() -> None:
     call = FunctionCall("call-1", "tool", {})
     messages = (

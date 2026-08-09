@@ -138,7 +138,8 @@ def build_memorize_tool(memorizer: ExplicitMemorizer) -> Tool:
         context = current_memory_tool_context()
         channel = context.channel if context is not None else ""
         chat_id = context.chat_id if context is not None else ""
-        stable_source = source_ref.strip() or _explicit_source_ref(
+        context_source = context.source_ref if context is not None else ""
+        stable_source = source_ref.strip() or context_source or _explicit_source_ref(
             summary,
             memory_kind,
             channel,

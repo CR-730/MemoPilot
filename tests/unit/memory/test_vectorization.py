@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+from hashlib import sha1
 from pathlib import Path
 
 import pytest
 
+from memopilot.bus.events import InboundMessage
 from memopilot.memory.store import MemoryStore
 from memopilot.memory.vectorization import VectorizationService
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
+from memopilot.runtime.common_tools.common import OperationalMessageStoreAdapter
+from memopilot.runtime.common_tools.message_lookup import FetchMessagesTool
 
 
 class _Embedder:
@@ -38,6 +44,263 @@ class _ImplicitExtractor:
         ]
 
 
+def _insert_message_boundaries(
+    connection, session_key: str, first_message_id: str, last_message_id: str, now: str
+) -> None:
+    position = int(
+        connection.execute(
+            "SELECT COALESCE(MAX(session_position), 0) + 1 FROM messages WHERE session_key = ?",
+            (session_key,),
+        ).fetchone()[0]
+    )
+    connection.executemany(
+        "INSERT INTO messages(message_id, session_key, role, content, turn_id, turn_position, "
+        "created_at, session_position, media_json, tool_chain_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]')",
+        (
+            (
+                first_message_id,
+                session_key,
+                "user",
+                "原始用户消息",
+                first_message_id,
+                0,
+                now,
+                position,
+            ),
+            (
+                last_message_id,
+                session_key,
+                "assistant",
+                "原始助手回复",
+                last_message_id,
+                1,
+                now,
+                position + 1,
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_vectorized_memory_source_ref_fetches_its_consolidation_messages(
+    tmp_path: Path,
+) -> None:
+    operational = tmp_path / "operational.db"
+    memory = tmp_path / "memory2.db"
+    migrate_database(operational, DatabaseKind.OPERATIONAL)
+    migrate_database(memory, DatabaseKind.MEMORY)
+    repository = ConversationRepository(operational)
+    now = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    first = InboundMessage(
+        "feishu", "user", "chat-1", "第一条原文", now, metadata={"message_id": "event-1"}
+    )
+    second = InboundMessage(
+        "feishu", "user", "chat-1", "第二条原文", now, metadata={"message_id": "event-2"}
+    )
+    first_user_id = repository.predict_user_message_id(first)
+    repository.commit_turn(first, assistant_content="第一条回答")
+    second_commit = repository.commit_turn(second, assistant_content="第二条回答")
+    output = {"memories": [{"kind": "event", "summary": "用户给出了两条原文"}]}
+    with connect_database(operational) as connection:
+        connection.execute(
+            "INSERT INTO consolidation_manifests("
+            "consolidation_id, session_key, first_message_id, last_message_id, "
+            "artifact_hashes_json, model_output_json, state, attempts, created_at, updated_at, "
+            "committed_at, artifact_states_json, last_error"
+            ") VALUES (?, ?, ?, ?, '{}', ?, 'committed', 1, ?, ?, ?, '{}', NULL)",
+            (
+                "con-source",
+                first.session_key,
+                first_user_id,
+                second_commit.assistant_message_id,
+                json.dumps(output),
+                now.isoformat(),
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+    store = MemoryStore(memory, dimension=2, vector_enabled=False)
+    await VectorizationService(operational, store, _Embedder()).run("con-source")
+
+    item = store.search_keywords("两条原文", limit=1)[0]
+    source_ref = str(item["source_ref"])
+    assert source_ref.startswith("[") and "#h:" in source_ref
+    fetch = FetchMessagesTool(OperationalMessageStoreAdapter(repository))
+    payload = json.loads(await fetch.execute(source_ref=source_ref))
+    assert [message["content"] for message in payload["messages"]] == [
+        "第一条原文",
+        "第一条回答",
+        "第二条原文",
+        "第二条回答",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vectorization_source_refs_are_stable_across_entry_reordering(tmp_path: Path) -> None:
+    operational = tmp_path / "operational.db"
+    memory = tmp_path / "memory2.db"
+    migrate_database(operational, DatabaseKind.OPERATIONAL)
+    migrate_database(memory, DatabaseKind.MEMORY)
+    repository = ConversationRepository(operational)
+    now = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    message = InboundMessage(
+        "feishu", "user", "chat-1", "原文", now, metadata={"message_id": "event"}
+    )
+    first_id = repository.predict_user_message_id(message)
+    committed = repository.commit_turn(message, assistant_content="回答")
+    entries = [
+        {"kind": "event", "summary": "记忆 A"},
+        {"kind": "preference", "summary": "记忆 B"},
+    ]
+    with connect_database(operational) as connection:
+        for consolidation_id, memories in (
+            ("con-first", entries),
+            ("con-second", list(reversed(entries))),
+        ):
+            connection.execute(
+                "INSERT INTO consolidation_manifests("
+                "consolidation_id, session_key, first_message_id, last_message_id, "
+                "artifact_hashes_json, model_output_json, state, attempts, created_at, updated_at, "
+                "committed_at, artifact_states_json, last_error"
+                ") VALUES (?, ?, ?, ?, '{}', ?, 'committed', 1, ?, ?, ?, '{}', NULL)",
+                (
+                    consolidation_id,
+                    message.session_key,
+                    first_id,
+                    committed.assistant_message_id,
+                    json.dumps({"memories": memories}),
+                    now.isoformat(),
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+    store = MemoryStore(memory, dimension=2, vector_enabled=False)
+    service = VectorizationService(operational, store, _Embedder())
+    assert (await service.run("con-first")).created == 2
+    assert (await service.run("con-second")).unchanged == 2
+    assert {
+        str(item["source_ref"]).rsplit("#", 1)[-1]
+        for item in store.search_keywords("记忆", limit=2)
+    } == {f"h:{sha1(summary.encode()).hexdigest()[:12]}" for summary in ("记忆 A", "记忆 B")}
+
+
+@pytest.mark.asyncio
+async def test_vectorization_deduplicates_repeated_summary_in_one_window(tmp_path: Path) -> None:
+    operational = tmp_path / "operational.db"
+    memory = tmp_path / "memory2.db"
+    migrate_database(operational, DatabaseKind.OPERATIONAL)
+    migrate_database(memory, DatabaseKind.MEMORY)
+    repository = ConversationRepository(operational)
+    now = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    message = InboundMessage(
+        "feishu", "user", "chat-1", "原文", now, metadata={"message_id": "event"}
+    )
+    first_id = repository.predict_user_message_id(message)
+    committed = repository.commit_turn(message, assistant_content="回答")
+    with connect_database(operational) as connection:
+        connection.execute(
+            "INSERT INTO consolidation_manifests("
+            "consolidation_id, session_key, first_message_id, last_message_id, "
+            "artifact_hashes_json, model_output_json, state, attempts, created_at, updated_at, "
+            "committed_at, artifact_states_json, last_error"
+            ") VALUES (?, ?, ?, ?, '{}', ?, 'committed', 1, ?, ?, ?, '{}', NULL)",
+            (
+                "con-duplicate",
+                message.session_key,
+                first_id,
+                committed.assistant_message_id,
+                json.dumps({"memories": [{"kind": "event", "summary": "重复记忆"}] * 2}),
+                now.isoformat(),
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+    result = await VectorizationService(
+        operational, MemoryStore(memory, dimension=2, vector_enabled=False), _Embedder()
+    ).run("con-duplicate")
+    assert (result.created, result.unchanged) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_vectorization_fails_when_manifest_message_boundaries_are_unresolvable(
+    tmp_path: Path,
+) -> None:
+    operational = tmp_path / "operational.db"
+    memory = tmp_path / "memory2.db"
+    migrate_database(operational, DatabaseKind.OPERATIONAL)
+    migrate_database(memory, DatabaseKind.MEMORY)
+    now = "2026-07-14T12:00:00+00:00"
+    insert_manifest = (
+        "INSERT INTO consolidation_manifests("
+        "consolidation_id, session_key, first_message_id, last_message_id, "
+        "artifact_hashes_json, model_output_json, state, attempts, created_at, "
+        "updated_at, committed_at, artifact_states_json, last_error"
+        ") VALUES ('con-invalid', 'feishu:chat-1', 'missing-first', "
+        "'missing-last', '{}', ?, 'committed', 1, ?, ?, ?, '{}', NULL)"
+    )
+    with connect_database(operational) as connection:
+        connection.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, 0)",
+            ("feishu:chat-1", "feishu", "chat-1", now, now),
+        )
+        connection.execute(
+            insert_manifest,
+            (json.dumps({"memories": [{"kind": "event", "summary": "不应写入"}]}), now, now, now),
+        )
+    with pytest.raises(RuntimeError, match="窗口边界"):
+        await VectorizationService(
+            operational, MemoryStore(memory, dimension=2, vector_enabled=False), _Embedder()
+        ).run("con-invalid")
+    with connect_database(memory) as connection:
+        assert (
+            connection.execute(
+                "SELECT state FROM memory_ingestion_batches "
+                "WHERE batch_id = 'vectorize:con-invalid'"
+            ).fetchone()[0]
+            == "failed"
+        )
+
+
+@pytest.mark.asyncio
+async def test_vectorization_fails_when_manifest_message_boundaries_are_reversed(
+    tmp_path: Path,
+) -> None:
+    operational = tmp_path / "operational.db"
+    memory = tmp_path / "memory2.db"
+    migrate_database(operational, DatabaseKind.OPERATIONAL)
+    migrate_database(memory, DatabaseKind.MEMORY)
+    repository = ConversationRepository(operational)
+    now = datetime(2026, 7, 14, 12, tzinfo=UTC)
+    message = InboundMessage(
+        "feishu", "user", "chat-1", "原文", now, metadata={"message_id": "event"}
+    )
+    first_id = repository.predict_user_message_id(message)
+    committed = repository.commit_turn(message, assistant_content="回答")
+    with connect_database(operational) as connection:
+        connection.execute(
+            "INSERT INTO consolidation_manifests("
+            "consolidation_id, session_key, first_message_id, last_message_id, "
+            "artifact_hashes_json, model_output_json, state, attempts, created_at, updated_at, "
+            "committed_at, artifact_states_json, last_error"
+            ") VALUES (?, ?, ?, ?, '{}', ?, 'committed', 1, ?, ?, ?, '{}', NULL)",
+            (
+                "con-reversed",
+                message.session_key,
+                committed.assistant_message_id,
+                first_id,
+                json.dumps({"memories": [{"kind": "event", "summary": "不应写入"}]}),
+                now.isoformat(),
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+    with pytest.raises(RuntimeError, match="顺序无效"):
+        await VectorizationService(
+            operational, MemoryStore(memory, dimension=2, vector_enabled=False), _Embedder()
+        ).run("con-reversed")
+
+
 @pytest.mark.asyncio
 async def test_implicit_extraction_failure_keeps_markdown_commit_and_is_retryable(
     tmp_path: Path,
@@ -63,6 +326,7 @@ async def test_implicit_extraction_failure_keeps_markdown_commit_and_is_retryabl
             "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, 0)",
             ("feishu:chat-1", "feishu", "chat-1", now, now),
         )
+        _insert_message_boundaries(connection, "feishu:chat-1", "m1", "m2", now)
         connection.execute(
             "INSERT INTO consolidation_manifests("
             "consolidation_id, session_key, first_message_id, last_message_id, "
@@ -83,13 +347,19 @@ async def test_implicit_extraction_failure_keeps_markdown_commit_and_is_retryabl
         ).run("con-split")
 
     with connect_database(operational) as connection:
-        assert connection.execute(
-            "SELECT state FROM consolidation_manifests WHERE consolidation_id = 'con-split'"
-        ).fetchone()[0] == "committed"
+        assert (
+            connection.execute(
+                "SELECT state FROM consolidation_manifests WHERE consolidation_id = 'con-split'"
+            ).fetchone()[0]
+            == "committed"
+        )
     with connect_database(memory) as connection:
-        assert connection.execute(
-            "SELECT state FROM memory_ingestion_batches WHERE batch_id = 'vectorize:con-split'"
-        ).fetchone()[0] == "failed"
+        assert (
+            connection.execute(
+                "SELECT state FROM memory_ingestion_batches WHERE batch_id = 'vectorize:con-split'"
+            ).fetchone()[0]
+            == "failed"
+        )
 
     succeeding = _ImplicitExtractor()
     result = await VectorizationService(
@@ -126,6 +396,7 @@ async def test_vectorization_is_resumable_and_reinforces_exact_duplicate(tmp_pat
             "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, 0)",
             ("feishu:chat-1", "feishu", "chat-1", now, now),
         )
+        _insert_message_boundaries(connection, "feishu:chat-1", "m1", "m2", now)
         connection.execute(
             "INSERT INTO consolidation_manifests("
             "consolidation_id, session_key, first_message_id, last_message_id, "
@@ -148,6 +419,7 @@ async def test_vectorization_is_resumable_and_reinforces_exact_duplicate(tmp_pat
     # 同一事实来自新的 consolidation 时，不复制条目，而是强化原条目。
     output["memories"] = [{"kind": "preference", "summary": "用户偏好中文提交。"}]
     with connect_database(operational) as connection:
+        _insert_message_boundaries(connection, "feishu:chat-1", "m3", "m4", now)
         connection.execute(
             "INSERT INTO consolidation_manifests("
             "consolidation_id, session_key, first_message_id, last_message_id, "
@@ -171,6 +443,7 @@ async def test_vectorization_is_resumable_and_reinforces_exact_duplicate(tmp_pat
         }
     ]
     with connect_database(operational) as connection:
+        _insert_message_boundaries(connection, "feishu:chat-1", "m5", "m6", now)
         connection.execute(
             "INSERT INTO consolidation_manifests("
             "consolidation_id, session_key, first_message_id, last_message_id, "
@@ -204,6 +477,12 @@ async def test_vectorization_supersedes_highly_similar_preference_without_explic
         connection.execute(
             "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, 0)",
             ("feishu:chat-1", "feishu", "chat-1", now, now),
+        )
+        _insert_message_boundaries(
+            connection, "feishu:chat-1", "con-old-first", "con-old-last", now
+        )
+        _insert_message_boundaries(
+            connection, "feishu:chat-1", "con-new-first", "con-new-last", now
         )
         for consolidation_id, summary in (
             ("con-old", "用户希望每次都优先采用原型实现"),
@@ -266,6 +545,12 @@ async def test_vectorization_requires_stronger_evidence_to_supersede_emotional_p
         connection.execute(
             "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, 0)",
             ("feishu:chat-1", "feishu", "chat-1", now, now),
+        )
+        _insert_message_boundaries(
+            connection, "feishu:chat-1", "con-old-first", "con-old-last", now
+        )
+        _insert_message_boundaries(
+            connection, "feishu:chat-1", "con-new-first", "con-new-last", now
         )
         for consolidation_id, memory_item in (
             (
@@ -359,6 +644,8 @@ async def test_vectorization_merges_same_tool_procedure_and_deduplicates_recent_
             "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, 0)",
             ("feishu:chat-1", "feishu", "chat-1", now, now),
         )
+        for index in range(1, 5):
+            _insert_message_boundaries(connection, "feishu:chat-1", f"m{index}a", f"m{index}b", now)
         for index, (consolidation_id, item) in enumerate(outputs.items(), 1):
             connection.execute(
                 "INSERT INTO consolidation_manifests("

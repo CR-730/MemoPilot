@@ -61,7 +61,11 @@ def expand_history(records: Iterable[MessageRecord]) -> tuple[ChatMessage, ...]:
     history: list[ChatMessage] = []
     records = tuple(records)
     start = next(
-        (index for index, record in enumerate(records) if record.role == "user"),
+        (
+            index
+            for index, record in enumerate(records)
+            if record.role == "user" or record.metadata.get("proactive")
+        ),
         len(records),
     )
     for record in records[start:]:
@@ -69,6 +73,10 @@ def expand_history(records: Iterable[MessageRecord]) -> tuple[ChatMessage, ...]:
             history.append(ChatMessage.user(record.content))
             continue
         if record.role != "assistant":
+            continue
+        if record.metadata.get("proactive"):
+            content = f"[主动推送] {record.content}" if record.content else "[主动推送]"
+            history.append(ChatMessage.assistant(content=content))
             continue
         for group in record.tool_chain:
             calls = group.get("calls")

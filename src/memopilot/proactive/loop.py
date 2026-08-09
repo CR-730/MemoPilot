@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
 
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.proactive.service import ProactiveOutcome
 from memopilot.runtime.outbound import DeliveryError, OutboundDispatch, OutboundPort
 from memopilot.tasks.agent_task import AgentTask
@@ -53,10 +54,12 @@ class ProactiveLoop:
         service_factory: ProactiveServiceFactory,
         outbound: OutboundPort,
         drift: DriftTaskRunner,
+        conversation: ConversationRepository | None = None,
     ) -> None:
         self._service_factory = service_factory
         self._outbound = outbound
         self._drift = drift
+        self._conversation = conversation
 
     async def execute_task(
         self,
@@ -105,6 +108,22 @@ class ProactiveLoop:
             )
         )
         if sent:
+            if self._conversation is not None:
+                self._conversation.commit_direct_assistant(
+                    session_key=session_key,
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=outcome.message,
+                    media=(),
+                    timestamp=now,
+                    source_ref=f"proactive:{outcome.decision_id}",
+                    metadata={
+                        "proactive": True,
+                        "tools_used": ["message_push"],
+                        "evidence_item_ids": list(outcome.evidence_ids),
+                        "state_summary_tag": "none",
+                    },
+                )
             service.finalize_confirmed(outcome, confirmed_at=now)
             return ()
         raise DeliveryError("主动消息未明确发送成功")

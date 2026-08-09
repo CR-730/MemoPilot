@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -59,6 +59,7 @@ class MessageRecord:
     session_position: int
     created_at: str
     tool_chain: tuple[dict[str, object], ...] = ()
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,23 +172,17 @@ class ConversationRepository:
         self,
         message: TurnMessage,
         *,
-        assistant_content: str | None = None,
+        assistant_content: str,
         assistant_media: tuple[str, ...] = (),
         assistant_tool_chain: tuple[dict[str, object], ...] = (),
-    ) -> TurnCommitResult | None:
+    ) -> TurnCommitResult:
         content = message.content
-        if not content.strip() or (
-            assistant_content is not None and not assistant_content.strip()
-        ):
+        if not content.strip() or not assistant_content.strip():
             raise ValueError("Turn 必须提供完整的会话与消息字段")
         timestamp = message.timestamp
-        metadata = message.metadata
         now_text = _utc_iso(timestamp)
         session_key = message.session_key
-        turn_id = _stable_id(
-            "turn",
-            str(metadata.get("message_id") or f"{session_key}:{now_text}"),
-        )
+        turn_id = self._turn_id(message)
         user_id = _stable_id("message", f"{turn_id}:user")
         assistant_id = _stable_id("message", f"{turn_id}:assistant")
         connection = self._connect()
@@ -207,16 +202,15 @@ class ConversationRepository:
             ).fetchall()
             inserted = not existing
             if existing:
-                if (
-                    len(existing) != 2
-                    or (str(existing[0]["role"]), str(existing[0]["content"]))
-                    != ("user", content)
-                ):
+                if len(existing) != 2 or (
+                    str(existing[0]["role"]),
+                    str(existing[0]["content"]),
+                ) != ("user", content):
                     raise ValueError("重复 Turn 的用户消息内容不一致")
                 persisted_assistant = str(existing[1]["content"])
                 persisted_media = _parse_media_json(existing[1]["media_json"])
                 persisted_tool_chain = _parse_tool_chain_json(existing[1]["tool_chain_json"])
-                if assistant_content is not None and (
+                if (
                     str(existing[1]["role"]),
                     persisted_assistant,
                 ) != (
@@ -224,17 +218,10 @@ class ConversationRepository:
                     assistant_content,
                 ):
                     raise ValueError("重复 Turn 的助手消息内容不一致")
-                if (
-                    assistant_content is not None
-                    and assistant_media
-                    and persisted_media != assistant_media
-                ):
+                if assistant_media and persisted_media != assistant_media:
                     raise ValueError("重复 Turn 的媒体结果不一致")
                 if assistant_tool_chain and persisted_tool_chain != assistant_tool_chain:
                     raise ValueError("重复 Turn 的工具调用链不一致")
-            elif assistant_content is None:
-                connection.execute("COMMIT")
-                return None
             else:
                 persisted_assistant = assistant_content
                 persisted_media = assistant_media
@@ -297,6 +284,151 @@ class ConversationRepository:
             assistant_id,
         )
 
+    def predict_user_message_id(self, message: TurnMessage) -> str:
+        return _stable_id("message", f"{self._turn_id(message)}:user")
+
+    @staticmethod
+    def _turn_id(message: TurnMessage) -> str:
+        timestamp = _utc_iso(message.timestamp)
+        identity = str(message.metadata.get("message_id") or f"{message.session_key}:{timestamp}")
+        return _stable_id("turn", identity)
+
+    def commit_direct_assistant(
+        self,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        content: str,
+        media: tuple[str, ...],
+        timestamp: datetime,
+        source_ref: str = "",
+        metadata: Mapping[str, object] | None = None,
+    ) -> TurnCommitResult:
+        if not content.strip():
+            raise ValueError("direct assistant content is required")
+        now_text = _utc_iso(timestamp)
+        turn_id = _stable_id("direct", source_ref or f"{session_key}:{now_text}")
+        assistant_id = _stable_id("message", f"{turn_id}:assistant")
+        connection = self._connect()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._upsert_session(
+                connection,
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                now_text=now_text,
+            )
+            existing = connection.execute(
+                "SELECT session_key, role, content, media_json, metadata_json, message_id "
+                "FROM messages WHERE turn_id = ? AND turn_position = 0",
+                (turn_id,),
+            ).fetchone()
+            if existing is not None:
+                persisted_media = _parse_media_json(existing["media_json"])
+                persisted_metadata = _parse_metadata_json(existing["metadata_json"])
+                if (
+                    str(existing["session_key"]),
+                    str(existing["role"]),
+                    str(existing["content"]),
+                    persisted_media,
+                    persisted_metadata,
+                ) != (
+                    session_key,
+                    "assistant",
+                    content,
+                    media,
+                    dict(metadata or {}),
+                ):
+                    raise ValueError("direct assistant replay content is inconsistent")
+                connection.execute("COMMIT")
+                return TurnCommitResult(
+                    content, media, (), False, turn_id, str(existing["message_id"])
+                )
+            position = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(session_position), 0) + 1 "
+                    "FROM messages WHERE session_key = ?",
+                    (session_key,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "INSERT INTO messages(message_id, session_key, role, content, turn_id, "
+                "turn_position, created_at, session_position, media_json, tool_chain_json, "
+                "metadata_json) "
+                "VALUES (?, ?, 'assistant', ?, ?, 0, ?, ?, ?, '[]', ?)",
+                (
+                    assistant_id,
+                    session_key,
+                    content,
+                    turn_id,
+                    now_text,
+                    position,
+                    json.dumps(media, ensure_ascii=False),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            connection.execute("COMMIT")
+            return TurnCommitResult(content, media, (), True, turn_id, assistant_id)
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def find_direct_assistant(
+        self, *, session_key: str, timestamp: datetime, source_ref: str = ""
+    ) -> TurnCommitResult | None:
+        turn_id = _stable_id("direct", source_ref or f"{session_key}:{_utc_iso(timestamp)}")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT content, media_json, message_id FROM messages "
+                "WHERE turn_id = ? AND role = 'assistant'",
+                (turn_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return TurnCommitResult(
+            str(row["content"]),
+            _parse_media_json(row["media_json"]),
+            (),
+            False,
+            turn_id,
+            str(row["message_id"]),
+        )
+
+    def find_committed_turn(self, message: TurnMessage) -> TurnCommitResult | None:
+        """只读查询完整且可重放的已提交 Turn。"""
+        now_text = _utc_iso(message.timestamp)
+        turn_id = _stable_id(
+            "turn",
+            str(message.metadata.get("message_id") or f"{message.session_key}:{now_text}"),
+        )
+        assistant_id = _stable_id("message", f"{turn_id}:assistant")
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT role, content, media_json, tool_chain_json FROM messages "
+                "WHERE turn_id = ? ORDER BY turn_position",
+                (turn_id,),
+            ).fetchall()
+        if not existing:
+            return None
+        if (
+            len(existing) != 2
+            or (str(existing[0]["role"]), str(existing[0]["content"])) != ("user", message.content)
+            or str(existing[1]["role"]) != "assistant"
+        ):
+            raise ValueError("重复 Turn 的用户消息内容不一致")
+        return TurnCommitResult(
+            str(existing[1]["content"]),
+            _parse_media_json(existing[1]["media_json"]),
+            _parse_tool_chain_json(existing[1]["tool_chain_json"]),
+            False,
+            turn_id,
+            assistant_id,
+        )
+
     def list_recent_messages(
         self,
         session_key: str,
@@ -311,10 +443,10 @@ class ConversationRepository:
             rows = connection.execute(
                 """
                 SELECT message_id, session_key, role, content, turn_id,
-                       session_position, created_at, tool_chain_json
+                       session_position, created_at, tool_chain_json, metadata_json
                 FROM (
                     SELECT message_id, session_key, role, content, turn_id,
-                           session_position, created_at, tool_chain_json
+                           session_position, created_at, tool_chain_json, metadata_json
                     FROM messages
                     WHERE session_key = ? AND session_position IS NOT NULL
                       AND (? IS NULL OR julianday(created_at) <= julianday(?))
@@ -335,6 +467,7 @@ class ConversationRepository:
                 int(row["session_position"]),
                 str(row["created_at"]),
                 _parse_tool_chain_json(row["tool_chain_json"]),
+                _parse_metadata_json(row["metadata_json"]),
             )
             for row in rows
         )
@@ -345,15 +478,10 @@ class ConversationRepository:
     ) -> tuple[int, int, int, str]:
         with self._connect() as connection:
             session = connection.execute(
-                "SELECT last_consolidated_position FROM sessions "
-                "WHERE session_key = ?",
+                "SELECT last_consolidated_position FROM sessions WHERE session_key = ?",
                 (session_key,),
             ).fetchone()
-            last_position = (
-                int(session["last_consolidated_position"])
-                if session is not None
-                else 0
-            )
+            last_position = int(session["last_consolidated_position"]) if session is not None else 0
             totals = connection.execute(
                 """
                 SELECT COUNT(*) AS total_messages,
@@ -406,8 +534,7 @@ class ConversationRepository:
                 (session_key,),
             ).fetchone()
             session = connection.execute(
-                "SELECT last_consolidated_position FROM sessions "
-                "WHERE session_key = ?",
+                "SELECT last_consolidated_position FROM sessions WHERE session_key = ?",
                 (session_key,),
             ).fetchone()
             if target is None or session is None:
@@ -422,8 +549,7 @@ class ConversationRepository:
                 raise RuntimeError("无法解析私聊会话目标")
             remaining = int(
                 connection.execute(
-                    "SELECT COALESCE(MAX(session_position), 0) FROM messages "
-                    "WHERE session_key = ?",
+                    "SELECT COALESCE(MAX(session_position), 0) FROM messages WHERE session_key = ?",
                     (session_key,),
                 ).fetchone()[0]
             )
@@ -626,6 +752,16 @@ def _parse_tool_chain_json(value: object) -> tuple[dict[str, object], ...]:
     if not isinstance(decoded, list) or any(not isinstance(item, dict) for item in decoded):
         raise ValueError("消息 tool_chain_json 必须是数组")
     return tuple(decoded)
+
+
+def _parse_metadata_json(value: object) -> dict[str, object]:
+    try:
+        decoded = json.loads(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("message metadata_json is not valid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("message metadata_json must be an object")
+    return decoded
 
 
 __all__ = [

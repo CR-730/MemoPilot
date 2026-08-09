@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from datetime import UTC, datetime
 
+from memopilot.bus.events import InboundMessage
 from memopilot.memory.contracts import MemoryQueryResult, MemoryRecord
 from memopilot.memory.store import MemoryStore
 from memopilot.memory.tool_context import bind_memory_tool_context, reset_memory_tool_context
@@ -11,6 +12,7 @@ from memopilot.memory.tools import (
     build_memorize_tool,
     build_recall_memory_tool,
 )
+from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.contracts import FunctionCall
 from memopilot.runtime.tools import ToolRegistry
@@ -134,6 +136,32 @@ async def test_memorize_tool_routes_explicit_memory_through_shared_writer() -> N
     assert memorizer.calls[0]["source_ref"].startswith("explicit:")
     assert callable(memorizer.calls[0]["assert_current"])
     assert memorizer.calls[0]["fenced_write"] is nullcontext
+
+
+async def test_memorize_uses_the_message_id_that_commit_turn_will_persist(tmp_path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    repository = ConversationRepository(database)
+    message = InboundMessage(
+        "feishu", "user", "chat-1", "记住这个偏好",
+        timestamp=datetime(2026, 7, 21, tzinfo=UTC), metadata={"message_id": "event-1"},
+    )
+    source_ref = repository.predict_user_message_id(message)
+    memorizer = _Memorizer()
+    registry = ToolRegistry([build_memorize_tool(memorizer)])  # type: ignore[arg-type]
+    token = bind_memory_tool_context(message.session_key, source_ref=source_ref)
+    try:
+        observation = await registry.execute(
+            FunctionCall("call-memorize", "memorize", {"summary": "用户偏好中文"})
+        )
+    finally:
+        reset_memory_tool_context(token)
+
+    repository.commit_turn(message, assistant_content="已记住")
+    assert observation.ok is True
+    assert memorizer.calls[0]["source_ref"] == source_ref
+    records = repository.list_recent_messages(message.session_key, limit=2)
+    assert source_ref == next(record.message_id for record in records if record.role == "user")
 
 
 async def test_recall_memory_tool_parses_timeline_boundaries() -> None:
