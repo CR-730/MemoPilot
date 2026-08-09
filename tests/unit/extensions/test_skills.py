@@ -260,7 +260,9 @@ metadata: '{"skill":{"requires":{"env":["DEPLOY_TOKEN"]}}}'
 
     assert "# Skills Catalog" in rendered
     assert "review | 代码审查 | workspace | available" in rendered
+    assert f"<location>{mentioned / 'SKILL.md'}</location>" in rendered
     assert "deploy | 部署服务 | workspace | unavailable: ENV: DEPLOY_TOKEN" in rendered
+    assert f"<location>{unavailable / 'SKILL.md'}</location>" in rendered
     assert "先 `read_file` 读取 `<location>` 中的完整 SKILL.md" in rendered
     assert rendered.count("# Skill: always") == 1
     assert rendered.count("# Skill: review") == 1

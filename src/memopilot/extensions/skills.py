@@ -203,9 +203,10 @@ class SkillCatalog:
             )
             if missing:
                 availability = "unavailable: " + ", ".join(missing)
-            lines.append(
-                f"- {skill.name} | {skill.description} | {skill.source} | {availability}"
-            )
+            line = f"- {skill.name} | {skill.description} | {skill.source} | {availability}"
+            if skill.path is not None:
+                line += f" | <location>{skill.path}</location>"
+            lines.append(line)
         return build_skills_catalog_prompt("\n".join(lines))
 
     def render(self, names: tuple[str, ...], *, max_chars: int) -> str:

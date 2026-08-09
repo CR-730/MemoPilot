@@ -33,7 +33,6 @@ from memopilot.extensions.plugin_registry import (
     plugin_registry,
 )
 from memopilot.extensions.plugins import PluginDiagnostic
-from memopilot.extensions.prompts import PromptBlock
 from memopilot.runtime.phases import (
     LifecyclePhase,
     PhaseContext,
@@ -171,8 +170,6 @@ class PluginManager:
         self._loaded: list[_LoadedPlugin] = []
         self._tool_hooks: list[ToolHook] = []
         self._phase_modules: list[PhaseModule] = []
-        self._prompt_blocks: list[PromptBlock] = []
-        self._prompt_render_modules: list[object] = []
         self.diagnostics: list[PluginDiagnostic] = []
 
     @property
@@ -190,14 +187,6 @@ class PluginManager:
     @property
     def phase_modules(self) -> tuple[PhaseModule, ...]:
         return tuple(self._phase_modules)
-
-    @property
-    def prompt_blocks(self) -> tuple[PromptBlock, ...]:
-        return tuple(self._prompt_blocks)
-
-    @property
-    def prompt_render_modules(self) -> tuple[object, ...]:
-        return tuple(self._prompt_render_modules)
 
     def get_plugin(self, plugin_id: str) -> Any | None:
         return next(
@@ -286,11 +275,9 @@ class PluginManager:
         tool_names = self._register_tools(instance, module_path)
         hook_count_before = len(self._tool_hooks)
         phase_count_before = len(self._phase_modules)
-        prompt_block_count_before = len(self._prompt_blocks)
-        prompt_render_count_before = len(self._prompt_render_modules)
-        self._bind_tool_hooks(instance, module_path)
-        self._collect_modules(instance)
         try:
+            self._bind_tool_hooks(instance, module_path)
+            self._collect_modules(instance)
             await instance.initialize()
         except Exception as exc:
             plugin_registry.remove_plugin(module_path)
@@ -298,8 +285,6 @@ class PluginManager:
                 self._tool_registry.unregister(tool_name)
             del self._tool_hooks[hook_count_before:]
             del self._phase_modules[phase_count_before:]
-            del self._prompt_blocks[prompt_block_count_before:]
-            del self._prompt_render_modules[prompt_render_count_before:]
             self.diagnostics.append(
                 PluginDiagnostic(
                     name,
@@ -330,8 +315,6 @@ class PluginManager:
         self._loaded.clear()
         self._tool_hooks.clear()
         self._phase_modules.clear()
-        self._prompt_blocks.clear()
-        self._prompt_render_modules.clear()
 
     terminate_all = unload_all
 
@@ -373,12 +356,7 @@ class PluginManager:
     def _collect_modules(self, instance: Any) -> None:
         for method in _MODULE_METHODS:
             values = _load_module_list(instance, method)
-            if method == "prompt_render_modules":
-                self._prompt_render_modules.extend(values)
             for index, value in enumerate(values):
-                if method == "prompt_render_modules" and isinstance(value, PromptBlock):
-                    self._prompt_blocks.append(value)
-                    continue
                 self._phase_modules.append(
                     _adapt_phase_module(
                         value,

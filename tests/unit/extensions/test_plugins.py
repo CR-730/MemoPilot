@@ -234,9 +234,6 @@ class Broken(Plugin):
             )
         ]
 
-    def prompt_render_modules(self):
-        return [PromptBlock("broken.prompt", "never")]
-
     async def initialize(self):
         raise RuntimeError("boom")
 
@@ -255,12 +252,38 @@ class Broken(Plugin):
     assert tools.tool_names == ()
     assert manager.tool_hooks == ()
     assert manager.phase_modules == ()
-    assert manager.prompt_blocks == ()
     assert await event_bus.emit("before_turn", {}) == {"broken_seen": True}
     assert module_path in sys.modules
     state_files = list((tmp_path / ".memopilot" / "plugin_state").glob("*.json"))
     assert state_files == []
     assert manager.diagnostics[0].code == "initialization_failed"
+
+
+@pytest.mark.asyncio
+async def test_prompt_block_is_rejected_as_an_invalid_prompt_render_module(
+    tmp_path: Path,
+) -> None:
+    _write_class_plugin(
+        tmp_path,
+        "legacy_prompt",
+        '''
+from memopilot.extensions.plugin_base import Plugin
+from memopilot.extensions.prompts import PromptBlock
+
+class LegacyPrompt(Plugin):
+    def prompt_render_modules(self):
+        return [PromptBlock("legacy.prompt", "不应走独立提示词路径")]
+''',
+    )
+    manager = PluginManager([tmp_path], tool_registry=ToolRegistry())
+
+    await manager.load_all()
+
+    assert manager.loaded_plugin_ids == ()
+    assert manager.phase_modules == ()
+    assert [(item.plugin_id, item.code) for item in manager.diagnostics] == [
+        ("legacy_prompt", "initialization_failed")
+    ]
 
 
 def test_plugin_subclass_and_decorators_register_against_its_module() -> None:

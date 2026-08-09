@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,7 +20,9 @@ from memopilot.runtime.contracts import (
     ModelResponse,
     ToolSchema,
 )
-from memopilot.runtime.engine import AgentRuntime, TurnInput
+from memopilot.runtime.engine import DefaultReasoner, TurnInput
+from memopilot.runtime.passive_turn import PassiveTurnPipeline
+from memopilot.runtime.phases import LifecyclePhase
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tools import Tool, ToolRegistry
 
@@ -27,6 +30,43 @@ _BUILTIN_ROOT = Path(__file__).parents[3] / "src" / "memopilot" / "builtin_plugi
 _STATUS_DIR = _BUILTIN_ROOT / "status_commands"
 _OBSERVE_DIR = _BUILTIN_ROOT / "observe"
 _NOW = datetime(2026, 7, 29, 1, 2, tzinfo=UTC)
+
+
+class _NoopOutbound:
+    async def dispatch(self, dispatch):
+        del dispatch
+        return True
+
+
+async def run_through_passive_pipeline(
+    reasoner: DefaultReasoner, turn: TurnInput, **kwargs: object
+):
+    with tempfile.TemporaryDirectory() as directory:
+        database = Path(directory) / "operational.db"
+        migrate_database(database, DatabaseKind.OPERATIONAL)
+        pipeline = PassiveTurnPipeline(
+            reasoner,
+            repository=ConversationRepository(database),
+            outbound=_NoopOutbound(),
+            event_bus=reasoner._event_bus or EventBus(),
+            history_limit=50,
+            after_turn_modules=tuple(
+                module
+                for module in getattr(reasoner, "_test_outer_modules", ())
+                if module.phase is LifecyclePhase.AFTER_TURN
+            ),
+            outer_modules=tuple(
+                module
+                for module in getattr(reasoner, "_test_outer_modules", ())
+                if module.phase
+                in {
+                    LifecyclePhase.BEFORE_TURN,
+                    LifecyclePhase.BEFORE_REASONING,
+                    LifecyclePhase.AFTER_REASONING,
+                }
+            ),
+        )
+        return await pipeline.execute_direct(turn, **kwargs)
 
 
 class _Provider(ChatProvider):
@@ -89,18 +129,22 @@ async def test_memory_status_short_circuits_provider_and_reads_repository(
     _commit_turn(repository, 2, "第二个问题", "第二个回答")
     with connect_database(database) as connection:
         connection.execute(
-            "UPDATE sessions SET last_consolidated_position = 2 "
-            "WHERE session_key = 'cli:chat'"
+            "UPDATE sessions SET last_consolidated_position = 2 WHERE session_key = 'cli:chat'"
         )
         connection.commit()
     manager = await _load_status(tmp_path, repository)
     provider = _Provider()
 
-    result = await AgentRuntime(
+    runtime = DefaultReasoner(
         provider,
         ToolRegistry(),
         modules=manager.phase_modules,
-    ).run(TurnInput("cli:chat", "/memorystatus"))
+    )
+    runtime._test_outer_modules = manager.phase_modules  # type: ignore[attr-defined]
+    result = await run_through_passive_pipeline(
+        runtime,
+        TurnInput("cli:chat", "/memorystatus"),
+    )
 
     assert provider.calls == 0
     assert result.react.exit_reason == "before_turn_abort"
@@ -147,7 +191,9 @@ async def test_real_cache_usage_is_aggregated_observed_and_displayed(
             )
         ]
     )
-    turn = await AgentRuntime(provider, tools).run(TurnInput("cli:chat", "执行"))
+    turn = await run_through_passive_pipeline(
+        DefaultReasoner(provider, tools), TurnInput("cli:chat", "执行")
+    )
     assert turn.react.prompt_tokens == 150
     assert turn.react.prompt_cache_hit_tokens == 120
 
@@ -179,11 +225,16 @@ async def test_real_cache_usage_is_aggregated_observed_and_displayed(
     repository = ConversationRepository(database)
     status = await _load_status(tmp_path, repository)
     blocked_provider = _Provider()
-    result = await AgentRuntime(
+    runtime = DefaultReasoner(
         blocked_provider,
         ToolRegistry(),
         modules=status.phase_modules,
-    ).run(TurnInput("cli:chat", "/kvcache 5"))
+    )
+    runtime._test_outer_modules = status.phase_modules  # type: ignore[attr-defined]
+    result = await run_through_passive_pipeline(
+        runtime,
+        TurnInput("cli:chat", "/kvcache 5"),
+    )
 
     assert blocked_provider.calls == 0
     assert "命中率  80.0%" in result.reply

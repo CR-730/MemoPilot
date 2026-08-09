@@ -76,14 +76,16 @@ from memopilot.proactive.loop import ProactiveLoop
 from memopilot.proactive.mcp_sources import ProactiveSourceGateway, load_proactive_sources
 from memopilot.proactive.service import ProactiveService
 from memopilot.proactive.store import ProactiveRepository
+from memopilot.runtime.agent_core import AgentCore
 from memopilot.runtime.agent_loop import AgentLoop
 from memopilot.runtime.common_tools import register_common_tools
 from memopilot.runtime.common_tools.http import SharedHttpResources
 from memopilot.runtime.common_tools.message_push import MessagePushTool
 from memopilot.runtime.common_tools.vision import build_read_image_vision_tool
-from memopilot.runtime.engine import AgentRuntime
+from memopilot.runtime.engine import DefaultReasoner
 from memopilot.runtime.outbound import OutboundPort, PushToolOutboundPort
 from memopilot.runtime.passive_turn import PassiveTurnPipeline
+from memopilot.runtime.phases import LifecyclePhase
 from memopilot.runtime.providers import ChatProvider, OpenAICompatibleProvider, VisionProvider
 from memopilot.runtime.react import ReActProgressObserver
 from memopilot.runtime.session import OperationalSessionManager
@@ -119,7 +121,8 @@ class RuntimeBundle:
     memory_engine: LayeredMemoryEngine
     memory_tasks: MemoryService
     scheduler_service: SchedulerService
-    runtime: AgentRuntime
+    runtime: DefaultReasoner
+    agent_core: AgentCore | None
     task_dispatcher: TaskDispatcher | None
     skills: SkillCatalog
     event_bus: EventBus
@@ -353,15 +356,18 @@ async def build_runtime_bundle(
         registry.register(build_memorize_tool(memorizer), always_on=True)
         registry.register(build_forget_memory_tool(store), always_on=True)
         refresh_skill_availability()
-        runtime = AgentRuntime(
+        runtime = DefaultReasoner(
             provider,
             registry,
             tool_executor=tool_executor,
             max_iterations=settings.llm_max_iterations,
             memory_engine=memory_engine,
             memory_profile=markdown,
-            modules=manager.phase_modules,
-            prompt_blocks=manager.prompt_blocks,
+            modules=tuple(
+                module
+                for module in manager.phase_modules
+                if module.phase is not LifecyclePhase.AFTER_TURN
+            ),
             event_bus=event_bus,
             skills=active_skills,
             tool_search_enabled=settings.tool_search_enabled,
@@ -464,7 +470,8 @@ async def build_runtime_bundle(
 
         system_jobs = DriftTurnPipeline(
             operational,
-            runtime,
+            provider,
+            tool_executor=tool_executor,
             outbound=outbound,
             drift_selector=ModelDriftSkillSelector(provider, active_skills),
             drift_workspace=settings.workspace,
@@ -480,6 +487,7 @@ async def build_runtime_bundle(
                 outbound=outbound,
                 service_factory=build_proactive_service,
                 drift=system_jobs,
+                conversation=operational,
             )
         )
         if outbound is not None and proactive_loop is not None:
@@ -490,15 +498,31 @@ async def build_runtime_bundle(
                 event_bus=event_bus,
                 history_limit=settings.memory_history_limit,
                 progress_factory=progress_factory,
+                after_turn_modules=tuple(
+                    module
+                    for module in manager.phase_modules
+                    if module.phase is LifecyclePhase.AFTER_TURN
+                ),
+                outer_modules=tuple(
+                    module
+                    for module in manager.phase_modules
+                    if module.phase in {
+                        LifecyclePhase.BEFORE_TURN,
+                        LifecyclePhase.BEFORE_REASONING,
+                        LifecyclePhase.AFTER_REASONING,
+                    }
+                ),
             )
-            schedule_service.bind_executor(runtime, outbound)
+            agent_core = AgentCore(passive)
+            schedule_service.bind_executor(agent_core, outbound)
             task_dispatcher = TaskDispatcher(
-                passive=passive,
+                passive=agent_core,
                 memory=memory_tasks,
                 proactive=proactive_loop,
                 scheduler=schedule_service,
             )
         else:
+            agent_core = None
             task_dispatcher = None
         return RuntimeBundle(
             repository=operational,
@@ -508,6 +532,7 @@ async def build_runtime_bundle(
             memory_tasks=memory_tasks,
             scheduler_service=schedule_service,
             runtime=runtime,
+            agent_core=agent_core,
             task_dispatcher=task_dispatcher,
             skills=active_skills,
             event_bus=event_bus,

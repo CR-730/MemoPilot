@@ -149,6 +149,10 @@ def extract_cited_ids_from_tool_chain(
             if not isinstance(decoded, dict):
                 continue
             data = cast(dict[str, object], decoded)
+            if not {"cited_item_ids", "items"}.intersection(data):
+                result = data.get("result")
+                if isinstance(result, dict):
+                    data = cast(dict[str, object], result)
         else:
             continue
         raw_ids: list[object] = []

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from memopilot.persistence.migrations import (
     connect_database,
     migrate_database,
 )
+from memopilot.runtime.agent_core import AgentCore
 from memopilot.runtime.agent_loop import AgentLoop
 from memopilot.runtime.common_tools.message_push import MessagePushTool
 from memopilot.runtime.contracts import (
@@ -28,9 +30,10 @@ from memopilot.runtime.contracts import (
     ModelResponse,
     ToolSchema,
 )
-from memopilot.runtime.engine import AgentRuntime, TurnInput
+from memopilot.runtime.engine import DefaultReasoner, TurnInput
 from memopilot.runtime.outbound import PushToolOutboundPort
 from memopilot.runtime.passive_turn import PassiveTurnPipeline
+from memopilot.runtime.phases import LifecyclePhase
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.session import OperationalSessionManager
 from memopilot.runtime.task_dispatcher import TaskDispatcher
@@ -41,6 +44,43 @@ from memopilot.tasks.redis_queue import QueueMessage
 _BUILTIN_ROOT = Path(__file__).parents[2] / "src" / "memopilot" / "builtin_plugins"
 _NOW = datetime(2026, 7, 28, tzinfo=UTC)
 _LEASE = object()
+
+
+class _NoopOutbound:
+    async def dispatch(self, dispatch):
+        del dispatch
+        return True
+
+
+async def run_through_passive_pipeline(
+    reasoner: DefaultReasoner, turn: TurnInput, **kwargs: object
+):
+    with tempfile.TemporaryDirectory() as directory:
+        database = Path(directory) / "operational.db"
+        migrate_database(database, DatabaseKind.OPERATIONAL)
+        pipeline = PassiveTurnPipeline(
+            reasoner,
+            repository=ConversationRepository(database),
+            outbound=_NoopOutbound(),
+            event_bus=reasoner._event_bus or EventBus(),
+            history_limit=50,
+            after_turn_modules=tuple(
+                module
+                for module in getattr(reasoner, "_test_outer_modules", ())
+                if module.phase is LifecyclePhase.AFTER_TURN
+            ),
+            outer_modules=tuple(
+                module
+                for module in getattr(reasoner, "_test_outer_modules", ())
+                if module.phase
+                in {
+                    LifecyclePhase.BEFORE_TURN,
+                    LifecyclePhase.BEFORE_REASONING,
+                    LifecyclePhase.AFTER_REASONING,
+                }
+            ),
+        )
+        return await pipeline.execute_direct(turn, **kwargs)
 
 
 class _Provider(ChatProvider):
@@ -96,6 +136,7 @@ class _Queue:
         self.published.append(task)
         return "2-0"
 
+
 async def _load(
     plugin_dirs: list[Path],
     *,
@@ -143,11 +184,16 @@ async def test_setup_helper_short_circuits_with_memopilot_configuration(
         workspace=tmp_path,
     )
 
-    result = await AgentRuntime(
+    runtime = DefaultReasoner(
         provider,
         ToolRegistry(),
         modules=manager.phase_modules,
-    ).run(TurnInput("cli:chat", "/chatid@MemoPilot"))
+    )
+    runtime._test_outer_modules = manager.phase_modules  # type: ignore[attr-defined]
+    result = await run_through_passive_pipeline(
+        runtime,
+        TurnInput("cli:chat", "/chatid@MemoPilot"),
+    )
 
     assert provider.calls == []
     assert result.react.exit_reason == "before_turn_abort"
@@ -170,8 +216,7 @@ async def test_undo_removes_latest_complete_turn_and_rolls_cursor(
     _commit_turn(repository, 2, "第二问", "第二答")
     with connect_database(database) as connection:
         connection.execute(
-            "UPDATE sessions SET last_consolidated_position = 4 "
-            "WHERE session_key = 'cli:chat'"
+            "UPDATE sessions SET last_consolidated_position = 4 WHERE session_key = 'cli:chat'"
         )
         connection.commit()
     provider = _Provider()
@@ -181,11 +226,16 @@ async def test_undo_removes_latest_complete_turn_and_rolls_cursor(
         repository=repository,
     )
 
-    result = await AgentRuntime(
+    runtime = DefaultReasoner(
         provider,
         ToolRegistry(),
         modules=manager.phase_modules,
-    ).run(TurnInput("cli:chat", "/undo"))
+    )
+    runtime._test_outer_modules = manager.phase_modules  # type: ignore[attr-defined]
+    result = await run_through_passive_pipeline(
+        runtime,
+        TurnInput("cli:chat", "/undo"),
+    )
 
     assert provider.calls == []
     assert result.react.exit_reason == "before_turn_abort"
@@ -271,13 +321,14 @@ async def test_meme_runs_through_agent_loop_and_sends_clean_text_and_image(
             ModelResponse("好的 <meme:bashful>", (), "stop"),
         )
     )
-    runtime = AgentRuntime(
+    runtime = DefaultReasoner(
         provider,
         tools,
         modules=manager.phase_modules,
         event_bus=bus,
         session_manager=OperationalSessionManager(repository),
     )
+    runtime._test_outer_modules = manager.phase_modules  # type: ignore[attr-defined]
     sent_text: list[str] = []
     sent_images: list[str] = []
 
@@ -302,12 +353,24 @@ async def test_meme_runs_through_agent_loop_and_sends_clean_text_and_image(
     push = MessagePushTool()
     push.register_channel("cli", text=send_text, image=send_image)
     dispatcher = TaskDispatcher(
-        passive=PassiveTurnPipeline(
-            runtime,
-            repository=repository,
-            outbound=PushToolOutboundPort(push),
-            event_bus=bus,
-            history_limit=12,
+        passive=AgentCore(
+            PassiveTurnPipeline(
+                runtime,
+                repository=repository,
+                outbound=PushToolOutboundPort(push),
+                event_bus=bus,
+                history_limit=12,
+                outer_modules=tuple(
+                    module
+                    for module in manager.phase_modules
+                    if module.phase
+                    in {
+                        LifecyclePhase.BEFORE_TURN,
+                        LifecyclePhase.BEFORE_REASONING,
+                        LifecyclePhase.AFTER_REASONING,
+                    }
+                ),
+            )
         ),
         memory=_Unused(),
         proactive=_Unused(),
@@ -363,8 +426,7 @@ async def test_meme_runs_through_agent_loop_and_sends_clean_text_and_image(
     handling_logs = [
         record.getMessage()
         for record in caplog.records
-        if record.name == "memopilot.runtime.agent_loop"
-        and "处理消息 kind=" in record.getMessage()
+        if record.name == "memopilot.runtime.agent_loop" and "处理消息 kind=" in record.getMessage()
     ]
     assert handling_logs == [
         "AgentLoop 处理消息 kind=passive.turn session=cli:chat preview='来个表情'"

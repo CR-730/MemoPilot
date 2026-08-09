@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
+from memopilot.extensions.events import EventBus
 from memopilot.extensions.plugin_events import AfterStepCtx
 from memopilot.extensions.plugin_manager import PluginManager
+from memopilot.persistence.conversation import ConversationRepository
+from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.contracts import (
     ChatMessage,
     FunctionCall,
     ModelResponse,
     ToolSchema,
 )
-from memopilot.runtime.engine import AgentRuntime, TurnInput
-from memopilot.runtime.phases import PluginPhaseFrame
+from memopilot.runtime.engine import DefaultReasoner, TurnInput
+from memopilot.runtime.passive_turn import PassiveTurnPipeline
+from memopilot.runtime.phases import LifecyclePhase, PluginPhaseFrame
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tools import Tool, ToolRegistry
 
@@ -23,6 +28,43 @@ PLUGIN_DIR = (
     / "builtin_plugins"
     / "context_pressure"
 )
+
+
+class _NoopOutbound:
+    async def dispatch(self, dispatch):
+        del dispatch
+        return True
+
+
+async def run_through_passive_pipeline(
+    reasoner: DefaultReasoner, turn: TurnInput, **kwargs: object
+):
+    with tempfile.TemporaryDirectory() as directory:
+        database = Path(directory) / "operational.db"
+        migrate_database(database, DatabaseKind.OPERATIONAL)
+        pipeline = PassiveTurnPipeline(
+            reasoner,
+            repository=ConversationRepository(database),
+            outbound=_NoopOutbound(),
+            event_bus=reasoner._event_bus or EventBus(),
+            history_limit=50,
+            after_turn_modules=tuple(
+                module
+                for module in getattr(reasoner, "_test_outer_modules", ())
+                if module.phase is LifecyclePhase.AFTER_TURN
+            ),
+            outer_modules=tuple(
+                module
+                for module in getattr(reasoner, "_test_outer_modules", ())
+                if module.phase
+                in {
+                    LifecyclePhase.BEFORE_TURN,
+                    LifecyclePhase.BEFORE_REASONING,
+                    LifecyclePhase.AFTER_REASONING,
+                }
+            ),
+        )
+        return await pipeline.execute_direct(turn, **kwargs)
 
 
 class _Provider(ChatProvider):
@@ -96,12 +138,15 @@ async def test_context_pressure_stops_only_above_eighty_percent_with_more_work()
         ]
     )
     provider = _Provider()
-    result = await AgentRuntime(
-        provider,
-        tools,
-        modules=manager.phase_modules,
-        context_window_tokens=1,
-    ).run(TurnInput("feishu:chat-1", "question"))
+    result = await run_through_passive_pipeline(
+        DefaultReasoner(
+            provider,
+            tools,
+            modules=manager.phase_modules,
+            context_window_tokens=1,
+        ),
+        TurnInput("feishu:chat-1", "question"),
+    )
 
     assert calls == ["done"]
     assert provider.calls == 1

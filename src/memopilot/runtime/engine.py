@@ -16,8 +16,6 @@ from memopilot.extensions.plugin_events import (
     AfterReasoningInput,
     AfterReasoningResult,
     AfterStepCtx,
-    AfterTurnCtx,
-    AfterTurnInput,
     BeforeReasoningCtx,
     BeforeReasoningInput,
     BeforeStepCtx,
@@ -92,6 +90,10 @@ class TurnInput:
     memory_source_ref: str = ""
     received_at: datetime | None = None
     allowed_tool_risks: frozenset[str] | None = None
+    disabled_tools: frozenset[str] = frozenset()
+    omit_user_turn: bool = False
+    skip_post_memory: bool = False
+    suppress_stream_events: bool = False
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,14 @@ class TurnResult:
     cited_memory_ids: tuple[str, ...] = ()
 
 
+@dataclass
+class ReasoningSession:
+    turn: TurnInput
+    context: PhaseContext
+    execution: _RuntimeExecution
+    tools: ToolRegistry
+
+
 PhaseHandler = Callable[[PhaseContext], Awaitable[Mapping[str, Any]]]
 
 
@@ -152,7 +162,7 @@ class FunctionPhaseModule:
         return await self.handler(context)
 
 
-class AgentRuntime:
+class DefaultReasoner:
     def __init__(
         self,
         provider: ChatProvider,
@@ -193,38 +203,30 @@ class AgentRuntime:
         if memory_markdown_max_chars < 500:
             raise ValueError("Markdown 记忆注入预算不能少于 500 字符")
         self._memory_markdown_max_chars = memory_markdown_max_chars
-        memory_modules: tuple[PhaseModule, ...] = ()
-        if memory_engine is not None or memory_profile is not None:
-            memory_modules = cast(
-                tuple[PhaseModule, ...],
-                (
-                    FunctionPhaseModule(
-                        LifecyclePhase.BEFORE_REASONING,
-                        "before_reasoning.memory_prerecall",
-                        ("reasoning.input",),
-                        ("memory.context", "memory.trace"),
-                        self._memory_prerecall,
-                    ),
-                ),
-            )
         all_modules = cast(
             Sequence[PhaseModule],
             (
-                *_default_modules(
+                *_reasoner_modules(
                     prompt_renderer,
                     prompt_max_chars,
                     skills,
                     event_bus,
-                    session_manager,
                 ),
-                *memory_modules,
-                *modules,
+                *(module for module in modules if module.phase in {
+                    LifecyclePhase.PROMPT_RENDER,
+                    LifecyclePhase.BEFORE_STEP,
+                    LifecyclePhase.AFTER_STEP,
+                }),
             ),
         )
         self._pipeline = PhasePipeline(
             all_modules,
             initial_slots={"turn.input"},
             provided_slots={
+                LifecyclePhase.BEFORE_REASONING: {
+                    "reasoning.input",
+                    "reasoning:ctx",
+                },
                 LifecyclePhase.BEFORE_STEP: {
                     "step.iteration",
                     "step.messages",
@@ -277,17 +279,13 @@ class AgentRuntime:
             "memory.trace": memory_trace,
         }
 
-    async def run(
+    def begin_turn(
         self,
         turn: TurnInput,
         *,
         tools: ToolRegistry | None = None,
         step_sink: RuntimeStepSink | None = None,
-        progress: ReActProgressObserver | None = None,
-        execution_assert_current: Callable[[], None] | None = None,
-        memory_assert_current: Callable[[], None] | None = None,
-        memory_fenced_write: Callable[[], AbstractContextManager[None]] | None = None,
-    ) -> TurnResult:
+    ) -> ReasoningSession:
         if (
             not turn.system_prompt.strip()
             and self._prompt_workspace is not None
@@ -317,24 +315,34 @@ class AgentRuntime:
             tools=active_tools,
             context_window_tokens=self._context_window_tokens,
         )
-        await execution.run_phase(LifecyclePhase.BEFORE_TURN)
-        before_turn_ctx = cast(BeforeTurnCtx, context.slots["session:ctx"])
-        if before_turn_ctx.abort:
-            return _aborted_turn_result(
-                turn,
-                before_turn_ctx,
-                exit_reason="before_turn_abort",
-                execution=execution,
-            )
-        await execution.run_phase(LifecyclePhase.BEFORE_REASONING)
+        return ReasoningSession(turn, context, execution, active_tools)
+
+    def aborted_result(
+        self,
+        session: ReasoningSession,
+        ctx: BeforeTurnCtx | BeforeReasoningCtx,
+        exit_reason: str,
+    ) -> TurnResult:
+        return _aborted_turn_result(
+            cast(TurnInput, session.context.slots["turn.input"]),
+            ctx,
+            exit_reason=exit_reason,
+            execution=session.execution,
+        )
+
+    async def run_reasoning(
+        self,
+        session: ReasoningSession,
+        *,
+        progress: ReActProgressObserver | None = None,
+        execution_assert_current: Callable[[], None] | None = None,
+        memory_assert_current: Callable[[], None] | None = None,
+        memory_fenced_write: Callable[[], AbstractContextManager[None]] | None = None,
+    ) -> ReActResult:
+        context = session.context
+        execution = session.execution
+        active_tools = session.tools
         before_reasoning_ctx = cast(BeforeReasoningCtx, context.slots["reasoning:ctx"])
-        if before_reasoning_ctx.abort:
-            return _aborted_turn_result(
-                cast(TurnInput, context.slots["turn.input"]),
-                before_reasoning_ctx,
-                exit_reason="before_reasoning_abort",
-                execution=execution,
-            )
         policy_turn = cast(TurnInput, context.slots["turn.input"])
         blocked_tool_names = {
             name
@@ -343,6 +351,7 @@ class AgentRuntime:
             and (document := active_tools.get_document(name)) is not None
             and document.risk not in policy_turn.allowed_tool_risks
         }
+        blocked_tool_names.update(policy_turn.disabled_tools)
         deferred_search_enabled = self._tool_search_enabled and active_tools is self._tools
         preloaded_tools = (
             tuple(
@@ -428,11 +437,20 @@ class AgentRuntime:
                 self._tools.get_always_on_names(),
             )
         context.slots["reasoning.result"] = react
+        return react
+
+    def prepare_after_reasoning(self, session: ReasoningSession) -> None:
+        context = session.context
+        react = cast(ReActResult, context.slots["reasoning.result"])
         context.slots["after_reasoning.input"] = AfterReasoningInput(
             cast(BeforeTurnInput, context.slots["before_turn.input"]),
             react,
         )
-        await execution.run_phase(LifecyclePhase.AFTER_REASONING)
+
+    def finish_turn(self, session: ReasoningSession) -> TurnResult:
+        context = session.context
+        execution = session.execution
+        react = cast(ReActResult, context.slots["reasoning.result"])
         raw_cited_ids = context.slots.get("persist:assistant:cited_memory_ids")
         candidate_ids = (
             tuple(str(item_id) for item_id in raw_cited_ids)
@@ -443,7 +461,6 @@ class AgentRuntime:
         cited_memory_ids = tuple(
             item_id for item_id in candidate_ids if item_id in allowed_memory_ids
         )
-        await execution.run_phase(LifecyclePhase.AFTER_TURN)
         final_react = context.slots.get("turn.output")
         if not isinstance(final_react, ReActResult):
             raise RuntimeError("AfterReasoning 未产生 ReActResult")
@@ -681,35 +698,6 @@ class _RuntimeExecution(ReActObserver):
             )
             self._context.slots["after_step.input"] = step_ctx
             self._context.slots["step:ctx"] = step_ctx
-        elif phase is LifecyclePhase.AFTER_REASONING:
-            phase_input = cast(AfterReasoningInput, self._context.slots["after_reasoning.input"])
-            result = cast(ReActResult, phase_input.turn_result)
-            self._context.slots["reasoning:ctx"] = AfterReasoningCtx(
-                state.session_key,
-                state.channel,
-                state.chat_id,
-                tuple(record.call.name for record in result.tool_chain),
-                result.thinking,
-                tuple(_tool_record_snapshot(record) for record in result.tool_chain),
-                result.reply,
-                outbound_metadata=dict(state.outbound_metadata),
-            )
-        elif phase is LifecyclePhase.AFTER_TURN:
-            reasoning_ctx = cast(AfterReasoningCtx, self._context.slots["reasoning:ctx"])
-            output = cast(ReActResult, self._context.slots["turn.output"])
-            after_result = AfterReasoningResult(reasoning_ctx, output)
-            phase_input = AfterTurnInput(state, after_result)
-            self._context.slots["after_turn.input"] = phase_input
-            self._context.slots["turn:ctx"] = AfterTurnCtx(
-                state.session_key,
-                state.channel,
-                state.chat_id,
-                reasoning_ctx.reply,
-                reasoning_ctx.tools_used,
-                reasoning_ctx.thinking,
-                tuple(reasoning_ctx.media),
-                dict(reasoning_ctx.outbound_metadata),
-            )
 
     async def before_step(
         self,
@@ -786,13 +774,6 @@ class _RuntimeExecution(ReActObserver):
             )
         await self.run_phase(LifecyclePhase.AFTER_STEP)
         ctx = cast(AfterStepCtx, self._context.slots["step:ctx"])
-        successful_tools = {record.call.name for record in tool_records if record.observation.ok}
-        if "message_push" in successful_tools:
-            self.set_visible_tool_names(frozenset({"write_file", "edit_file", "finish_drift"}))
-        elif "mount_server" in successful_tools:
-            self.set_visible_tool_names(frozenset(self._tools.tool_names))
-        if "finish_drift" in successful_tools:
-            return AfterStepControl(True, "finish_drift")
         return AfterStepControl(ctx.early_stop, ctx.early_stop_reason)
 
     async def _record(self, event: RuntimeTraceEvent) -> None:
@@ -1158,14 +1139,14 @@ async def _complete_after_turn(context: PhaseContext) -> Mapping[str, Any]:
     return {"turn.completed": context.slots["turn.output"] is not None}
 
 
-def _default_modules(
-    prompt_renderer: PromptRenderer,
-    prompt_max_chars: int,
-    skills: SkillCatalog | None,
+def build_outer_modules(
     event_bus: EventBus | None,
     session_manager: SessionManager | None = None,
-) -> tuple[FunctionPhaseModule, ...]:
-    return (
+    *,
+    memory_modules: Sequence[PhaseModule] = (),
+    plugin_modules: Sequence[PhaseModule] = (),
+) -> tuple[PhaseModule, ...]:
+    modules = cast(tuple[PhaseModule, ...], (
         FunctionPhaseModule(
             LifecyclePhase.BEFORE_TURN,
             "before_turn.build_ctx",
@@ -1208,6 +1189,41 @@ def _default_modules(
             ("reasoning.input",),
             _finalize_before_reasoning,
         ),
+        FunctionPhaseModule(
+            LifecyclePhase.AFTER_REASONING,
+            "after_reasoning.build_ctx",
+            ("reasoning.result",),
+            ("reasoning:ctx",),
+            _after_reasoning,
+        ),
+        FunctionPhaseModule(
+            LifecyclePhase.AFTER_REASONING,
+            "after_reasoning.emit",
+            ("after_reasoning.build_ctx", "reasoning:ctx"),
+            (),
+            partial(_emit_after_reasoning, event_bus=event_bus),
+        ),
+        FunctionPhaseModule(
+            LifecyclePhase.AFTER_REASONING,
+            "after_reasoning.finalize",
+            ("after_reasoning.emit", "reasoning:ctx"),
+            ("turn.output",),
+            _finalize_after_reasoning,
+        ),
+    ))
+    return cast(
+        tuple[PhaseModule, ...],
+        (*modules, *memory_modules, *plugin_modules),
+    )
+
+
+def _reasoner_modules(
+    prompt_renderer: PromptRenderer,
+    prompt_max_chars: int,
+    skills: SkillCatalog | None,
+    event_bus: EventBus | None,
+) -> tuple[FunctionPhaseModule, ...]:
+    return (
         FunctionPhaseModule(
             LifecyclePhase.PROMPT_RENDER,
             "prompt_render.build_ctx",
@@ -1290,41 +1306,6 @@ def _default_modules(
             ("step.observed",),
             _return_after_step,
         ),
-        FunctionPhaseModule(
-            LifecyclePhase.AFTER_REASONING,
-            "after_reasoning.build_ctx",
-            ("reasoning.result",),
-            ("reasoning:ctx",),
-            _after_reasoning,
-        ),
-        FunctionPhaseModule(
-            LifecyclePhase.AFTER_REASONING,
-            "after_reasoning.emit",
-            ("after_reasoning.build_ctx", "reasoning:ctx"),
-            (),
-            partial(_emit_after_reasoning, event_bus=event_bus),
-        ),
-        FunctionPhaseModule(
-            LifecyclePhase.AFTER_REASONING,
-            "after_reasoning.finalize",
-            ("after_reasoning.emit", "reasoning:ctx"),
-            ("turn.output",),
-            _finalize_after_reasoning,
-        ),
-        FunctionPhaseModule(
-            LifecyclePhase.AFTER_TURN,
-            "after_turn.build_ctx",
-            ("turn.output",),
-            ("turn:ctx",),
-            _after_turn,
-        ),
-        FunctionPhaseModule(
-            LifecyclePhase.AFTER_TURN,
-            "after_turn.complete",
-            ("after_turn.build_ctx", "turn:ctx"),
-            ("turn.completed",),
-            _complete_after_turn,
-        ),
     )
 
 
@@ -1332,7 +1313,11 @@ def validate_extension_phase_modules(modules: Sequence[PhaseModule]) -> None:
     """用真实核心 Phase 合同在插件提交前验证扩展模块。"""
     all_modules = cast(
         Sequence[PhaseModule],
-        (*_default_modules(PromptRenderer(), 12000, None, None), *modules),
+        (
+            *build_outer_modules(None),
+            *_reasoner_modules(PromptRenderer(), 12000, None, None),
+            *modules,
+        ),
     )
     PhasePipeline(
         all_modules,
@@ -1456,7 +1441,8 @@ def _without_recent_turns(content: str) -> str:
 
 
 __all__ = [
-    "AgentRuntime",
+    "DefaultReasoner",
+    "build_outer_modules",
     "FunctionPhaseModule",
     "LongTermMemoryProfile",
     "PhaseTraceEntry",

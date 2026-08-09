@@ -1,19 +1,61 @@
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.plugin_manager import PluginManager
+from memopilot.persistence.conversation import ConversationRepository
+from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.contracts import (
     ChatMessage,
     FunctionCall,
     ModelResponse,
     ToolSchema,
 )
-from memopilot.runtime.engine import AgentRuntime, TurnInput
+from memopilot.runtime.engine import DefaultReasoner, TurnInput
+from memopilot.runtime.passive_turn import PassiveTurnPipeline
+from memopilot.runtime.phases import LifecyclePhase
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tools import Tool, ToolExecutor, ToolRegistry
+
+
+class _NoopOutbound:
+    async def dispatch(self, dispatch):
+        del dispatch
+        return True
+
+
+async def run_through_passive_pipeline(
+    reasoner: DefaultReasoner, turn: TurnInput, **kwargs: object
+):
+    with tempfile.TemporaryDirectory() as directory:
+        database = Path(directory) / "operational.db"
+        migrate_database(database, DatabaseKind.OPERATIONAL)
+        pipeline = PassiveTurnPipeline(
+            reasoner,
+            repository=ConversationRepository(database),
+            outbound=_NoopOutbound(),
+            event_bus=reasoner._event_bus or EventBus(),
+            history_limit=50,
+            after_turn_modules=tuple(
+                module
+                for module in getattr(reasoner, "_test_outer_modules", ())
+                if module.phase is LifecyclePhase.AFTER_TURN
+            ),
+            outer_modules=tuple(
+                module
+                for module in getattr(reasoner, "_test_outer_modules", ())
+                if module.phase
+                in {
+                    LifecyclePhase.BEFORE_TURN,
+                    LifecyclePhase.BEFORE_REASONING,
+                    LifecyclePhase.AFTER_REASONING,
+                }
+            ),
+        )
+        return await pipeline.execute_direct(turn, **kwargs)
 
 
 class _Provider(ChatProvider):
@@ -56,7 +98,7 @@ def _write_plugin(root: Path) -> None:
     plugin_dir = root / "runtime_audit"
     plugin_dir.mkdir()
     (plugin_dir / "plugin.py").write_text(
-        '''
+        """
 from memopilot.extensions.decorators import (
     on_after_step,
     on_before_turn,
@@ -88,7 +130,7 @@ class RuntimeAudit(Plugin):
         assert event.session_key == "feishu:chat-1"
         assert event.source == "passive"
         return {"command": "safe"}
-''',
+""",
         encoding="utf-8",
     )
 
@@ -120,10 +162,9 @@ async def test_plugin_decorators_fire_through_real_agent_runtime(tmp_path: Path)
     await manager.load_all()
     executor = ToolExecutor(tools, manager.tool_hooks)
 
-    result = await AgentRuntime(
-        _Provider(), tools, event_bus=bus, tool_executor=executor
-    ).run(
-        TurnInput(session_key="feishu:chat-1", content="删除 a")
+    result = await run_through_passive_pipeline(
+        DefaultReasoner(_Provider(), tools, event_bus=bus, tool_executor=executor),
+        TurnInput(session_key="feishu:chat-1", content="删除 a"),
     )
 
     plugin = manager.get_plugin("runtime_audit")
@@ -144,7 +185,7 @@ async def test_prototype_phase_and_prompt_modules_change_real_runtime_input(
     plugin_dir = tmp_path / "prototype_runtime"
     plugin_dir.mkdir()
     (plugin_dir / "plugin.py").write_text(
-        '''
+        """
 from dataclasses import replace
 from memopilot.extensions.plugin_base import Plugin
 from memopilot.extensions.prompts import PromptRenderContext, PromptSectionRender
@@ -187,20 +228,25 @@ class PrototypeRuntimePlugin(Plugin):
 
     def prompt_render_modules(self):
         return [DynamicPrompt()]
-''',
+""",
         encoding="utf-8",
     )
     manager = PluginManager([tmp_path], tool_registry=ToolRegistry())
     await manager.load_all()
     provider = _CapturingProvider()
-    runtime = AgentRuntime(
+    runtime = DefaultReasoner(
         provider,
         ToolRegistry(),
         modules=manager.phase_modules,
     )
+    runtime._test_outer_modules = manager.phase_modules  # type: ignore[attr-defined]
 
-    await runtime.run(TurnInput("feishu:user-a", "甲的问题", system_prompt="核心"))
-    await runtime.run(TurnInput("feishu:user-b", "乙的问题", system_prompt="核心"))
+    await run_through_passive_pipeline(
+        runtime, TurnInput("feishu:user-a", "甲的问题", system_prompt="核心")
+    )
+    await run_through_passive_pipeline(
+        runtime, TurnInput("feishu:user-b", "乙的问题", system_prompt="核心")
+    )
 
     first, second = provider.calls
     assert (first[-1].content or "").endswith("已改写：甲的问题")

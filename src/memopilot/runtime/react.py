@@ -59,6 +59,7 @@ class BeforeStepControl:
 class AfterStepControl:
     early_stop: bool = False
     early_stop_reason: str = ""
+    next_visible_tool_names: frozenset[str] | None = None
 
 
 class ReActObserver(Protocol):
@@ -92,6 +93,7 @@ class ReActProgressObserver(Protocol):
         call: FunctionCall,
         observation: ToolObservation,
     ) -> None: ...
+
 
 class ReActEngine:
     def __init__(
@@ -147,13 +149,9 @@ class ReActEngine:
             )
         else:
             visible_order = [
-                name
-                for name in self._tools.tool_names
-                if name not in self._excluded_tool_names
+                name for name in self._tools.tool_names if name not in self._excluded_tool_names
             ]
-        visible_order = [
-            name for name in visible_order if name not in self._excluded_tool_names
-        ]
+        visible_order = [name for name in visible_order if name not in self._excluded_tool_names]
         visible_tools = set(visible_order)
         safe_progress = _BestEffortProgress(progress) if progress is not None else None
         input_token_samples: list[int] = []
@@ -170,21 +168,25 @@ class ReActEngine:
                 control = await self._observer.before_step(iteration, working)
             if control is not None and control.extra_hints:
                 working.append(
-                    ChatMessage.system(
-                        "运行时补充提示：\n" + "\n".join(control.extra_hints)
-                    )
+                    ChatMessage.system("运行时补充提示：\n" + "\n".join(control.extra_hints))
                 )
             if control is not None and control.early_stop:
                 reply = control.early_stop_reply.strip() or "当前推理已安全停止。"
                 working.append(ChatMessage.assistant(content=reply))
-                return _logged_result(ReActResult(
-                    reply=reply,
-                    messages=tuple(working),
-                    iterations=iteration,
-                    tool_chain=tuple(records),
-                    exit_reason="early_stop",
-                ), self._session_key, input_token_samples, prompt_tokens,
-                    prompt_cache_hit_tokens, completion_tokens)
+                return _logged_result(
+                    ReActResult(
+                        reply=reply,
+                        messages=tuple(working),
+                        iterations=iteration,
+                        tool_chain=tuple(records),
+                        exit_reason="early_stop",
+                    ),
+                    self._session_key,
+                    input_token_samples,
+                    prompt_tokens,
+                    prompt_cache_hit_tokens,
+                    completion_tokens,
+                )
             if self._assert_current is not None:
                 self._assert_current()
             input_tokens = estimate_messages_tokens(working)
@@ -238,24 +240,28 @@ class ReActEngine:
                     await self._observer.after_step(iteration, response, (), working)
                 reply = (response.content or "").strip()
                 if reply:
-                    tools_used = [
-                        record.call.name for record in records if record.observation.ok
-                    ]
+                    tools_used = [record.call.name for record in records if record.observation.ok]
                     logger.info(
                         "[LLM决策→回复] 第%d轮，共调用工具%d次: %s",
                         iteration,
                         len(tools_used),
                         tools_used if tools_used else "无",
                     )
-                    return _logged_result(ReActResult(
-                        reply=reply,
-                        messages=tuple(working),
-                        iterations=iteration,
-                        tool_chain=tuple(records),
-                        exit_reason="completed",
-                        thinking=response.thinking,
-                    ), self._session_key, input_token_samples, prompt_tokens,
-                        prompt_cache_hit_tokens, completion_tokens)
+                    return _logged_result(
+                        ReActResult(
+                            reply=reply,
+                            messages=tuple(working),
+                            iterations=iteration,
+                            tool_chain=tuple(records),
+                            exit_reason="completed",
+                            thinking=response.thinking,
+                        ),
+                        self._session_key,
+                        input_token_samples,
+                        prompt_tokens,
+                        prompt_cache_hit_tokens,
+                        completion_tokens,
+                    )
                 return await self._finalize(
                     working,
                     records,
@@ -281,21 +287,32 @@ class ReActEngine:
                 after_control = await self._observer.after_step(
                     iteration, response, step_records, working
                 )
+            if after_control is not None and after_control.next_visible_tool_names is not None:
+                visible_order = [
+                    name for name in visible_order if name in after_control.next_visible_tool_names
+                ]
+                visible_tools = set(visible_order)
             if after_control is not None and after_control.early_stop:
                 reason = after_control.early_stop_reason.strip() or "after_step"
                 reply = (response.content or "").strip()
                 if not reply:
                     reply = f"已完成当前工具调用；因 {reason} 停止继续推理。"
                 working.append(ChatMessage.assistant(content=reply))
-                return _logged_result(ReActResult(
-                    reply=reply,
-                    messages=tuple(working),
-                    iterations=iteration,
-                    tool_chain=tuple(records),
-                    exit_reason=reason,
-                    thinking=response.thinking,
-                ), self._session_key, input_token_samples, prompt_tokens,
-                    prompt_cache_hit_tokens, completion_tokens)
+                return _logged_result(
+                    ReActResult(
+                        reply=reply,
+                        messages=tuple(working),
+                        iterations=iteration,
+                        tool_chain=tuple(records),
+                        exit_reason=reason,
+                        thinking=response.thinking,
+                    ),
+                    self._session_key,
+                    input_token_samples,
+                    prompt_tokens,
+                    prompt_cache_hit_tokens,
+                    completion_tokens,
+                )
 
         return await self._finalize(
             working,
@@ -364,16 +381,13 @@ class ReActEngine:
                     else None
                 )
                 if isinstance(owner, ToolSearchTool):
-                    owner.set_excluded_names(
-                        set(visible_tools) | set(self._excluded_tool_names)
-                    )
+                    owner.set_excluded_names(set(visible_tools) | set(self._excluded_tool_names))
             blocked_reason = None
             if disallowed_tool:
                 blocked_reason = f"工具 {call.name} 不允许在当前后台任务中执行。"
             elif hidden_tool:
                 blocked_reason = (
-                    f"工具 {call.name} 尚未加载；请先调用 "
-                    f'tool_search(query="select:{call.name}")。'
+                    f'工具 {call.name} 尚未加载；请先调用 tool_search(query="select:{call.name}")。'
                 )
             logger.info(
                 "[工具执行→] %s  args=%s",
@@ -395,14 +409,10 @@ class ReActEngine:
                     tool_batch_index=batch_index,
                 ),
                 blocked_reason=blocked_reason,
-                blocked_error_type=(
-                    "tool_not_allowed" if disallowed_tool else "tool_not_loaded"
-                ),
+                blocked_error_type=("tool_not_allowed" if disallowed_tool else "tool_not_loaded"),
             )
             if call.name == "tool_search" and observation.ok:
-                unlocked = ToolDiscoveryState().unlock_names_from_result(
-                    str(observation.result)
-                )
+                unlocked = ToolDiscoveryState().unlock_names_from_result(str(observation.result))
                 for name in unlocked:
                     if (
                         self._tools.has_tool(name)
@@ -437,9 +447,7 @@ class ReActEngine:
                         "iteration": iteration,
                         "call_id": call.id,
                         "tool_name": call.name,
-                        "arguments": dict(
-                            observation.final_arguments or call.arguments
-                        ),
+                        "arguments": dict(observation.final_arguments or call.arguments),
                         "status": observation.status,
                         "result": observation.result,
                         "error_type": observation.error_type,
@@ -480,13 +488,9 @@ class ReActEngine:
         response = await self._provider.complete(messages=messages, tools=tools)
         if progress is not None:
             if response.thinking:
-                await progress.on_stream_delta(
-                    StreamDelta(thinking_delta=response.thinking)
-                )
+                await progress.on_stream_delta(StreamDelta(thinking_delta=response.thinking))
             if response.content and not response.tool_calls:
-                await progress.on_stream_delta(
-                    StreamDelta(content_delta=response.content)
-                )
+                await progress.on_stream_delta(StreamDelta(content_delta=response.content))
         return response
 
     async def _finalize(
@@ -510,21 +514,25 @@ class ReActEngine:
             control = await self._observer.before_step(final_iteration, working)
         if control is not None and control.extra_hints:
             working.append(
-                ChatMessage.system(
-                    "运行时补充提示：\n" + "\n".join(control.extra_hints)
-                )
+                ChatMessage.system("运行时补充提示：\n" + "\n".join(control.extra_hints))
             )
         if control is not None and control.early_stop:
             reply = control.early_stop_reply.strip() or "当前推理已安全停止。"
             working.append(ChatMessage.assistant(content=reply))
-            return _logged_result(ReActResult(
-                reply=reply,
-                messages=tuple(working),
-                iterations=iterations,
-                tool_chain=tuple(records),
-                exit_reason="early_stop",
-            ), self._session_key, input_token_samples, prompt_tokens,
-                prompt_cache_hit_tokens, completion_tokens)
+            return _logged_result(
+                ReActResult(
+                    reply=reply,
+                    messages=tuple(working),
+                    iterations=iterations,
+                    tool_chain=tuple(records),
+                    exit_reason="early_stop",
+                ),
+                self._session_key,
+                input_token_samples,
+                prompt_tokens,
+                prompt_cache_hit_tokens,
+                completion_tokens,
+            )
         input_token_samples.append(estimate_messages_tokens(working))
         try:
             response = await self._provider.complete(messages=working, tools=())
@@ -551,16 +559,22 @@ class ReActEngine:
         if not reply:
             reply = "当前步骤已经停止；已保留取得的工具结果，但尚未形成完整结论。"
         working.append(ChatMessage.assistant(content=reply))
-        return _logged_result(ReActResult(
-            reply=reply,
-            messages=tuple(working),
-            iterations=iterations,
-            tool_chain=tuple(records),
-            exit_reason="provider_error" if infrastructure_error else exit_reason,
-            thinking=final_thinking,
-            infrastructure_error=infrastructure_error,
-        ), self._session_key, input_token_samples, prompt_tokens,
-            prompt_cache_hit_tokens, completion_tokens)
+        return _logged_result(
+            ReActResult(
+                reply=reply,
+                messages=tuple(working),
+                iterations=iterations,
+                tool_chain=tuple(records),
+                exit_reason="provider_error" if infrastructure_error else exit_reason,
+                thinking=final_thinking,
+                infrastructure_error=infrastructure_error,
+            ),
+            self._session_key,
+            input_token_samples,
+            prompt_tokens,
+            prompt_cache_hit_tokens,
+            completion_tokens,
+        )
 
     async def _provider_failure(
         self,
@@ -592,15 +606,21 @@ class ReActEngine:
         if self._observer is not None:
             await self._observer.after_step(iteration, failure, (), working)
         working.append(ChatMessage.assistant(content=reply))
-        return _logged_result(ReActResult(
-            reply=reply,
-            messages=tuple(working),
-            iterations=iteration,
-            tool_chain=tuple(records),
-            exit_reason="provider_error",
-            infrastructure_error=type(error).__name__,
-        ), self._session_key, input_token_samples, prompt_tokens,
-            prompt_cache_hit_tokens, completion_tokens)
+        return _logged_result(
+            ReActResult(
+                reply=reply,
+                messages=tuple(working),
+                iterations=iteration,
+                tool_chain=tuple(records),
+                exit_reason="provider_error",
+                infrastructure_error=type(error).__name__,
+            ),
+            self._session_key,
+            input_token_samples,
+            prompt_tokens,
+            prompt_cache_hit_tokens,
+            completion_tokens,
+        )
 
 
 def _multimodal_tool_message(

@@ -9,13 +9,41 @@ import pytest
 from memopilot.persistence.conversation import ConversationRepository
 from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.contracts import ChatMessage, ModelResponse
-from memopilot.runtime.engine import AgentRuntime, SessionHistoryRequest, TurnInput
+from memopilot.runtime.engine import (
+    DefaultReasoner,
+    SessionHistoryRequest,
+    TurnInput,
+    _before_turn,
+    _finalize_before_reasoning,
+    _finalize_before_turn,
+)
+from memopilot.runtime.phases import LifecyclePhase
 from memopilot.runtime.session import OperationalSessionManager
 from memopilot.runtime.tools import ToolRegistry
 
 
 def test_session_history_request_is_typed() -> None:
     assert SessionHistoryRequest("feishu:chat-1", 20).limit == 20
+
+
+class _NoopOutbound:
+    async def dispatch(self, dispatch):
+        del dispatch
+        return True
+
+
+async def run_through_passive_pipeline(
+    reasoner: DefaultReasoner, turn: TurnInput, **kwargs: object
+):
+    session = reasoner.begin_turn(turn, **kwargs)
+    await session.execution.run_phase(LifecyclePhase.BEFORE_TURN)
+    session.context.slots.update(
+        await _before_turn(session.context, session_manager=reasoner._session_manager)
+    )
+    session.context.slots.update(await _finalize_before_turn(session.context))
+    await session.execution.run_phase(LifecyclePhase.BEFORE_REASONING)
+    session.context.slots.update(await _finalize_before_reasoning(session.context))
+    return await reasoner.run_reasoning(session)
 
 
 class _SessionManager:
@@ -41,10 +69,11 @@ class _Provider:
 async def test_before_turn_resolves_session_history_once() -> None:
     manager = _SessionManager()
     provider = _Provider()
-    runtime = AgentRuntime(provider, ToolRegistry(), session_manager=manager)
+    runtime = DefaultReasoner(provider, ToolRegistry(), session_manager=manager)
 
-    await runtime.run(
-        TurnInput("feishu:chat-1", "current", history=SessionHistoryRequest("feishu:chat-1", 20))
+    await run_through_passive_pipeline(
+        runtime,
+        TurnInput("feishu:chat-1", "current", history=SessionHistoryRequest("feishu:chat-1", 20)),
     )
 
     assert manager.calls == [("feishu:chat-1", 20)]
@@ -57,24 +86,25 @@ async def test_before_turn_resolves_session_history_once() -> None:
 @pytest.mark.asyncio
 async def test_explicit_history_does_not_query_session_manager() -> None:
     manager = _SessionManager()
-    runtime = AgentRuntime(_Provider(), ToolRegistry(), session_manager=manager)
+    runtime = DefaultReasoner(_Provider(), ToolRegistry(), session_manager=manager)
 
-    await runtime.run(TurnInput("feishu:chat-1", "current", history=()))
+    await run_through_passive_pipeline(runtime, TurnInput("feishu:chat-1", "current", history=()))
 
     assert manager.calls == []
 
 
 @pytest.mark.asyncio
 async def test_session_history_request_requires_manager() -> None:
-    runtime = AgentRuntime(_Provider(), ToolRegistry())
+    runtime = DefaultReasoner(_Provider(), ToolRegistry())
 
     with pytest.raises(RuntimeError, match="SessionHistoryRequest requires SessionManager"):
-        await runtime.run(
+        await run_through_passive_pipeline(
+            runtime,
             TurnInput(
                 "feishu:chat-1",
                 "current",
                 history=SessionHistoryRequest("feishu:chat-1", 20),
-            )
+            ),
         )
 
 
@@ -113,10 +143,10 @@ async def test_before_turn_expands_persisted_tool_history_for_provider(tmp_path:
 
     manager = CountingManager(repository)
     provider = _Provider()
-    runtime = AgentRuntime(provider, ToolRegistry(), session_manager=manager)
+    runtime = DefaultReasoner(provider, ToolRegistry(), session_manager=manager)
 
-    await runtime.run(
-        TurnInput("cli:chat", "current", history=SessionHistoryRequest("cli:chat", 20))
+    await run_through_passive_pipeline(
+        runtime, TurnInput("cli:chat", "current", history=SessionHistoryRequest("cli:chat", 20))
     )
 
     history = [item for item in provider.messages if item.role != "system"]

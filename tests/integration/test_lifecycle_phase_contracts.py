@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.plugin_manager import PluginManager
+from memopilot.persistence.conversation import ConversationRepository
+from memopilot.persistence.migrations import DatabaseKind, migrate_database
 from memopilot.runtime.contracts import ChatMessage, ModelResponse, ToolSchema
-from memopilot.runtime.engine import AgentRuntime, TurnInput
+from memopilot.runtime.engine import DefaultReasoner, TurnInput
+from memopilot.runtime.passive_turn import PassiveTurnPipeline
+from memopilot.runtime.phases import LifecyclePhase
 from memopilot.runtime.providers import ChatProvider
 from memopilot.runtime.tools import ToolRegistry
 
@@ -36,18 +41,53 @@ class _CapturingProvider(ChatProvider):
             finish_reason="stop",
             thinking=self.thinking,
             provider_fields=(
-                {"reasoning_content": self.thinking}
-                if self.thinking is not None
-                else {}
+                {"reasoning_content": self.thinking} if self.thinking is not None else {}
             ),
         )
+
+
+class _NoopOutbound:
+    async def dispatch(self, dispatch):
+        del dispatch
+        return True
+
+
+async def run_through_passive_pipeline(
+    reasoner: DefaultReasoner, turn: TurnInput, **kwargs: object
+):
+    with tempfile.TemporaryDirectory() as directory:
+        database = Path(directory) / "operational.db"
+        migrate_database(database, DatabaseKind.OPERATIONAL)
+        pipeline = PassiveTurnPipeline(
+            reasoner,
+            repository=ConversationRepository(database),
+            outbound=_NoopOutbound(),
+            event_bus=reasoner._event_bus or EventBus(),
+            history_limit=50,
+            after_turn_modules=tuple(
+                module
+                for module in getattr(reasoner, "_test_outer_modules", ())
+                if module.phase is LifecyclePhase.AFTER_TURN
+            ),
+            outer_modules=tuple(
+                module
+                for module in getattr(reasoner, "_test_outer_modules", ())
+                if module.phase
+                in {
+                    LifecyclePhase.BEFORE_TURN,
+                    LifecyclePhase.BEFORE_REASONING,
+                    LifecyclePhase.AFTER_REASONING,
+                }
+            ),
+        )
+        return await pipeline.execute_direct(turn, **kwargs)
 
 
 def _write_all_phase_plugin(root: Path) -> None:
     plugin_dir = root / "all_phases"
     plugin_dir.mkdir()
     (plugin_dir / "plugin.py").write_text(
-        '''
+        """
 from memopilot.extensions.plugin_base import Plugin
 from memopilot.extensions.plugin_events import (
     AfterReasoningInput,
@@ -142,7 +182,7 @@ class AllPhasesPlugin(Plugin):
     def after_step_modules(self): return [AfterStepModule()]
     def after_reasoning_modules(self): return [AfterReasoningModule()]
     def after_turn_modules(self): return [AfterTurnModule(self)]
-''',
+""",
         encoding="utf-8",
     )
 
@@ -155,18 +195,21 @@ async def test_all_seven_prototype_phase_frames_flow_through_real_runtime(
     await manager.load_all()
     provider = _CapturingProvider()
 
-    result = await AgentRuntime(
+    runtime = DefaultReasoner(
         provider,
         ToolRegistry(),
         modules=manager.phase_modules,
-    ).run(
+    )
+    runtime._test_outer_modules = manager.phase_modules  # type: ignore[attr-defined]
+    result = await run_through_passive_pipeline(
+        runtime,
         TurnInput(
             "feishu:chat-1",
             "original question",
             system_prompt="core",
             media=("input.png",),
             outbound_metadata={"request": "kept"},
-        )
+        ),
     )
 
     rewritten = [item.content for item in provider.calls[0] if item.role == "user"][-1]
@@ -206,8 +249,9 @@ async def test_before_step_gate_stops_before_provider_and_preserves_phase_fields
     bus.on("before_reasoning", before_reasoning)
     bus.on("before_step", before_step)
 
-    result = await AgentRuntime(provider, ToolRegistry(), event_bus=bus).run(
-        TurnInput("feishu:chat-1", "original")
+    result = await run_through_passive_pipeline(
+        DefaultReasoner(provider, ToolRegistry(), event_bus=bus),
+        TurnInput("feishu:chat-1", "original"),
     )
 
     assert provider.calls == []
@@ -226,7 +270,7 @@ async def test_after_reasoning_plugin_receives_generic_final_thinking_without_re
     plugin_dir = tmp_path / "thinking_observer"
     plugin_dir.mkdir()
     (plugin_dir / "plugin.py").write_text(
-        '''
+        """
 from memopilot.extensions.plugin_base import Plugin
 
 class CaptureThinking:
@@ -243,18 +287,23 @@ class ThinkingObserverPlugin(Plugin):
     name = "thinking_observer"
     def after_reasoning_modules(self):
         return [CaptureThinking(self)]
-''',
+""",
         encoding="utf-8",
     )
     manager = PluginManager([tmp_path], tool_registry=ToolRegistry())
     await manager.load_all()
     provider = _CapturingProvider("visible answer", thinking="private chain")
 
-    result = await AgentRuntime(
+    runtime = DefaultReasoner(
         provider,
         ToolRegistry(),
         modules=manager.phase_modules,
-    ).run(TurnInput("feishu:chat-1", "question"))
+    )
+    runtime._test_outer_modules = manager.phase_modules  # type: ignore[attr-defined]
+    result = await run_through_passive_pipeline(
+        runtime,
+        TurnInput("feishu:chat-1", "question"),
+    )
 
     plugin = manager.get_plugin("thinking_observer")
     assert plugin.context.kv_store.get("thinking") == "private chain"

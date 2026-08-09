@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,7 +14,6 @@ from memopilot.config import MemoPilotSettings
 from memopilot.extensions.events import EventBus
 from memopilot.extensions.mcp import McpServerConfig
 from memopilot.runtime.contracts import ChatMessage, FunctionCall, ModelResponse, ToolSchema
-from memopilot.runtime.engine import TurnInput
 from memopilot.runtime.tools import ToolRegistry
 
 FAKE_MCP_SERVER = Path(__file__).parents[1] / "fixtures" / "fake_mcp_server.py"
@@ -189,7 +189,7 @@ async def test_runtime_bundle_rolls_back_extensions_when_background_construction
     plugin = tmp_path / "plugins" / "rollback"
     plugin.mkdir(parents=True)
     (plugin / "plugin.py").write_text(
-        '''
+        """
 from memopilot.extensions.decorators import on_before_turn, tool
 from memopilot.extensions.plugin_base import Plugin
 
@@ -206,7 +206,7 @@ class RollbackPlugin(Plugin):
 
     async def terminate(self):
         (self.context.workspace / "terminated.txt").write_text("yes", encoding="utf-8")
-''',
+""",
         encoding="utf-8",
     )
     registries: list[ToolRegistry] = []
@@ -298,9 +298,7 @@ async def test_runtime_bundle_connects_memory_to_agent_and_background_jobs(
     assert bundle.memory_tasks.repository is bundle.repository
     assert settings.operational_database.exists()
     assert settings.memory_database.exists()
-    assert "主动推送" in (settings.workspace / "PROACTIVE_CONTEXT.md").read_text(
-        encoding="utf-8"
-    )
+    assert "主动推送" in (settings.workspace / "PROACTIVE_CONTEXT.md").read_text(encoding="utf-8")
     await bundle.close_extensions()
 
 
@@ -324,7 +322,7 @@ async def test_runtime_bundle_injects_one_derived_memory_window(
     )
     try:
         assert bundle.task_dispatcher is not None
-        assert bundle.task_dispatcher._passive._history_limit == 22
+        assert bundle.task_dispatcher._passive._pipeline._history_limit == 22
         assert bundle.memory_tasks.consolidation.keep_count == 22
         assert bundle.memory_tasks.consolidation.min_new_messages == 11
         assert bundle.memory_tasks.consolidation.recent_turn_count == 11
@@ -336,9 +334,7 @@ async def test_proactive_source_can_reference_server_from_manual_mcp_json(tmp_pa
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "mcp_servers.json").write_text(
-        json.dumps(
-            {"servers": {"feeds": {"command": ["python"], "args": ["server.py"]}}}
-        ),
+        json.dumps({"servers": {"feeds": {"command": ["python"], "args": ["server.py"]}}}),
         encoding="utf-8",
     )
     (workspace / "proactive_sources.json").write_text(
@@ -414,7 +410,7 @@ async def test_runtime_bundle_wires_plugin_tools_and_hooks(tmp_path: Path) -> No
     plugin = tmp_path / "plugins" / "rewrite"
     plugin.mkdir(parents=True)
     (plugin / "plugin.py").write_text(
-        '''
+        """
 from memopilot.extensions.decorators import on_tool_pre, tool
 from memopilot.extensions.plugin_base import Plugin
 
@@ -428,7 +424,7 @@ class Rewrite(Plugin):
     @on_tool_pre(tool_name="plugin_echo")
     async def rewrite(self, event):
         return {"value": "rewritten"}
-''',
+""",
         encoding="utf-8",
     )
     settings = MemoPilotSettings(
@@ -460,10 +456,18 @@ async def test_runtime_bundle_discovers_workspace_plugin_and_skill(tmp_path: Pat
     plugin = tmp_path / "plugins" / "demo"
     plugin.mkdir(parents=True)
     (plugin / "plugin.py").write_text(
-        '''
+        """
 from memopilot.extensions.decorators import tool
 from memopilot.extensions.plugin_base import Plugin
-from memopilot.extensions.prompts import PromptBlock
+from memopilot.extensions.prompts import PromptSectionRender
+
+class PromptModule:
+    requires = ("prompt_render.emit", "prompt:ctx")
+    async def run(self, frame):
+        frame.slots["prompt:ctx"].system_sections_bottom.append(
+            PromptSectionRender("demo.identity", "启动即生效的插件提示", True)
+        )
+        return frame
 
 class Demo(Plugin):
     name = "demo"
@@ -472,12 +476,12 @@ class Demo(Plugin):
         self.context.kv_store.increment("starts")
 
     def prompt_render_modules(self):
-        return [PromptBlock("demo.identity", "启动即生效的插件提示", priority=10)]
+        return [PromptModule()]
 
     @tool(name="search")
     async def search(self, event, query: str):
         return query
-''',
+""",
         encoding="utf-8",
     )
     broken = tmp_path / "plugins" / "broken"
@@ -509,6 +513,7 @@ required_tools: [search]
         settings,
         chat_provider=provider,  # type: ignore[arg-type]
         embedder=_Embedder(),  # type: ignore[arg-type]
+        outbound=object(),  # type: ignore[arg-type]
     )
 
     assert "search" in bundle.tools.tool_names
@@ -522,7 +527,13 @@ required_tools: [search]
     assert bundle.skill_diagnostics == ()
     assert bundle.plugin_manager.get_plugin("demo").context.kv_store.get("starts") == 1
 
-    await bundle.runtime.run(TurnInput("feishu:user", "你好", system_prompt="核心"))
+    assert bundle.agent_core is not None
+    await bundle.agent_core.run_direct(
+        session_key="feishu:user",
+        content="你好",
+        now=datetime.now(UTC),
+        source_ref="test:plugin-skill",
+    )
     assert "启动即生效的插件提示" in (provider.messages[0][0].content or "")
     assert "# Skill: tool-failure-recovery" in (provider.messages[0][0].content or "")
     await bundle.close_extensions()
@@ -549,9 +560,7 @@ async def test_runtime_bundle_builds_core_runner_when_outbound_is_available(
         embedder=_Embedder(),  # type: ignore[arg-type]
         outbound=object(),  # type: ignore[arg-type]
     )
-    assert "recall_memory" in {
-        schema["function"]["name"] for schema in bundle.tools.schemas()
-    }
+    assert "recall_memory" in {schema["function"]["name"] for schema in bundle.tools.schemas()}
     assert bundle.memory_tasks.repository is bundle.repository
     assert bundle.task_dispatcher is not None
     assert settings.operational_database.exists()
@@ -626,18 +635,19 @@ required_tools: [mcp_fake__echo]
         embedder=_Embedder(),  # type: ignore[arg-type]
     )
     try:
-        assert [
-            skill.name for skill in runner.skills.background_candidates()
-        ] == ["create-drift-skill"]
+        assert [skill.name for skill in runner.skills.background_candidates()] == [
+            "create-drift-skill"
+        ]
         runner.mcp_registry.start_connect_all_background()
         for _ in range(100):
             if "mcp_fake__echo" in runner.tools.tool_names:
                 break
             await asyncio.sleep(0.02)
         assert "mcp_fake__echo" in runner.tools.tool_names
-        assert [
-            skill.name for skill in runner.skills.background_candidates()
-        ] == ["create-drift-skill", "mcp_research"]
+        assert [skill.name for skill in runner.skills.background_candidates()] == [
+            "create-drift-skill",
+            "mcp_research",
+        ]
         assert runner.mcp_registry.diagnostics == ()
     finally:
         await runner.close_extensions()
