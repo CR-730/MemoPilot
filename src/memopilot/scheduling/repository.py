@@ -231,7 +231,7 @@ class ScheduleRepository:
             connection.close()
 
     def transition_execution(self, execution_id: str, *, outcome: str, now: datetime) -> str:
-        if outcome not in {"running", "succeeded", "failed", "cancelled"}:
+        if outcome not in {"running", "succeeded", "failed", "cancelled", "needs_review"}:
             raise ValueError(f"不支持的定时执行状态: {outcome}")
         with self._connect() as connection:
             row = connection.execute(
@@ -240,7 +240,7 @@ class ScheduleRepository:
             if row is None:
                 raise KeyError(execution_id)
             current = str(row["state"])
-            if current in {"succeeded", "failed", "cancelled"}:
+            if current in {"succeeded", "failed", "cancelled", "needs_review"}:
                 return current
             connection.execute(
                 "UPDATE scheduled_executions SET state = ?, updated_at = ? WHERE execution_id = ?",
@@ -303,33 +303,33 @@ class ScheduleRepository:
             "activity_version": self._activity_version(connection, task.session_key),
         }
         connection.execute(
-                """
+            """
                 INSERT INTO scheduled_executions(
                     execution_id, task_id, scheduled_at, state, created_at, updated_at
                 ) VALUES (?, ?, ?, 'queued', ?, ?)
                 """,
-                (
-                    execution_id,
-                    task.task_id,
-                    effective_scheduled_at.isoformat(),
-                    now.isoformat(),
-                    now.isoformat(),
-                ),
-            )
-        self._finish_or_advance(connection, task, now)
-        return ScheduledExecution(
+            (
                 execution_id,
                 task.task_id,
-                effective_scheduled_at,
-                "queued",
-                AgentTask(
-                    task_id=execution_id,
-                    kind="schedule.run",
-                    priority=1,
-                    session_key=task.session_key,
-                    payload=payload,
-                    created_at=now,
-                ),
+                effective_scheduled_at.isoformat(),
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        self._finish_or_advance(connection, task, now)
+        return ScheduledExecution(
+            execution_id,
+            task.task_id,
+            effective_scheduled_at,
+            "queued",
+            AgentTask(
+                task_id=execution_id,
+                kind="schedule.run",
+                priority=1,
+                session_key=task.session_key,
+                payload=payload,
+                created_at=now,
+            ),
         )
 
     @staticmethod

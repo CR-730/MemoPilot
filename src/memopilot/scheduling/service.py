@@ -22,7 +22,7 @@ from memopilot.scheduling.time_rules import compute_fire_at
 from memopilot.tasks.agent_task import AgentTask
 
 if TYPE_CHECKING:
-    from memopilot.runtime.engine import AgentRuntime
+    from memopilot.runtime.agent_core import AgentCore
 
 
 class SchedulerService:
@@ -30,15 +30,15 @@ class SchedulerService:
         self,
         repository: ScheduleRepository,
         *,
-        runtime: AgentRuntime | None = None,
+        agent_core: AgentCore | None = None,
         outbound: OutboundPort | None = None,
     ) -> None:
         self.repository = repository
-        self._runtime = runtime
+        self._agent_core = agent_core
         self._outbound = outbound
 
-    def bind_executor(self, runtime: AgentRuntime, outbound: OutboundPort) -> None:
-        self._runtime = runtime
+    def bind_executor(self, agent_core: AgentCore, outbound: OutboundPort) -> None:
+        self._agent_core = agent_core
         self._outbound = outbound
 
     def schedule(
@@ -109,12 +109,12 @@ class SchedulerService:
         return self.repository.enqueue_due(now=now)
 
     async def execute_task(self, task: AgentTask, *, now: datetime) -> tuple[AgentTask, ...]:
-        if self._runtime is None or self._outbound is None:
+        if self._agent_core is None or self._outbound is None:
             raise RuntimeError("SchedulerService 未配置执行依赖")
         payload = task.payload
         execution_id = _required_text(payload, "execution_id")
         current = self.repository.transition_execution(execution_id, outcome="running", now=now)
-        if current in {"succeeded", "failed", "cancelled"}:
+        if current in {"succeeded", "failed", "cancelled", "needs_review"}:
             return ()
         try:
             task_payload = payload.get("payload")
@@ -124,17 +124,11 @@ class SchedulerService:
             if mode == "instant":
                 text = _required_text(task_payload, "message")
             elif mode == "agent":
-                from memopilot.runtime.engine import TurnInput
-
-                result = await self._runtime.run(
-                    TurnInput(
-                        task.session_key,
-                        _required_text(task_payload, "prompt"),
-                        prompt_scope="scheduled",
-                        received_at=now,
-                        allowed_tool_risks=frozenset({"read-only", "write"}),
-                        memory_source_ref=f"task:{task.task_id}",
-                    )
+                result = await self._agent_core.run_direct(
+                    session_key=f"scheduler:{execution_id}",
+                    content=_required_text(task_payload, "prompt"),
+                    now=now,
+                    source_ref=f"task:{task.task_id}",
                 )
                 if result.react.infrastructure_error:
                     self.repository.transition_execution(execution_id, outcome="failed", now=now)
@@ -160,7 +154,10 @@ class SchedulerService:
                 raise DeliveryError("定时任务结果未明确发送成功")
             self.repository.transition_execution(execution_id, outcome="succeeded", now=now)
             return ()
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, DeliveryError):
+        except DeliveryError:
+            self.repository.transition_execution(execution_id, outcome="needs_review", now=now)
+            raise
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except BaseException:
             self.repository.transition_execution(execution_id, outcome="failed", now=now)

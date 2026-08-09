@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "apscheduler>=3.11,<4",
-  "fastapi>=0.115,<1",
   "html2text>=2025.4.15,<2026",
   "httpx>=0.28,<1",
   "jsonschema>=4,<5",
@@ -15,11 +14,11 @@ dependencies = [
   "mcp>=1.20,<2",
   "openai>=2,<3",
   "pydantic-settings>=2.10,<3",
+  "python-dotenv>=1,<2",
   "pyyaml>=6,<7",
   "redis>=6,<9",
   "sqlite-vec>=0.1.6,<0.2",
   "textual>=5,<7",
-  "uvicorn[standard]>=0.35,<1",
 ]
 
 [project.scripts]

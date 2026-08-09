@@ -9,6 +9,7 @@ import tomllib
 from pathlib import Path
 from typing import Annotated, Any, Self
 
+from dotenv import load_dotenv
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
@@ -81,9 +82,6 @@ class MemoPilotSettings(BaseSettings):
     proactive_active_end_hour: int = Field(default=23, ge=1, le=24)
     drift_enabled: bool = True
     drift_min_interval_hours: float = Field(default=3, ge=0)
-    lease_ttl_seconds: int = Field(default=30, gt=0)
-    lease_heartbeat_seconds: int = Field(default=10, gt=0)
-    reclaim_idle_seconds: int = Field(default=60, gt=0)
     sqlite_busy_timeout_seconds: float = Field(default=5, gt=0)
     mcp_startup_timeout_seconds: float = Field(default=15, gt=0)
     mcp_call_timeout_seconds: float = Field(default=30, gt=0)
@@ -261,6 +259,7 @@ def load_settings(
     path = Path(config_path)
     if path.suffix.lower() != ".toml":
         raise ValueError(f"主配置仅支持 TOML: {path.suffix}")
+    load_dotenv(path.parent / ".env", override=False)
     raw_data = tomllib.loads(path.read_text(encoding="utf-8"))
     data = _resolve_environment(raw_data)
     llm = _as_dict(data.get("llm"))

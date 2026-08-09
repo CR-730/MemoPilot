@@ -8,7 +8,9 @@ from memopilot.persistence.conversation import (
     MultiplePrivateSessionsError,
 )
 from memopilot.persistence.migrations import DatabaseKind, connect_database, migrate_database
+from memopilot.runtime.outbound import DeliveryError
 from memopilot.scheduling.contracts import DueScanResult
+from memopilot.scheduling.repository import ScheduleRepository
 from memopilot.scheduling.scheduler import ScheduledTurnPipeline
 from memopilot.scheduling.service import SchedulerService
 from memopilot.tasks.agent_task import AgentTask
@@ -141,8 +143,9 @@ async def test_schedule_runtime_failure_marks_execution_failed_and_reraises(tmp_
             self.outcomes.append(outcome)
             return None
 
-    class Runtime:
-        async def run(self, turn):  # type: ignore[no-untyped-def]
+    class Core:
+        async def run_direct(self, **kwargs):  # type: ignore[no-untyped-def]
+            del kwargs
             raise RuntimeError("provider failed")
 
     class Outbound:
@@ -152,7 +155,7 @@ async def test_schedule_runtime_failure_marks_execution_failed_and_reraises(tmp_
     repository = Repository()
     service = SchedulerService(
         repository,  # type: ignore[arg-type]
-        runtime=Runtime(),
+        agent_core=Core(),
         outbound=Outbound(),
     )  # type: ignore[arg-type]
     task = AgentTask(
@@ -175,6 +178,186 @@ async def test_schedule_runtime_failure_marks_execution_failed_and_reraises(tmp_
 
 
 @pytest.mark.asyncio
+async def test_agent_schedule_uses_core_direct_session_and_sends_once() -> None:
+    class Repository:
+        def __init__(self) -> None:
+            self.outcomes: list[str] = []
+
+        def transition_execution(self, _execution_id, *, outcome, now):  # type: ignore[no-untyped-def]
+            del now
+            self.outcomes.append(outcome)
+            return None
+
+    class Core:
+        def __init__(self) -> None:
+            self.kwargs = None
+
+        async def run_direct(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.kwargs = kwargs
+            react = type("React", (), {"infrastructure_error": False})()
+            return type(
+                "Result",
+                (),
+                {"reply": "done", "react": react},
+            )()
+
+    class Outbound:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def dispatch(self, value):  # type: ignore[no-untyped-def]
+            self.calls.append(value)
+            return True
+
+    repository, core, outbound = Repository(), Core(), Outbound()
+    service = SchedulerService(repository, agent_core=core, outbound=outbound)  # type: ignore[arg-type]
+    task = AgentTask(
+        "t",
+        "schedule.run",
+        1,
+        "cli:chat",
+        {
+            "execution_id": "e",
+            "execution_mode": "agent",
+            "payload": {"prompt": "go"},
+            "channel": "cli",
+            "chat_id": "chat",
+        },
+        NOW,
+    )
+
+    assert await service.execute_task(task, now=NOW) == ()
+    assert core.kwargs["session_key"] == "scheduler:e"
+    assert len(outbound.calls) == 1
+    assert repository.outcomes == ["running", "succeeded"]
+
+
+@pytest.mark.asyncio
+async def test_schedule_delivery_unknown_enters_review_and_replay_does_not_repeat() -> None:
+    class Repository:
+        def __init__(self) -> None:
+            self.state = "queued"
+
+        def transition_execution(self, _execution_id, *, outcome, now):  # type: ignore[no-untyped-def]
+            del now
+            if self.state == "needs_review":
+                return self.state
+            self.state = outcome
+            return outcome
+
+    class Core:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run_direct(self, **_kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            react = type("React", (), {"infrastructure_error": False})()
+            return type("Result", (), {"reply": "done", "react": react})()
+
+    class Outbound:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def dispatch(self, _value):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            return False
+
+    repository, core, outbound = Repository(), Core(), Outbound()
+    service = SchedulerService(repository, agent_core=core, outbound=outbound)  # type: ignore[arg-type]
+    task = AgentTask(
+        "t",
+        "schedule.run",
+        1,
+        "cli:chat",
+        {
+            "execution_id": "e",
+            "execution_mode": "agent",
+            "payload": {"prompt": "go"},
+            "channel": "cli",
+            "chat_id": "chat",
+        },
+        NOW,
+    )
+
+    with pytest.raises(DeliveryError):
+        await service.execute_task(task, now=NOW)
+    assert repository.state == "needs_review"
+    assert await service.execute_task(task, now=NOW + timedelta(minutes=1)) == ()
+    assert core.calls == 1
+    assert outbound.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_real_schedule_repository_persists_needs_review_terminal(tmp_path: Path) -> None:
+    database = tmp_path / "operational.db"
+    migrate_database(database, DatabaseKind.OPERATIONAL)
+    with connect_database(database) as connection:
+        connection.execute(
+            "INSERT INTO sessions(session_key, channel, chat_id, created_at, updated_at) "
+            "VALUES ('cli:chat', 'cli', 'chat', ?, ?)",
+            (NOW.isoformat(), NOW.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO scheduled_tasks(task_id, session_key, schedule_kind, schedule_json, "
+            "execution_mode, payload_json, next_run_at, enabled, version, created_at, updated_at) "
+            "VALUES ('scheduled', 'cli:chat', 'at', '{}', 'agent', '{}', NULL, 1, 1, ?, ?)",
+            (NOW.isoformat(), NOW.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO scheduled_executions(execution_id, task_id, scheduled_at, state, "
+            "created_at, updated_at) VALUES ('e', 'scheduled', ?, 'queued', ?, ?)",
+            (NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+        )
+
+    class Core:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run_direct(self, **_kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            react = type("React", (), {"infrastructure_error": False})()
+            return type("Result", (), {"reply": "done", "react": react})()
+
+    class Outbound:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def dispatch(self, _value):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            return False
+
+    core, outbound = Core(), Outbound()
+    service = SchedulerService(
+        ScheduleRepository(database), agent_core=core, outbound=outbound
+    )  # type: ignore[arg-type]
+    task = AgentTask(
+        "t",
+        "schedule.run",
+        1,
+        "cli:chat",
+        {
+            "execution_id": "e",
+            "execution_mode": "agent",
+            "payload": {"prompt": "go"},
+            "channel": "cli",
+            "chat_id": "chat",
+        },
+        NOW,
+    )
+
+    with pytest.raises(DeliveryError):
+        await service.execute_task(task, now=NOW)
+    with connect_database(database) as connection:
+        state = connection.execute(
+            "SELECT state FROM scheduled_executions WHERE execution_id = 'e'"
+        ).fetchone()[0]
+    assert state == "needs_review"
+    assert await service.execute_task(task, now=NOW + timedelta(minutes=1)) == ()
+    assert core.calls == 1
+    assert outbound.calls == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [{"execution_mode": "agent"}, {"payload": {}}])
 async def test_schedule_invalid_running_payload_marks_failed_and_reraises(
     tmp_path: Path, payload: dict[str, object]
@@ -188,7 +371,7 @@ async def test_schedule_invalid_running_payload_marks_failed_and_reraises(
 
     service = SchedulerService(
         Repository(),  # type: ignore[arg-type]
-        runtime=object(),
+        agent_core=object(),
         outbound=object(),
     )  # type: ignore[arg-type]
     repository = service.repository

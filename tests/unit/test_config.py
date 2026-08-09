@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -24,9 +25,6 @@ def test_settings_use_documented_defaults(tmp_path: Path, monkeypatch: pytest.Mo
     assert settings.proactive_enabled is False
     assert settings.drift_enabled is True
     assert settings.drift_min_interval_hours == 3
-    assert settings.lease_ttl_seconds == 30
-    assert settings.lease_heartbeat_seconds == 10
-    assert settings.reclaim_idle_seconds == 60
     assert settings.sqlite_busy_timeout_seconds == 5
     assert settings.mcp_startup_timeout_seconds == 15
     assert settings.mcp_call_timeout_seconds == 30
@@ -305,6 +303,20 @@ def test_toml_loader_uses_environment_for_omitted_embedding_values(
     assert settings.embedding_model == "env-embedding"
     assert settings.embedding_api_key.get_secret_value() == "env-secret"
     assert settings.embedding_dimension == 768
+
+
+def test_toml_loader_exports_dotenv_values_for_mcp_subprocesses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("STEAM_API_KEY", raising=False)
+    config = tmp_path / "config.toml"
+    config.write_text("[llm.main]\nmodel = 'deepseek-chat'\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("STEAM_API_KEY=dotenv-secret\n", encoding="utf-8")
+
+    load_settings(config, workspace=tmp_path / "workspace")
+
+    assert os.environ["STEAM_API_KEY"] == "dotenv-secret"
 
 
 def test_toml_loader_parses_array_only_mcp_stdio_servers(tmp_path: Path) -> None:

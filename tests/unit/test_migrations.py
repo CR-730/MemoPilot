@@ -64,7 +64,7 @@ def test_migrations_create_expected_schema(tmp_path: Path, kind: DatabaseKind) -
 
     assert report.from_version == 0
     expected_version = {
-        DatabaseKind.OPERATIONAL: 10,
+        DatabaseKind.OPERATIONAL: 12,
         DatabaseKind.MEMORY: 3,
         DatabaseKind.PROACTIVE: 9,
     }[kind]
@@ -97,8 +97,8 @@ def test_operational_v1_upgrades_without_losing_existing_rows(tmp_path: Path) ->
     report = migrate_database(database, DatabaseKind.OPERATIONAL)
 
     assert report.from_version == 1
-    assert report.to_version == 10
-    assert report.applied_versions == (2, 3, 4, 5, 6, 7, 8, 9, 10)
+    assert report.to_version == 12
+    assert report.applied_versions == (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
     assert report.backup_path is not None
     with connect_database(database) as connection:
         session = connection.execute(
@@ -188,8 +188,8 @@ def test_operational_v4_upgrades_without_losing_existing_rows(tmp_path: Path) ->
     report = migrate_database(database, DatabaseKind.OPERATIONAL)
 
     assert report.from_version == 4
-    assert report.to_version == 10
-    assert report.applied_versions == (5, 6, 7, 8, 9, 10)
+    assert report.to_version == 12
+    assert report.applied_versions == (5, 6, 7, 8, 9, 10, 11, 12)
     with connect_database(database) as connection:
         session = connection.execute(
             "SELECT chat_id, last_consolidated_position FROM sessions "
@@ -263,8 +263,8 @@ def test_operational_v8_upgrades_messages_with_empty_media(tmp_path: Path) -> No
     report = migrate_database(database, DatabaseKind.OPERATIONAL)
 
     assert report.from_version == 8
-    assert report.to_version == 10
-    assert report.applied_versions == (9, 10)
+    assert report.to_version == 12
+    assert report.applied_versions == (9, 10, 11, 12)
     with connect_database(database) as connection:
         rows = connection.execute(
             "SELECT role, content, media_json FROM messages ORDER BY session_position"
@@ -297,7 +297,7 @@ def test_operational_v10_upgrades_messages_with_empty_tool_chain(tmp_path: Path)
 
     report = migrate_database(database, DatabaseKind.OPERATIONAL)
 
-    assert report.applied_versions == (10,)
+    assert report.applied_versions == (10, 11, 12)
     with connect_database(database) as connection:
         assert connection.execute("SELECT tool_chain_json FROM messages").fetchone()[0] == "[]"
 

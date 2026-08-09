@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -12,8 +11,6 @@ from typing import Protocol
 from memopilot.persistence.conversation import ConversationRepository
 from memopilot.scheduling.contracts import DueScanResult
 from memopilot.tasks.agent_task import AgentTask
-
-logger = logging.getLogger(__name__)
 
 
 class UserScheduleService(Protocol):
@@ -86,16 +83,5 @@ class TaskProducer:
         bucket = int(now.timestamp() // self.memory_optimizer_interval.total_seconds())
         return AgentTask(f"memory.optimize:{bucket}", "memory.optimize", 3, "system:memory",
                          {"bucket": bucket}, now)
-
-    async def run_forever(self) -> None:
-        while True:
-            try:
-                self.tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Scheduler Tick 失败")
-            await self.sleep(self.poll_interval_seconds)
-
 
 __all__ = ["SystemTickResult", "TaskProducer", "UserScheduleService"]

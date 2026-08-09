@@ -28,13 +28,11 @@ class AgentLoop:
         *,
         clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
-        interrupt_poll_interval: float = 0.05,
     ) -> None:
         self._queue = queue
         self._dispatcher = dispatcher
         self._clock = clock or (lambda: datetime.now(UTC))
         self._sleep = sleep
-        self._interrupt_poll_interval = interrupt_poll_interval
         self._running = False
         self._current: asyncio.Task[None] | None = None
         self._current_message: QueueMessage | None = None
@@ -42,9 +40,7 @@ class AgentLoop:
         self._preempted = False
 
     async def run_once(self) -> bool:
-        message = await self._queue.read_pending(consumer_id=self.consumer_id)
-        if message is None:
-            message = await self._queue.read_next(consumer_id=self.consumer_id)
+        message = await self._queue.read_next(consumer_id=self.consumer_id)
         if message is None:
             return False
         self._current_message = message
@@ -69,19 +65,6 @@ class AgentLoop:
 
     async def _wait_for_current(self, message: QueueMessage) -> None:
         assert self._current is not None
-        if message.priority == 0:
-            await self._current
-            return
-        while not self._current.done():
-            await self._sleep(0)
-            if self._current.done():
-                break
-            p0 = await self._queue.read_priority(0, consumer_id=self.consumer_id)
-            if p0 is not None:
-                self._preempted = True
-                self._current.cancel()
-                break
-            await self._sleep(self._interrupt_poll_interval)
         await self._current
 
     async def _run_message(self, message: QueueMessage) -> None:

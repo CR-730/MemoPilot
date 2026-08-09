@@ -38,12 +38,6 @@ class _Queue:
         del consumer_id
         return None
 
-    async def read_priority(
-        self, priority: int, *, consumer_id: str, entry_id: str = ">"
-    ) -> object | None:
-        del priority, consumer_id, entry_id
-        return None
-
     async def acknowledge(self, message: object) -> None:
         self.acked = True
         self.acked_task_ids.append(str(message.task_id))
@@ -117,30 +111,21 @@ async def test_send_failure_is_not_acked() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pending_message_is_replayed_before_new_message() -> None:
-    queue = _Queue(kind="schedule.run")
-    pending = SimpleNamespace(
-        task_id="pending-1",
-        kind="memory.optimize",
-        priority=3,
-        session_key="system:memory",
-        payload_json="{}",
-    )
+async def test_agent_loop_reads_only_new_messages() -> None:
+    queue = _Queue()
+    pending_reads = 0
 
     async def read_pending(*, consumer_id: str) -> object | None:
+        nonlocal pending_reads
         del consumer_id
-        return pending
+        pending_reads += 1
+        return None
 
     queue.read_pending = read_pending  # type: ignore[method-assign]
-    runner = _Dispatcher()
-    loop = AgentLoop(
-        queue,  # type: ignore[arg-type]
-        runner,
-    )
+    loop = AgentLoop(queue, _Dispatcher())  # type: ignore[arg-type]
 
     assert await loop.run_once() is True
-    assert runner.calls == 1
-    assert queue.acked is True
+    assert pending_reads == 0
 
 
 @pytest.mark.asyncio
@@ -178,25 +163,13 @@ async def test_p0_preempts_background_task_with_priority_ack_policy(
 ) -> None:
     queue = _Queue(kind=kind)
     queue.message.priority = priority
-    p0 = SimpleNamespace(
-        task_id="p0",
-        kind="passive.turn",
-        priority=0,
-        session_key="feishu:chat-1",
-        payload_json="{}",
-    )
-
-    async def read_priority(
-        priority: int, *, consumer_id: str, entry_id: str = ">"
-    ) -> object | None:
-        del consumer_id, entry_id
-        return p0 if priority == 0 else None
-
-    queue.read_priority = read_priority  # type: ignore[method-assign]
     runner = _BlockingDispatcher()
-    loop = AgentLoop(queue, runner, interrupt_poll_interval=0)  # type: ignore[arg-type]
+    loop = AgentLoop(queue, runner)  # type: ignore[arg-type]
 
-    assert await loop.run_once() is True
+    running = asyncio.create_task(loop.run_once())
+    await runner.started.wait()
+    assert loop.preempt_for_p0() is True
+    assert await running is True
     assert runner.cancelled is True
     assert queue.acked is expected_ack
 
@@ -204,21 +177,14 @@ async def test_p0_preempts_background_task_with_priority_ack_policy(
 @pytest.mark.asyncio
 async def test_p0_is_not_preempted_by_another_p0() -> None:
     queue = _Queue()
-    read_priority_calls = 0
+    dispatcher = _BlockingDispatcher()
+    loop = AgentLoop(queue, dispatcher)  # type: ignore[arg-type]
+    running = asyncio.create_task(loop.run_once())
+    await dispatcher.started.wait()
 
-    async def read_priority(
-        priority: int, *, consumer_id: str, entry_id: str = ">"
-    ) -> object | None:
-        nonlocal read_priority_calls
-        del priority, consumer_id, entry_id
-        read_priority_calls += 1
-        return None
-
-    queue.read_priority = read_priority  # type: ignore[method-assign]
-    loop = AgentLoop(queue, _Dispatcher())  # type: ignore[arg-type]
-
-    assert await loop.run_once() is True
-    assert read_priority_calls == 0
+    assert loop.preempt_for_p0() is False
+    assert loop.cancel_current() is True
+    assert await running is True
     assert queue.acked is True
 
 
@@ -255,36 +221,16 @@ async def test_derived_tasks_are_published_before_source_ack() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_p0_preemption_replays_and_executes_the_new_p0_next() -> None:
+async def test_preempted_task_is_not_replayed_by_agent_loop() -> None:
     queue = _Queue(kind="schedule.run")
-    p0 = SimpleNamespace(
-        task_id="p0",
-        kind="passive.turn",
-        priority=0,
-        session_key="feishu:chat-1",
-        payload_json="{}",
-    )
-    p0_pending = False
-
-    async def read_pending(*, consumer_id: str) -> object | None:
-        nonlocal p0_pending
-        del consumer_id
-        if not p0_pending:
-            return None
-        p0_pending = False
-        return p0
-
-    queue.read_pending = read_pending  # type: ignore[method-assign]
     blocking = _BlockingDispatcher()
-    loop = AgentLoop(queue, blocking)  # type: ignore[arg-type]
+    loop = AgentLoop(queue, blocking, clock=lambda: NOW)  # type: ignore[arg-type]
     first = asyncio.create_task(loop.run_once())
     await blocking.started.wait()
 
-    p0_pending = True
     assert loop.preempt_for_p0() is True
     assert await first is True
     assert queue.acked_task_ids == []
 
-    loop._dispatcher = _Dispatcher()  # noqa: SLF001
-    assert await loop.run_once() is True
-    assert queue.acked_task_ids == ["p0"]
+    assert await loop.run_once() is False
+    assert queue.acked_task_ids == []

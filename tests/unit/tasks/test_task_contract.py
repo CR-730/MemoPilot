@@ -44,7 +44,7 @@ def test_turn_replay_rejects_corrupt_media(tmp_path: Path, invalid_media: str) -
             "UPDATE messages SET media_json = ? WHERE role = 'assistant'", (invalid_media,)
         )
     with pytest.raises(ValueError, match="media_json"):
-        repository.commit_turn(message)
+        repository.find_committed_turn(message)
 
 
 def test_turn_replay_keeps_tool_chain(tmp_path: Path) -> None:
@@ -58,5 +58,33 @@ def test_turn_replay_keeps_tool_chain(tmp_path: Path) -> None:
     assert repository.commit_turn(
         message, assistant_content="回复", assistant_tool_chain=tool_chain
     ) is not None
-    assert repository.commit_turn(message) is not None
+    assert repository.find_committed_turn(message) is not None
     assert repository.list_recent_messages(message.session_key, limit=2)[1].tool_chain == tool_chain
+
+
+def test_commit_turn_requires_assistant_content(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    message = InboundMessage(
+        "feishu", "user", "chat-1", "你好",
+        timestamp=datetime(2026, 7, 28, tzinfo=UTC),
+        metadata={"message_id": "message-complete"},
+    )
+
+    with pytest.raises(TypeError):
+        repository.commit_turn(message)  # type: ignore[call-arg]
+
+
+def test_find_committed_turn_returns_persisted_reply(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    message = InboundMessage(
+        "feishu", "user", "chat-1", "你好",
+        timestamp=datetime(2026, 7, 28, tzinfo=UTC),
+        metadata={"message_id": "message-read"},
+    )
+    repository.commit_turn(message, assistant_content="回复")
+
+    committed = repository.find_committed_turn(message)
+
+    assert committed is not None
+    assert committed.assistant_content == "回复"
+    assert committed.inserted is False

@@ -10,7 +10,7 @@ from redis.asyncio import Redis
 
 from memopilot.bus.events import InboundMessage
 from memopilot.tasks.agent_task import AgentTask
-from memopilot.tasks.redis_queue import PublishedTask, RedisTaskQueue
+from memopilot.tasks.redis_queue import RedisTaskQueue
 
 NOW = datetime(2026, 7, 13, 9, 0, tzinfo=UTC)
 
@@ -68,7 +68,6 @@ async def test_inbound_publish_atomically_creates_only_one_p0(
     assert first is not None
     assert second is None
     assert await redis_client.xlen(queue.stream_key(0)) == 1
-    assert await redis_client.scard(queue.queued_task_ids_key) == 1
     assert await queue.publish_inbound(message) is None
 
 
@@ -76,16 +75,37 @@ async def test_inbound_publish_atomically_creates_only_one_p0(
 async def test_consumer_reads_highest_available_priority_first(redis_client: Redis) -> None:
     queue = RedisTaskQueue(redis_client)
     await queue.ensure_consumer_groups()
-    await queue.publish(PublishedTask("task-p3", "drift.run", 3, "feishu:chat", "{}"))
-    await queue.publish(PublishedTask("task-p2", "proactive.tick", 2, "feishu:chat", "{}"))
-    await queue.publish(PublishedTask("task-p1", "schedule.run", 1, "feishu:chat", "{}"))
+    for task_id, kind, priority in (
+        ("task-p3", "drift.run", 3),
+        ("task-p2", "proactive.tick", 2),
+        ("task-p1", "schedule.run", 1),
+    ):
+        await queue.publish_task_once(AgentTask(task_id, kind, priority, "feishu:chat", {}, NOW))
 
     messages = [await queue.read_next(consumer_id="runner-1") for _ in range(3)]
 
     assert [message.task_id for message in messages] == ["task-p1", "task-p2", "task-p3"]
     for message in messages:
         await queue.acknowledge(message)
-    assert await redis_client.scard(queue.queued_task_ids_key) == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_read_skips_empty_higher_priority_streams(
+    redis_client: Redis,
+) -> None:
+    queue = RedisTaskQueue(redis_client)
+    await queue.ensure_consumer_groups()
+    await queue.publish_task_once(
+        AgentTask("task-p3", "memory.optimize", 3, "system:memory", {}, NOW)
+    )
+    original = await queue.read_next(consumer_id="runner-1")
+    assert original is not None
+    assert original.task_id == "task-p3"
+
+    replayed = await queue.read_pending(consumer_id="runner-1")
+
+    assert replayed is not None
+    assert replayed.task_id == "task-p3"
 
 
 @pytest.mark.asyncio
@@ -94,7 +114,9 @@ async def test_consumer_recreates_group_deleted_while_service_is_running(
 ) -> None:
     queue = RedisTaskQueue(redis_client)
     await queue.ensure_consumer_groups()
-    await queue.publish(PublishedTask("task-1", "memory.optimize", 3, "system:memory", "{}"))
+    await queue.publish_task_once(
+        AgentTask("task-1", "memory.optimize", 3, "system:memory", {}, NOW)
+    )
     await redis_client.xgroup_destroy(queue.stream_key(0), queue.group)
 
     message = await queue.read_next(consumer_id="runner-1")
@@ -109,8 +131,8 @@ async def test_unfinished_stream_entries_are_not_trimmed_by_publish(redis_client
     await queue.ensure_consumer_groups()
 
     for index in range(10_100):
-        await queue.publish(
-            PublishedTask(f"task-{index}", "memory.optimize", 3, "system:memory", "{}")
+        await queue.publish_task_once(
+            AgentTask(f"task-{index}", "memory.optimize", 3, "system:memory", {}, NOW)
         )
 
     first = await redis_client.xrange(queue.stream_key(3), count=1)
